@@ -63,6 +63,9 @@ impl LayerType {
     ///
     /// Source unique de vérité pour la correspondance calque -> nom d'ancrage :
     /// [`AccessoryCategory::default_anchor_name`] y délègue.
+    ///
+    /// [`AccessoryCategory::default_anchor_name`]:
+    ///     crate::accessory::AccessoryCategory::default_anchor_name
     #[must_use]
     pub const fn anchor_name(self) -> &'static str {
         match self {

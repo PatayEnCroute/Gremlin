@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+# Caisse binaire : produit final distribué sous forme d'exécutable, jamais
+# publié sur crates.io. L'indiquer explicitement évite un `cargo publish`
+# accidentel et autorise les dépendances `path` sans version (voir
+# `allow-wildcard-paths` dans `deny.toml`).
+publish = false
 
 [lib]
 name = "gremlin_app"

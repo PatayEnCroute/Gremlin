@@ -1,7 +1,7 @@
 //! Surveillance active des dépôts Git et détection à chaud via `notify`.
 //!
 //! `RepoWatcher` est une **façade sans état** : toute la connaissance des dépôts
-//! surveillés vit dans le worker d'arrière-plan (voir [`crate::worker`]). Les
+//! surveillés vit dans le worker d'arrière-plan (voir `crate::worker`). Les
 //! opérations d'enregistrement sont confirmées par accusé de réception, si bien
 //! qu'un échec réel (chemin inaccessible, quota du système atteint) remonte
 //! directement à l'appelant au lieu d'être noyé dans les journaux.

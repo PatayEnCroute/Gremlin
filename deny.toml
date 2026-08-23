@@ -11,6 +11,14 @@ all-features = true
 # Toute vulnérabilité connue (RustSec) fait échouer la CI.
 version = 2
 yanked = "deny"
+# Les avis « unmaintained » ne sont pas des vulnérabilités : ils signalent une
+# caisse abandonnée en amont. Ceux que traîne notre graphe transitif — les
+# liaisons GTK3 via `tray-icon`, `ttf-parser` via `winit`, `paste` et
+# `proc-macro-error` via les macros de dérivation — n'offrent aucun chemin de
+# mise à jour et ne dépendent pas de nous. On ne bloque donc que sur une caisse
+# non maintenue déclarée *directement* par le workspace, là où le remplacement
+# est de notre ressort. Vulnérabilités et caisses retirées restent bloquantes.
+unmaintained = "workspace"
 ignore = []
 
 [licenses]
@@ -44,6 +52,11 @@ allow = ["Unicode-DFS-2016"]
 # (wgpu, winit, image) en transporte inévitablement quelques-uns.
 multiple-versions = "warn"
 wildcards = "deny"
+# La règle ci-dessus traque les versions flottantes tirées d'un registre
+# (`foo = "*"`), pas les caisses internes : une dépendance `path` est toujours
+# résolue localement, sans surprise de version. `gremlin-app` étant marquée
+# `publish = false`, cargo-deny accepte ses quatre dépendances de workspace.
+allow-wildcard-paths = true
 highlight = "all"
 deny = []
 

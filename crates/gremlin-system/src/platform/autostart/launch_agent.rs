@@ -40,7 +40,7 @@ impl LaunchAgentBackend {
 
     /// Sérialise le `LaunchAgent` en XML valide.
     ///
-    /// Toutes les valeurs interpolées passent par [`escape_xml`] : les chemins
+    /// Toutes les valeurs interpolées passent par `escape_xml` : les chemins
     /// macOS acceptent `&`, `<` et `'`, qui casseraient sinon le document (et
     /// permettraient d'injecter des clés `launchd` arbitraires).
     #[must_use]

@@ -9,7 +9,9 @@ use std::path::Path;
 /// Ouvre un répertoire dans le gestionnaire de fichiers du système.
 ///
 /// # Errors
-/// Renvoie une erreur si le gestionnaire de fichiers ne peut pas être lancé.
+/// * `NotFound` si `path` ne désigne pas un répertoire existant.
+/// * L'erreur d'entrée/sortie sous-jacente si le gestionnaire de fichiers ne
+///   peut pas être lancé.
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub fn open_directory(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "windows")]
@@ -18,6 +20,17 @@ pub fn open_directory(path: &Path) -> io::Result<()> {
     const FILE_MANAGER: &str = "open";
     #[cfg(target_os = "linux")]
     const FILE_MANAGER: &str = "xdg-open";
+
+    // Un dépôt découvert au démarrage peut avoir été déplacé ou supprimé depuis.
+    // Sans cette vérification, `spawn` réussit — le binaire existe, lui — et
+    // l'appelant conclut à un succès alors que rien ne s'est ouvert : le
+    // gestionnaire de fichiers signale l'erreur dans son coin, ou pas du tout.
+    if !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "le répertoire à ouvrir n'existe pas",
+        ));
+    }
 
     // `explorer.exe` renvoie un code de sortie non nul même en cas de succès :
     // on lance donc le processus sans attendre ni interpréter son statut.
@@ -47,8 +60,12 @@ mod tests {
     #[test]
     fn test_opening_a_missing_directory_reports_an_error_without_panicking() {
         // Le chemin n'existe pas : l'appel doit échouer proprement, jamais
-        // paniquer, quelle que soit la plateforme.
+        // paniquer, et sans lancer le moindre processus — sur les trois
+        // systèmes, `spawn` aurait réussi et masqué l'échec.
         let result = open_directory(Path::new(""));
-        assert!(result.is_err() || cfg!(target_os = "windows"));
+        assert!(
+            matches!(&result, Err(error) if error.kind() == io::ErrorKind::NotFound),
+            "un répertoire absent doit être signalé, obtenu : {result:?}"
+        );
     }
 }

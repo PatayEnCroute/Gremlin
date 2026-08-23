@@ -12,7 +12,7 @@
 //!
 //! ## Horloges
 //!
-//! Les horloges de [`LoopClocks`] sont volontairement distinctes : `frame`
+//! Les horloges de `LoopClocks` sont volontairement distinctes : `frame`
 //! cadence l'animation, `simulation` cadence le moteur métier, `auto_save`
 //! cadence la persistance. Les confondre exposait au risque d'appliquer deux
 //! fois la même décroissance.
@@ -912,7 +912,7 @@ impl GremlinApp {
     /// Draine les signaux entrants (systray, assets, Git) et applique leurs effets.
     ///
     /// Ne fait **pas** avancer la simulation : celle-ci est cadencée séparément
-    /// par [`GremlinApp::advance_simulation`].
+    /// par `GremlinApp::advance_simulation`.
     pub fn pump_events(&mut self) -> Vec<CoreEvent> {
         self.drain_tray_actions();
         self.drain_watcher_status();
