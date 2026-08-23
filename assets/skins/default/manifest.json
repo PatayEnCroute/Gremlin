@@ -1,0 +1,95 @@
+{
+  "name": "Classic Gremlin",
+  "author": "Gremlin Studio",
+  "version": "1.0.0",
+  "frame_width": 64,
+  "frame_height": 64,
+  "anchors": {
+    "glasses": {
+      "x": 16,
+      "y": 20
+    },
+    "hat": {
+      "x": 16,
+      "y": 4
+    },
+    "held": {
+      "x": 32,
+      "y": 28
+    },
+    "base": {
+      "x": 0,
+      "y": 0
+    },
+    "aura": {
+      "x": 0,
+      "y": 0
+    },
+    "outfit": {
+      "x": 0,
+      "y": 0
+    }
+  },
+  "animations": {
+    "angry": {
+      "frames": [
+        "angry_0"
+      ],
+      "frame_duration_ms": 200,
+      "mode": "Loop"
+    },
+    "coding": {
+      "frames": [
+        "coding_0"
+      ],
+      "frame_duration_ms": 200,
+      "mode": "Loop"
+    },
+    "dead": {
+      "frames": [
+        "dead_0"
+      ],
+      "frame_duration_ms": 1000,
+      "mode": "Once"
+    },
+    "dragged": {
+      "frames": [
+        "angry_0"
+      ],
+      "frame_duration_ms": 200,
+      "mode": "Loop"
+    },
+    "happy": {
+      "frames": [
+        "happy_0",
+        "happy_1"
+      ],
+      "frame_duration_ms": 180,
+      "mode": "Loop"
+    },
+    "hungry": {
+      "frames": [
+        "hungry_0",
+        "hungry_1"
+      ],
+      "frame_duration_ms": 400,
+      "mode": "Loop"
+    },
+    "idle": {
+      "frames": [
+        "idle_0",
+        "idle_1"
+      ],
+      "frame_duration_ms": 300,
+      "mode": "Loop"
+    },
+    "sick": {
+      "frames": [
+        "sick_0",
+        "sick_1"
+      ],
+      "frame_duration_ms": 500,
+      "mode": "Loop"
+    }
+  }
+}

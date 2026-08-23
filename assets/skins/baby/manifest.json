@@ -1,0 +1,50 @@
+{
+  "name": "Baby Gremlin",
+  "author": "Gremlin Studio",
+  "version": "1.0.0",
+  "frame_width": 64,
+  "frame_height": 64,
+  "anchors": {
+    "base": {
+      "x": 0,
+      "y": 0
+    },
+    "outfit": {
+      "x": 0,
+      "y": 0
+    },
+    "aura": {
+      "x": 0,
+      "y": 0
+    },
+    "hat": {
+      "x": 16,
+      "y": 6
+    },
+    "glasses": {
+      "x": 16,
+      "y": 22
+    },
+    "held": {
+      "x": 32,
+      "y": 24
+    }
+  },
+  "animations": {
+    "dragged": {
+      "frames": [
+        "idle_0"
+      ],
+      "frame_duration_ms": 200,
+      "mode": "Loop"
+    },
+    "idle": {
+      "frames": [
+        "idle_0",
+        "idle_1"
+      ],
+      "frame_duration_ms": 300,
+      "mode": "Loop"
+    }
+  }
+}

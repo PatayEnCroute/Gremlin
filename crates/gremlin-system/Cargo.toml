@@ -1,0 +1,28 @@
+[package]
+name = "gremlin-system"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+directories.workspace = true
+winit.workspace = true
+tracing.workspace = true
+image.workspace = true
+tray-icon.workspace = true
+muda.workspace = true
+
+# Le mode click-through passe désormais par `winit::Window::set_cursor_hittest`
+# (portable Windows / macOS / X11) : plus aucune FFI fenêtrage n'est nécessaire.
+# Seule la clé de registre `Run` de l'autostart Windows requiert encore Win32.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }
+
+[lints]
+workspace = true

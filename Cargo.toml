@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gremlin-core",
+    "crates/gremlin-watcher",
+    "crates/gremlin-render",
+    "crates/gremlin-system",
+    "crates/gremlin-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Version minimale supportée, alignée sur la chaîne épinglée en CI : sans
+# épinglage, une nouvelle version stable de Clippy pouvait faire échouer la CI
+# du jour au lendemain (pedantic + nursery sont promus en erreurs).
+rust-version = "1.92"
+authors = ["Gremlin Contributors"]
+license = "MIT"
+repository = "https://github.com/votre-user/gremlin"
+
+[workspace.dependencies]
+# Internal workspace crates
+gremlin-core = { path = "crates/gremlin-core" }
+gremlin-watcher = { path = "crates/gremlin-watcher" }
+gremlin-render = { path = "crates/gremlin-render" }
+gremlin-system = { path = "crates/gremlin-system" }
+
+# Error handling & Serialization
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging & Concurrency
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+crossbeam-channel = "0.5"
+
+# System & File monitoring
+directories = "6.0"
+notify = "8.0"
+walkdir = "2.5"
+
+# Graphics & Windowing & Systray
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+winit = "0.30"
+pixels = "0.15"
+tray-icon = "0.19"
+muda = "0.15"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+module_name_repetitions = "allow"
+struct_excessive_bools = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+missing_const_for_fn = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+

@@ -1,0 +1,54 @@
+# Configuration de `cargo-deny` — contrôle des vulnérabilités, des licences,
+# des sources et des dépendances dupliquées.
+#
+# Exécuté en CI (`.github/workflows/ci.yml`, job « supply-chain ») et
+# localement via `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Toute vulnérabilité connue (RustSec) fait échouer la CI.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Le projet est distribué sous licence MIT : seules les licences permissives
+# compatibles sont acceptées.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OFL-1.1",
+]
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# `unicode-ident` est distribué sous une licence Unicode spécifique, largement
+# répandue dans l'écosystème et compatible avec une distribution MIT.
+name = "unicode-ident"
+allow = ["Unicode-DFS-2016"]
+
+[bans]
+# Les doublons de versions sont signalés sans bloquer : l'écosystème graphique
+# (wgpu, winit, image) en transporte inévitablement quelques-uns.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+
+[sources]
+# Aucune dépendance ne doit provenir d'ailleurs que de crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
