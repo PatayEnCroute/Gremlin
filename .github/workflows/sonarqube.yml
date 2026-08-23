@@ -1,0 +1,43 @@
+name: SonarQube — Analyse Qualité & Sécurité
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sonarqube:
+    name: Analyse SonarQube
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (historique complet pour le blame)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxdo-dev libayatana-appindicator3-dev libgtk-3-dev libasound2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.92.0
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin (binaire précompilé)
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      - name: Generate test coverage report (cobertura.xml)
+        run: cargo tarpaulin --workspace --out xml --output-dir .
+        continue-on-error: true
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
