@@ -1,0 +1,22 @@
+[package]
+name = "gremlin-watcher"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+notify.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
+directories.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+[package]
+name = "gremlin-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# Caisse binaire : produit final distribué sous forme d'exécutable, jamais
+# publié sur crates.io. L'indiquer explicitement évite un `cargo publish`
+# accidentel et autorise les dépendances `path` sans version (voir
+# `allow-wildcard-paths` dans `deny.toml`).
+publish = false
+
+[lib]
+name = "gremlin_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gremlin"
+path = "src/main.rs"
+
+[dependencies]
+gremlin-core.workspace = true
+gremlin-watcher.workspace = true
+gremlin-render.workspace = true
+gremlin-system.workspace = true
+
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel.workspace = true
+winit.workspace = true
+pixels.workspace = true
+image.workspace = true
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
+
+[lints]
+workspace = true

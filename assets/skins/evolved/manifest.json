@@ -1,0 +1,50 @@
+{
+  "name": "Evolved Cyber Gremlin",
+  "author": "Gremlin Studio",
+  "version": "1.0.0",
+  "frame_width": 64,
+  "frame_height": 64,
+  "anchors": {
+    "held": {
+      "x": 32,
+      "y": 30
+    },
+    "aura": {
+      "x": 0,
+      "y": 0
+    },
+    "glasses": {
+      "x": 16,
+      "y": 18
+    },
+    "outfit": {
+      "x": 0,
+      "y": 0
+    },
+    "hat": {
+      "x": 16,
+      "y": 2
+    },
+    "base": {
+      "x": 0,
+      "y": 0
+    }
+  },
+  "animations": {
+    "dragged": {
+      "frames": [
+        "idle_0"
+      ],
+      "frame_duration_ms": 200,
+      "mode": "Loop"
+    },
+    "idle": {
+      "frames": [
+        "idle_0",
+        "idle_1"
+      ],
+      "frame_duration_ms": 300,
+      "mode": "Loop"
+    }
+  }
+}
