@@ -215,6 +215,25 @@ impl AccessoryManifest {
         self.frames.get(index).map(String::as_str)
     }
 
+    /// Renvoie le temps restant avant la prochaine frame d'animation.
+    ///
+    /// Les accessoires sans frame ou mono-frame sont statiques et renvoient
+    /// `None`. La durée est re-normalisée afin de rester sûre même pour une
+    /// structure construite directement sans passer par le parseur JSON.
+    #[must_use]
+    pub fn time_until_next_frame(&self, elapsed: Duration) -> Option<Duration> {
+        if self.frames.len() <= 1 {
+            return None;
+        }
+
+        let (duration_ms, _) = clamp_frame_duration_ms(self.frame_duration_ms);
+        let duration_ms = u128::from(duration_ms);
+        let elapsed_in_frame = elapsed.as_millis() % duration_ms;
+        let remaining_ms = duration_ms - elapsed_in_frame;
+
+        Some(Duration::from_millis(remaining_ms as u64))
+    }
+
     /// Récupère le décalage spécifique pour une humeur donnée, ou un décalage nul par défaut.
     #[must_use]
     pub fn mood_offset(&self, mood_key: &str) -> (i32, i32) {
@@ -559,6 +578,32 @@ mod tests {
     fn test_frame_key_at_mono_frame_est_stable() {
         let m = manifest("static", "Statique", AccessoryCategory::Hat);
         assert_eq!(m.frame_key_at(Duration::from_secs(9999)), Some("static"));
+    }
+
+    #[test]
+    fn test_delai_avant_prochaine_frame() {
+        let mut m = manifest("anim", "Anim", AccessoryCategory::Aura);
+        m.frames = vec!["f0".into(), "f1".into()];
+        m.frame_duration_ms = 100;
+
+        assert_eq!(
+            m.time_until_next_frame(Duration::ZERO),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            m.time_until_next_frame(Duration::from_millis(75)),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(
+            m.time_until_next_frame(Duration::from_millis(100)),
+            Some(Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn test_accessoire_statique_nimpose_pas_de_reveil() {
+        let m = manifest("static", "Statique", AccessoryCategory::Hat);
+        assert_eq!(m.time_until_next_frame(Duration::from_secs(9999)), None);
     }
 
     #[test]

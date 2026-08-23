@@ -1,7 +1,7 @@
 {
   "name": "Classic Gremlin",
   "author": "Gremlin Studio",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "frame_width": 64,
   "frame_height": 64,
   "anchors": {
@@ -28,21 +28,31 @@
     "outfit": {
       "x": 0,
       "y": 0
+    },
+    "head": {
+      "x": 32,
+      "y": 17
+    },
+    "effect_origin": {
+      "x": 32,
+      "y": 31
     }
   },
   "animations": {
     "angry": {
       "frames": [
-        "angry_0"
+        "angry_0",
+        "angry_1"
       ],
       "frame_duration_ms": 200,
       "mode": "Loop"
     },
     "coding": {
       "frames": [
-        "coding_0"
+        "coding_0",
+        "coding_1"
       ],
-      "frame_duration_ms": 200,
+      "frame_duration_ms": 140,
       "mode": "Loop"
     },
     "dead": {
@@ -54,9 +64,10 @@
     },
     "dragged": {
       "frames": [
-        "angry_0"
+        "dragged_0",
+        "dragged_1"
       ],
-      "frame_duration_ms": 200,
+      "frame_duration_ms": 120,
       "mode": "Loop"
     },
     "happy": {
@@ -81,6 +92,14 @@
         "idle_1"
       ],
       "frame_duration_ms": 300,
+      "mode": "Loop"
+    },
+    "sleep": {
+      "frames": [
+        "sleep_0",
+        "sleep_1"
+      ],
+      "frame_duration_ms": 600,
       "mode": "Loop"
     },
     "sick": {

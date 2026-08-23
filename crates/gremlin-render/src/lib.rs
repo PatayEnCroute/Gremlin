@@ -19,18 +19,22 @@ mod draw;
 
 pub mod accessory;
 pub mod animation;
+pub mod bubble;
 pub mod buffer;
 pub mod error;
 pub mod layer;
 pub mod limits;
 pub mod manifest;
+pub mod particles;
 pub mod procedural_accessories;
 pub mod sprite;
+pub mod transition;
 
 pub use accessory::{
     AccessoryCatalog, AccessoryCategory, AccessoryItem, AccessoryManifest, WardrobeEquipment,
 };
 pub use animation::{AnimationController, AnimationFrame, PlayMode, SpriteAnimation};
+pub use bubble::{BubbleRect, SpeechBubbleRenderer, SpeechBubbleView};
 pub use buffer::PixelBuffer;
 pub use error::RenderError;
 pub use layer::{ActiveLayer, LayerCompositor, LayerType};
@@ -39,5 +43,7 @@ pub use limits::{
     MIN_FRAME_DURATION_MS,
 };
 pub use manifest::{AnchorPoint, AnimationDef, SkinManifest};
+pub use particles::{ParticleEngine, ParticlePreset, ParticleShape, MAX_PARTICLES};
 pub use procedural_accessories::register_default_procedural_accessories;
 pub use sprite::{SpriteAtlas, SpriteFrame};
+pub use transition::{TransitionController, TransitionRenderer};

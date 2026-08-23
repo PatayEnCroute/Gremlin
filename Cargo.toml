@@ -48,6 +48,30 @@ pixels = "0.15"
 tray-icon = "0.19"
 muda = "0.15"
 
+# Présentation logicielle du panneau de paramètres.
+#
+# `pixels` construit son propre contexte wgpu (instance, adaptateur, device) à
+# chaque instance : une seconde fenêtre en `pixels` coûterait un contexte GPU
+# entier, contre l'objectif « RSS < 25 Mo » de la phase 10. Le panneau étant
+# déjà composé en logiciel dans un `PixelBuffer`, `softbuffer` le présente par
+# un simple transfert mémoire, sans GPU. `kms` est écarté : il sert au rendu
+# direct sur console Linux, pas à une fenêtre.
+softbuffer = { version = "0.4", default-features = false, features = [
+    "x11",
+    "x11-dlopen",
+    "wayland",
+    "wayland-dlopen",
+] }
+
+# Accessibilité système : arbre sémantique exposé aux lecteurs d'écran
+# (UI Automation sous Windows, NSAccessibility sous macOS, AT-SPI sous Linux).
+# `default-features = false` écarte la pile Unix du graphe par défaut ; elle est
+# réactivée par cible dans `gremlin-app`.
+accesskit = "0.24"
+accesskit_winit = { version = "0.33", default-features = false, features = [
+    "rwh_06",
+] }
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 

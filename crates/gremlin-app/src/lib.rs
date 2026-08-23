@@ -12,10 +12,12 @@
 pub mod app;
 pub mod config;
 pub mod desktop;
+mod dialogue;
 pub mod error;
 pub mod persistence;
 pub mod renderer;
 pub mod ui;
+mod visual_feedback;
 
 pub use app::{AppOptions, CustomAppEvent, GremlinApp, NATIVE_HEIGHT, NATIVE_WIDTH};
 pub use config::AppConfig;

@@ -23,21 +23,23 @@ use crate::error::AppError;
 use crate::persistence::PersistenceManager;
 use crate::renderer::AppRenderer;
 use crate::ui::{
-    CommandPalette, PaletteContext, PaletteExecutionResult, RaycastLayout, RaycastRenderer,
-    RepoDisplayInfo,
+    CommandPalette, PaletteContext, PaletteExecutionResult, PanelInteraction, PanelScene,
+    PanelStyle, RaycastRenderer, RepoDisplayInfo, SettingsWindow, SystemTheme, TextSize, Theme,
 };
+use crate::visual_feedback::{VisualAnchors, VisualCue, VisualFeedback};
 use crossbeam_channel::{Receiver, Sender};
 use gremlin_core::{CoreEvent, PetMood, PetState};
 use gremlin_render::{
     register_default_procedural_accessories, AccessoryCatalog, AccessoryItem, AccessoryManifest,
-    AnimationController, LayerCompositor, PixelBuffer, PlayMode, SkinManifest, SpriteAnimation,
-    SpriteAtlas,
+    AnimationController, LayerCompositor, PixelBuffer, PlayMode, SkinManifest,
+    SpeechBubbleRenderer, SpriteAnimation, SpriteAtlas, SpriteFrame, TransitionRenderer,
 };
 use gremlin_system::{
     AppPaths, AutostartManager, PlatformImpl, PlatformWindowExt, SystemTrayManager, TrayMenuAction,
     WindowConfig,
 };
 use gremlin_watcher::{AssetSignal, AssetWatcher, DevSignal, RepoWatcher, WatcherStatus};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,11 +76,39 @@ const SIMULATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// un canal non borné laisserait la mémoire croître sans limite.
 const SIGNAL_CHANNEL_CAPACITY: usize = 1024;
 
+/// Vérifie qu'une clé de sprite désigne uniquement un fichier voisin du manifest.
+///
+/// Les manifests de mods sont des entrées non fiables : une clé contenant un
+/// séparateur ne doit jamais permettre de sortir du répertoire de l'accessoire.
+fn is_safe_sprite_key(key: &str) -> bool {
+    if key.is_empty() || key.contains('/') || key.contains('\\') {
+        return false;
+    }
+
+    let path = Path::new(key);
+    path.file_name().and_then(std::ffi::OsStr::to_str) == Some(key) && path.extension().is_none()
+}
+
 /// Événements personnalisés injectés dans la boucle d'événements winit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Le variant d'accessibilité transporte un `TreeUpdate` et une requête
+/// d'action : il n'est donc ni `Copy` ni `Eq`, ce qui a fait retirer ces dérives
+/// de l'énumération entière —  comprise,  ne
+/// l'implémentant pas non plus.
+#[derive(Debug)]
 pub enum CustomAppEvent {
     /// Réveille la boucle : des signaux sont disponibles dans les canaux.
     Wake,
+    /// Événement émis par l'adaptateur d'accessibilité.
+    #[cfg(feature = "a11y")]
+    Accessibility(accesskit_winit::Event),
+}
+
+#[cfg(feature = "a11y")]
+impl From<accesskit_winit::Event> for CustomAppEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Accessibility(event)
+    }
 }
 
 /// Animation correspondant à une humeur.
@@ -157,23 +187,90 @@ impl AppOptions {
     }
 }
 
+/// Tampons fixes utilisés uniquement par la scène 64×64 du compagnon.
+struct SceneBuffers {
+    current: PixelBuffer,
+    outgoing: PixelBuffer,
+    presented: PixelBuffer,
+    has_presented: bool,
+}
+
+impl SceneBuffers {
+    fn new() -> Self {
+        Self {
+            current: PixelBuffer::new(NATIVE_WIDTH, NATIVE_HEIGHT),
+            outgoing: PixelBuffer::new(NATIVE_WIDTH, NATIVE_HEIGHT),
+            presented: PixelBuffer::new(NATIVE_WIDTH, NATIVE_HEIGHT),
+            has_presented: false,
+        }
+    }
+
+    fn capture_presented(&mut self) -> bool {
+        if !self.has_presented {
+            return false;
+        }
+        self.outgoing
+            .as_bytes_mut()
+            .copy_from_slice(self.presented.as_bytes());
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.has_presented = false;
+        self.current.clear(0, 0, 0, 0);
+        self.outgoing.clear(0, 0, 0, 0);
+        self.presented.clear(0, 0, 0, 0);
+    }
+}
+
 /// Ressources graphiques et d'animation.
 struct Visuals {
     pixel_buffer: PixelBuffer,
+    scene_buffers: SceneBuffers,
     sprite_atlas: SpriteAtlas,
     accessory_catalog: AccessoryCatalog,
     animation_controller: AnimationController,
     active_manifest: Option<SkinManifest>,
+    feedback: VisualFeedback,
+    scene_elapsed: Duration,
+}
+
+impl Visuals {
+    fn new(sprite_atlas: SpriteAtlas, accessory_catalog: AccessoryCatalog) -> Self {
+        Self {
+            pixel_buffer: PixelBuffer::new(NATIVE_WIDTH, NATIVE_HEIGHT),
+            scene_buffers: SceneBuffers::new(),
+            sprite_atlas,
+            accessory_catalog,
+            animation_controller: AnimationController::new(),
+            active_manifest: None,
+            feedback: VisualFeedback::new(),
+            scene_elapsed: Duration::ZERO,
+        }
+    }
 }
 
 /// État transitoire de l'interface.
 #[derive(Debug)]
 struct UiState {
     is_palette_open: bool,
-    suspended_click_through: bool,
     cursor_blink_state: bool,
     is_dragging: bool,
     needs_redraw: bool,
+    /// Le panneau doit être recomposé et re-présenté.
+    ///
+    /// Distinct de `needs_redraw`, qui concerne la fenêtre du familier : les
+    /// deux fenêtres ont désormais des cycles de rafraîchissement séparés, et
+    /// les confondre ferait recomposer la scène 64×64 à chaque frappe au clavier.
+    panel_needs_redraw: bool,
+    /// Ligne du panneau survolée par la souris, en indice d'item filtré.
+    hovered_item: Option<usize>,
+    /// Le panneau a déjà reçu le focus depuis sa dernière ouverture.
+    ///
+    /// Garde-fou : sans lui, un gestionnaire de fenêtres qui refuse le focus à
+    /// l'affichage déclencherait la fermeture sur perte de focus dans l'instant
+    /// qui suit l'ouverture.
+    panel_had_focus: bool,
     exit_requested: bool,
     modifiers: ModifiersState,
     last_save_error: Option<String>,
@@ -183,10 +280,12 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             is_palette_open: false,
-            suspended_click_through: false,
             cursor_blink_state: true,
             is_dragging: false,
             needs_redraw: true,
+            panel_needs_redraw: false,
+            hovered_item: None,
+            panel_had_focus: false,
             exit_requested: false,
             modifiers: ModifiersState::empty(),
             last_save_error: None,
@@ -252,6 +351,18 @@ pub struct GremlinApp {
     wake_bridge: Option<JoinHandle<()>>,
     window: Option<Arc<Window>>,
     renderer: Option<AppRenderer>,
+    /// Fenêtre dédiée du panneau de paramètres.
+    ///
+    /// Créée à la première ouverture puis conservée masquée : un utilisateur qui
+    /// n'ouvre jamais les réglages n'en paie pas le coût, et les ouvertures
+    /// suivantes sont immédiates.
+    settings: Option<SettingsWindow>,
+    /// Proxy de la boucle d'événements, requis par l'adaptateur d'accessibilité.
+    ///
+    /// Conservé même sans la feature `a11y`, pour que la construction de
+    /// l'application reste identique dans les deux configurations.
+    #[cfg_attr(not(feature = "a11y"), allow(dead_code))]
+    proxy: Option<EventLoopProxy<CustomAppEvent>>,
     platform: PlatformImpl,
     tray_manager: Option<SystemTrayManager>,
     autostart_manager: Option<AutostartManager>,
@@ -305,6 +416,10 @@ impl GremlinApp {
         // Le pont de réveil relaie les signaux vers les canaux consommés par la
         // boucle, puis réveille winit. Sans proxy (tests, mode headless), les
         // surveillants écrivent directement dans les canaux.
+        // Le proxy est conservé en plus d'être confié au pont de réveil :
+        // l'adaptateur d'accessibilité en a besoin pour remonter ses requêtes
+        // dans la boucle d'événements.
+        let retained_proxy = options.wake_proxy.clone();
         let (watcher_dev_sender, watcher_asset_sender, wake_bridge) =
             options.wake_proxy.map_or_else(
                 || (dev_sender.clone(), asset_sender.clone(), None),
@@ -366,17 +481,12 @@ impl GremlinApp {
         });
 
         let now = Instant::now();
+        let visuals = Visuals::new(sprite_atlas, accessory_catalog);
         let mut app = Self {
             config,
             paths,
             pet_state,
-            visuals: Visuals {
-                pixel_buffer: PixelBuffer::new(NATIVE_WIDTH, NATIVE_HEIGHT),
-                sprite_atlas,
-                accessory_catalog,
-                animation_controller: AnimationController::new(),
-                active_manifest: None,
-            },
+            visuals,
             ui: UiState::default(),
             clocks: LoopClocks::new(now),
             watchers: WatcherBridge {
@@ -391,6 +501,8 @@ impl GremlinApp {
             wake_bridge,
             window: None,
             renderer: None,
+            settings: None,
+            proxy: retained_proxy,
             platform: PlatformImpl,
             tray_manager,
             autostart_manager,
@@ -497,12 +609,36 @@ impl GremlinApp {
         for skin_dir in &skin_paths {
             if skin_dir.exists() && self.try_load_skin_from_dir(skin_dir) {
                 info!(skin = %skin_name, path = %skin_dir.display(), "Skin chargé depuis le disque");
+                self.finish_skin_reload();
                 return;
             }
         }
 
         info!("Utilisation des graphismes procéduraux par défaut");
         self.load_procedural_fallback_skin();
+        self.finish_skin_reload();
+    }
+
+    fn finish_skin_reload(&mut self) {
+        self.sync_visual_anchors();
+        self.sync_animation_with_mood();
+        self.visuals.feedback.cancel_transition();
+        self.visuals.scene_buffers.invalidate();
+        self.ui.needs_redraw = true;
+    }
+
+    /// Alimente les effets avec les points sémantiques optionnels du skin.
+    fn sync_visual_anchors(&mut self) {
+        let mut anchors = VisualAnchors::default();
+        if let Some(manifest) = &self.visuals.active_manifest {
+            if let Some(head) = manifest.anchors.get("head") {
+                anchors.head = (head.x, head.y);
+            }
+            if let Some(effect) = manifest.anchors.get("effect_origin") {
+                anchors.effect = (effect.x, effect.y);
+            }
+        }
+        self.visuals.feedback.set_anchors(anchors);
     }
 
     fn try_load_skin_from_dir(&mut self, skin_dir: &Path) -> bool {
@@ -511,7 +647,7 @@ impl GremlinApp {
             return false;
         };
 
-        let manifest = match SkinManifest::from_json(&manifest_content) {
+        let mut manifest = match SkinManifest::from_json(&manifest_content) {
             Ok(manifest) => manifest,
             Err(e) => {
                 warn!(path = %manifest_path.display(), "Manifest de skin invalide : {e}");
@@ -519,7 +655,7 @@ impl GremlinApp {
             }
         };
 
-        let mut loaded_any = false;
+        let mut loaded_keys = BTreeSet::new();
         if let Ok(entries) = fs::read_dir(skin_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -527,8 +663,14 @@ impl GremlinApp {
                     continue;
                 }
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    match self.visuals.sprite_atlas.load_from_png_file(stem, &path) {
-                        Ok(()) => loaded_any = true,
+                    match self
+                        .visuals
+                        .sprite_atlas
+                        .load_from_png_file_checked(stem, &path, &manifest)
+                    {
+                        Ok(()) => {
+                            loaded_keys.insert(stem.to_string());
+                        }
                         Err(e) => {
                             warn!(path = %path.display(), "Sprite ignoré : {e}");
                         }
@@ -537,12 +679,26 @@ impl GremlinApp {
             }
         }
 
-        if loaded_any {
+        for (animation_name, definition) in &mut manifest.animations {
+            definition.frames.retain(|key| {
+                let loaded = loaded_keys.contains(key);
+                if !loaded {
+                    warn!(
+                        animation = %animation_name,
+                        frame = %key,
+                        "Frame de skin absente ou invalide : référence retirée"
+                    );
+                }
+                loaded
+            });
+        }
+
+        if loaded_keys.is_empty() {
+            false
+        } else {
             self.visuals.animation_controller = manifest.build_animation_controller();
             self.visuals.active_manifest = Some(manifest);
             true
-        } else {
-            false
         }
     }
 
@@ -602,7 +758,7 @@ impl GremlinApp {
         let Ok(content) = fs::read_to_string(dir.join("manifest.json")) else {
             return;
         };
-        let manifest = match AccessoryManifest::from_json(&content) {
+        let mut manifest = match AccessoryManifest::from_json(&content) {
             Ok(manifest) => manifest,
             Err(e) => {
                 warn!(path = %dir.display(), "Manifest d'accessoire invalide : {e}");
@@ -610,18 +766,50 @@ impl GremlinApp {
             }
         };
 
-        if let Ok(png_entries) = fs::read_dir(dir) {
-            for png_entry in png_entries.flatten() {
-                let p = png_entry.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("png") {
-                    continue;
-                }
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    if let Err(e) = self.visuals.sprite_atlas.load_from_png_file(stem, &p) {
-                        warn!(path = %p.display(), "Sprite d'accessoire ignoré : {e}");
-                    }
-                }
+        let expected_width = manifest.frame_width;
+        let expected_height = manifest.frame_height;
+        let accessory_id = manifest.id.clone();
+        manifest.frames.retain(|key| {
+            if !is_safe_sprite_key(key) {
+                warn!(
+                    accessory = %accessory_id,
+                    frame = %key,
+                    "Clé de frame d'accessoire non sûre : entrée ignorée"
+                );
+                return false;
             }
+            let path = dir.join(format!("{key}.png"));
+            let frame = match SpriteFrame::from_png_file(&path) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    warn!(
+                        accessory = %accessory_id,
+                        frame = %key,
+                        path = %path.display(),
+                        "Frame d'accessoire absente ou corrompue : {e}"
+                    );
+                    return false;
+                }
+            };
+            if frame.width != expected_width || frame.height != expected_height {
+                warn!(
+                    accessory = %accessory_id,
+                    frame = %key,
+                    width = frame.width,
+                    height = frame.height,
+                    expected_width,
+                    expected_height,
+                    "Dimensions de frame d'accessoire incompatibles"
+                );
+                return false;
+            }
+            self.visuals.sprite_atlas.insert(key.clone(), frame);
+            true
+        });
+
+        if manifest.frames.is_empty() {
+            warn!(id = %manifest.id, "Accessoire ignoré : aucune frame valide");
+            return;
         }
 
         info!(id = %manifest.id, "Accessoire mod chargé avec succès");
@@ -659,27 +847,134 @@ impl GremlinApp {
         self.visuals.animation_controller.play(target, false);
     }
 
-    /// Bascule l'affichage de la fenêtre de paramètres façon Raycast.
-    pub fn toggle_palette(&mut self) {
-        self.ui.is_palette_open = !self.ui.is_palette_open;
-
-        if self.ui.is_palette_open {
-            // Suspension du click-through pour permettre la saisie.
-            if self.config.click_through_enabled {
-                self.ui.suspended_click_through = true;
-                self.apply_click_through(false);
-            }
-            self.resize_to(RaycastLayout::WIDTH, RaycastLayout::HEIGHT, true);
-            self.rebuild_palette_items();
-        } else {
-            if self.ui.suspended_click_through {
-                self.ui.suspended_click_through = false;
-                self.apply_click_through(true);
-            }
-            self.resize_to(NATIVE_WIDTH, NATIVE_HEIGHT, false);
+    /// Route un lot complet d'événements métier vers les retours visuels.
+    fn apply_core_events(&mut self, events: &[CoreEvent]) {
+        if events.is_empty() {
+            return;
         }
 
+        let outcome = self.visuals.feedback.handle_core_events(events);
+        if outcome.mood_changed {
+            let captured =
+                !self.ui.is_palette_open && self.visuals.scene_buffers.capture_presented();
+            self.sync_animation_with_mood();
+            if captured {
+                self.visuals.feedback.start_transition();
+            } else {
+                self.visuals.feedback.cancel_transition();
+            }
+        }
+
+        if outcome.dirty {
+            self.request_redraw();
+        }
+    }
+
+    /// Bascule l'affichage du panneau de paramètres.
+    ///
+    /// Cette méthode ne touche plus qu'à l'état : la création et l'affichage de
+    /// la fenêtre sont réconciliés par `reconcile_settings_window`, qui
+    /// dispose de la boucle d'événements. Séparer les deux rend la bascule
+    /// testable sans écran.
+    ///
+    /// Le panneau occupant désormais sa propre fenêtre, la scène du familier
+    /// n'est plus détruite : il continue de s'animer à côté des réglages. Le
+    /// mode click-through n'a plus à être suspendu non plus, puisque la saisie
+    /// arrive sur une fenêtre distincte qui, elle, n'est pas traversante.
+    pub fn toggle_palette(&mut self) {
+        self.ui.is_palette_open = !self.ui.is_palette_open;
+        self.ui.hovered_item = None;
+
+        if self.ui.is_palette_open {
+            self.rebuild_palette_items();
+        }
+
+        self.ui.panel_needs_redraw = true;
         self.request_redraw();
+    }
+
+    /// Aligne l'existence et la visibilité de la fenêtre de paramètres sur l'état.
+    ///
+    /// Appelée depuis la boucle d'événements, seul endroit où l'on dispose de
+    /// l'`ActiveEventLoop` nécessaire à la création d'une fenêtre.
+    fn reconcile_settings_window(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.ui.is_palette_open {
+            if let Some(panel) = &self.settings {
+                panel.hide();
+            }
+            return;
+        }
+
+        if self.settings.is_none() {
+            #[cfg(feature = "a11y")]
+            let outcome = SettingsWindow::new(
+                event_loop,
+                self.window.as_deref(),
+                self.text_size(),
+                self.proxy.clone(),
+            );
+            #[cfg(not(feature = "a11y"))]
+            let outcome = SettingsWindow::new(event_loop, self.window.as_deref(), self.text_size());
+
+            match outcome {
+                Ok(panel) => {
+                    info!("Fenêtre de paramètres créée");
+                    self.settings = Some(panel);
+                }
+                Err(e) => {
+                    // Échec explicite plutôt que faux succès : sans panneau,
+                    // l'état « ouvert » serait mensonger.
+                    error!("Impossible d'ouvrir le panneau de paramètres : {e}");
+                    self.ui.is_palette_open = false;
+                    return;
+                }
+            }
+        }
+
+        let anchor = self.window.clone();
+        let text_size = self.text_size();
+        if let Some(panel) = &mut self.settings {
+            match panel.resync(text_size) {
+                Ok(changed) => self.ui.panel_needs_redraw |= changed,
+                Err(e) => warn!("Le panneau n'a pas pu suivre l'échelle de l'écran : {e}"),
+            }
+            panel.show(anchor.as_deref());
+        }
+    }
+
+    /// Préférence de taille de texte du panneau.
+    const fn text_size(&self) -> TextSize {
+        self.config.ui.text_size
+    }
+
+    /// Réaligne les métriques du panneau après un changement de préférence.
+    fn resync_panel_metrics(&mut self) {
+        let text_size = self.text_size();
+        if let Some(panel) = &mut self.settings {
+            match panel.resync(text_size) {
+                Ok(_) => self.ui.panel_needs_redraw = true,
+                Err(e) => warn!("Le panneau n'a pas pu suivre la nouvelle taille de texte : {e}"),
+            }
+        }
+    }
+
+    /// Palette de couleurs à employer pour le panneau.
+    ///
+    /// Le thème du système est lu sur la fenêtre du panneau, seul endroit où le
+    /// gestionnaire de fenêtres le rapporte. Il vaut `None` sur les
+    /// environnements qui ne l'exposent pas, et la résolution retombe alors sur
+    /// la palette sombre.
+    fn resolve_theme(&self) -> Theme {
+        let system = self
+            .settings
+            .as_ref()
+            .and_then(|panel| panel.window().theme())
+            .map(|theme| match theme {
+                winit::window::Theme::Light => SystemTheme::Light,
+                winit::window::Theme::Dark => SystemTheme::Dark,
+            });
+
+        Theme::resolve(self.config.ui.theme, system)
     }
 
     /// Redimensionne le tampon logiciel, la surface GPU et la fenêtre.
@@ -748,53 +1043,393 @@ impl GremlinApp {
         }
     }
 
-    /// Traite les événements clavier dans la palette de commande.
+    /// Traite un événement destiné à la fenêtre du familier.
+    fn handle_pet_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                info!("Demande de fermeture reçue : sauvegarde puis arrêt");
+                self.persist_state("fermeture de la fenêtre");
+                event_loop.exit();
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.ui.modifiers = Modifiers::state(&new_modifiers);
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = &mut self.renderer {
+                    if let Err(e) = renderer.resize_surface(size.width, size.height) {
+                        warn!("Erreur lors du redimensionnement de la surface Pixels : {e}");
+                    }
+                }
+                self.request_redraw();
+            }
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
+                if key_event.state == ElementState::Pressed
+                    && key_event.logical_key == Key::Named(NamedKey::Space)
+                {
+                    self.toggle_palette();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+                (MouseButton::Right, ElementState::Pressed) => self.toggle_palette(),
+                (MouseButton::Left, ElementState::Pressed) => {
+                    self.ui.is_dragging = true;
+                    self.visuals.animation_controller.play("dragged", false);
+                    self.visuals.feedback.handle_cue(VisualCue::DragStarted);
+                    self.request_redraw();
+                    if let Some(window) = &self.window {
+                        let _ = window.drag_window();
+                    }
+                }
+                (MouseButton::Left, ElementState::Released) => {
+                    if self.ui.is_dragging {
+                        self.ui.is_dragging = false;
+                        self.sync_animation_with_mood();
+                        self.request_redraw();
+                    }
+                }
+                _ => {}
+            },
+            WindowEvent::RedrawRequested => {
+                self.compose_frame();
+                if let Some(renderer) = &mut self.renderer {
+                    if let Err(e) = renderer.render_buffer(&self.visuals.pixel_buffer) {
+                        warn!("Erreur lors du rendu GPU Pixels : {e}");
+                    }
+                }
+                self.ui.needs_redraw = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Traite un événement destiné à la fenêtre de paramètres.
+    ///
+    /// La fermeture du panneau n'arrête jamais l'application : elle referme le
+    /// panneau et rend la main au familier.
+    fn handle_panel_event(&mut self, event: WindowEvent) {
+        // L'adaptateur voit passer tous les événements : il y suit le focus, la
+        // position et l'échelle. En omettre un le désynchronise en silence.
+        #[cfg(feature = "a11y")]
+        if let Some(panel) = &mut self.settings {
+            panel.forward_to_accessibility(&event);
+        }
+
+        match event {
+            WindowEvent::CloseRequested => {
+                if self.ui.is_palette_open {
+                    self.toggle_palette();
+                }
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.ui.modifiers = Modifiers::state(&new_modifiers);
+            }
+            WindowEvent::Focused(has_focus) => self.handle_panel_focus(has_focus),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // L'écran a changé de densité : les métriques et le tampon
+                // doivent suivre, sans quoi le texte redeviendrait flou.
+                self.ui.panel_needs_redraw = true;
+            }
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
+                self.handle_palette_key(&key_event);
+                self.ui.panel_needs_redraw = true;
+            }
+            WindowEvent::CursorMoved { position, .. } => self.handle_panel_hover(position),
+            WindowEvent::CursorLeft { .. } => {
+                if self.ui.hovered_item.take().is_some() {
+                    self.ui.panel_needs_redraw = true;
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => self.handle_panel_scroll(delta),
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left && state == ElementState::Pressed {
+                    self.handle_panel_click();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                self.compose_panel();
+                if let Some(panel) = &mut self.settings {
+                    if let Err(e) = panel.present() {
+                        warn!("Échec de présentation du panneau : {e}");
+                    }
+                }
+                // L'arbre est republié en même temps que l'image : les deux
+                // décrivent le même état, et les faire diverger reviendrait à
+                // mentir au lecteur d'écran.
+                self.publish_accessibility_tree();
+                self.ui.panel_needs_redraw = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Republie l'arbre d'accessibilité décrivant l'état courant du panneau.
+    ///
+    /// Sans client d'assistance actif, l'appel ne construit rien : le coût est
+    /// nul pour qui n'utilise pas de lecteur d'écran.
+    #[cfg(feature = "a11y")]
+    fn publish_accessibility_tree(&mut self) {
+        let palette = &self.command_palette;
+        if let Some(panel) = &mut self.settings {
+            panel.publish_accessibility_tree(|| crate::ui::a11y::tree_update(palette));
+        }
+    }
+
+    /// Variante sans accessibilité : rien à publier.
+    ///
+    /// Conserve la signature de la variante active pour que les appelants
+    /// n'aient pas à être eux-mêmes conditionnés.
+    #[cfg(not(feature = "a11y"))]
+    #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+    const fn publish_accessibility_tree(&mut self) {}
+
+    /// Applique une action demandée par un lecteur d'écran.
+    #[cfg(feature = "a11y")]
+    fn handle_accessibility_event(&mut self, event: accesskit_winit::Event) {
+        use accesskit::Action;
+        use accesskit_winit::WindowEvent as A11yEvent;
+
+        // Une requête destinée à une fenêtre qui n'est plus la nôtre est ignorée
+        // plutôt que appliquée à tort.
+        if self
+            .settings
+            .as_ref()
+            .is_none_or(|panel| panel.id() != event.window_id)
+        {
+            return;
+        }
+
+        match event.window_event {
+            A11yEvent::InitialTreeRequested => {
+                self.publish_accessibility_tree();
+            }
+            A11yEvent::AccessibilityDeactivated => {}
+            A11yEvent::ActionRequested(request) => {
+                let Some(index) = crate::ui::a11y::row_index(request.target_node) else {
+                    return;
+                };
+
+                match request.action {
+                    Action::Focus | Action::ScrollIntoView => {
+                        self.command_palette.select_index(index);
+                    }
+                    Action::Click => {
+                        self.command_palette.select_index(index);
+                        let result = self.command_palette.execute_selected(&self.config.wardrobe);
+                        self.handle_execution_result(result);
+                        self.rebuild_palette_items();
+                    }
+                    _ => return,
+                }
+
+                self.ui.panel_needs_redraw = true;
+            }
+        }
+    }
+
+    /// Referme le panneau lorsqu'il perd le focus, façon Raycast.
+    ///
+    /// Le repli n'a lieu qu'après une prise de focus effective : sans ce garde,
+    /// un gestionnaire de fenêtres refusant le focus à l'ouverture refermerait
+    /// le panneau immédiatement après l'avoir affiché.
+    fn handle_panel_focus(&mut self, has_focus: bool) {
+        if has_focus {
+            self.ui.panel_had_focus = true;
+            return;
+        }
+
+        if self.ui.panel_had_focus && self.ui.is_palette_open && self.config.ui.close_on_focus_loss
+        {
+            self.ui.panel_had_focus = false;
+            self.toggle_palette();
+        }
+    }
+
+    /// Met à jour la ligne survolée depuis la position du curseur.
+    fn handle_panel_hover(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        let Some(panel) = &self.settings else {
+            return;
+        };
+
+        let metrics = panel.metrics();
+        let visible = metrics.visible_rows();
+        // La position arrive en pixels physiques, exactement l'unité du tampon :
+        // aucune conversion d'échelle n'est nécessaire.
+        let hovered = metrics
+            .row_at(position.x as i32, position.y as i32, visible)
+            .and_then(|row| self.command_palette.item_at_visible_row(row, visible));
+
+        if hovered != self.ui.hovered_item {
+            self.ui.hovered_item = hovered;
+            self.ui.panel_needs_redraw = true;
+        }
+    }
+
+    /// Active la ligne cliquée, ou déplace la fenêtre depuis son en-tête.
+    fn handle_panel_click(&mut self) {
+        if let Some(index) = self.ui.hovered_item {
+            self.command_palette.select_index(index);
+            let result = self.command_palette.execute_selected(&self.config.wardrobe);
+            self.handle_execution_result(result);
+            self.rebuild_palette_items();
+            self.ui.panel_needs_redraw = true;
+            return;
+        }
+
+        // Hors de la liste, le clic sert à déplacer le panneau : sans bordure de
+        // fenêtre, c'est la seule prise disponible.
+        if let Some(panel) = &self.settings {
+            let _ = panel.window().drag_window();
+        }
+    }
+
+    /// Fait défiler la liste à la molette.
+    ///
+    /// La molette déplace la sélection plutôt qu'un décalage indépendant : la
+    /// liste reste ainsi pilotée par un seul état, et le clavier et la souris ne
+    /// peuvent pas se contredire.
+    fn handle_panel_scroll(&mut self, delta: winit::event::MouseScrollDelta) {
+        use winit::event::MouseScrollDelta;
+
+        let steps = match delta {
+            MouseScrollDelta::LineDelta(_, y) => {
+                if y.is_finite() {
+                    -y.signum() as i32
+                } else {
+                    0
+                }
+            }
+            MouseScrollDelta::PixelDelta(position) => {
+                if position.y.abs() < 1.0 {
+                    0
+                } else {
+                    -position.y.signum() as i32
+                }
+            }
+        };
+
+        match steps.cmp(&0) {
+            std::cmp::Ordering::Greater => self.command_palette.select_next(),
+            std::cmp::Ordering::Less => self.command_palette.select_prev(),
+            std::cmp::Ordering::Equal => return,
+        }
+
+        self.ui.hovered_item = None;
+        self.ui.panel_needs_redraw = true;
+    }
+
+    /// Traite les événements clavier du panneau de paramètres.
+    ///
+    /// # Répartition des touches
+    ///
+    /// Les flèches horizontales déplacent le **curseur de saisie**, jamais la
+    /// navigation : c'est la convention de tout champ de texte, et la violer
+    /// rendrait la correction d'une frappe impossible. La navigation passe donc
+    /// par `Tab` et `Entrée` pour descendre, `Échap` et le retour arrière sur
+    /// saisie vide pour remonter — la répartition de Raycast.
+    ///
+    /// `Ctrl+A` n'est volontairement pas lié : sans modèle de sélection de
+    /// texte, il ne pourrait que mentir sur son effet. `Ctrl+U` efface la ligne
+    /// et `Ctrl+W` le mot précédent, deux conventions sans ambiguïté.
     pub fn handle_palette_key(&mut self, key_event: &KeyEvent) {
         if key_event.state != ElementState::Pressed {
             return;
         }
 
-        // Ctrl+S : raccourci annoncé dans le pied de page.
-        if self.ui.modifiers.control_key() {
-            if let Key::Character(text) = &key_event.logical_key {
-                if text.eq_ignore_ascii_case("s") {
-                    self.persist_state("raccourci Ctrl+S");
-                    self.ui.needs_redraw = true;
-                    return;
-                }
-            }
+        if self.ui.modifiers.control_key()
+            && self.handle_palette_control_key(&key_event.logical_key)
+        {
+            return;
         }
 
+        let page = self
+            .settings
+            .as_ref()
+            .map_or(1, |panel| panel.metrics().visible_rows());
+
         match &key_event.logical_key {
-            Key::Named(NamedKey::ArrowDown) => {
-                self.command_palette.select_next();
-                self.ui.needs_redraw = true;
-            }
-            Key::Named(NamedKey::ArrowUp) => {
-                self.command_palette.select_prev();
-                self.ui.needs_redraw = true;
-            }
-            Key::Named(NamedKey::Escape) => {
-                self.toggle_palette();
-            }
+            Key::Named(NamedKey::ArrowDown) => self.command_palette.select_next(),
+            Key::Named(NamedKey::ArrowUp) => self.command_palette.select_prev(),
+            Key::Named(NamedKey::PageDown) => self.command_palette.select_page_down(page),
+            Key::Named(NamedKey::PageUp) => self.command_palette.select_page_up(page),
+            Key::Named(NamedKey::ArrowLeft) => self.command_palette.move_caret_left(),
+            Key::Named(NamedKey::ArrowRight) => self.command_palette.move_caret_right(),
+            Key::Named(NamedKey::Home) => self.command_palette.move_caret_to_start(),
+            Key::Named(NamedKey::End) => self.command_palette.move_caret_to_end(),
+            Key::Named(NamedKey::Escape) => self.handle_palette_escape(),
             Key::Named(NamedKey::Backspace) => {
-                self.command_palette.pop_char();
-                self.ui.needs_redraw = true;
+                // Retour arrière sur saisie vide : on remonte d'un niveau plutôt
+                // que de ne rien faire, ce qui donne un geste de sortie continu.
+                if self.command_palette.query().is_empty() {
+                    if !self.command_palette.ascend() {
+                        return;
+                    }
+                } else {
+                    self.command_palette.delete_before_caret();
+                }
             }
-            Key::Named(NamedKey::Enter) => {
-                let res = self.command_palette.execute_selected(&self.config.wardrobe);
-                self.handle_execution_result(res);
+            Key::Named(NamedKey::Tab | NamedKey::Enter) => {
+                let result = self.command_palette.execute_selected(&self.config.wardrobe);
+                self.handle_execution_result(result);
                 self.rebuild_palette_items();
-                self.ui.needs_redraw = true;
             }
             Key::Character(text) => {
                 for ch in text.chars().filter(|c| !c.is_control()) {
-                    self.command_palette.push_char(ch);
-                    self.ui.needs_redraw = true;
+                    self.command_palette.insert_char(ch);
                 }
             }
-            _ => {}
+            _ => return,
         }
+
+        self.ui.hovered_item = None;
+        self.ui.panel_needs_redraw = true;
+    }
+
+    /// Traite les raccourcis à modificateur du panneau.
+    ///
+    /// Renvoie `true` lorsque la touche a été consommée.
+    fn handle_palette_control_key(&mut self, key: &Key) -> bool {
+        let Key::Character(text) = key else {
+            return false;
+        };
+
+        if text.eq_ignore_ascii_case("s") {
+            // Raccourci annoncé dans le pied de page.
+            self.persist_state("raccourci Ctrl+S");
+            self.ui.panel_needs_redraw = true;
+            return true;
+        }
+        if text.eq_ignore_ascii_case("u") {
+            self.command_palette.clear_query();
+            self.ui.panel_needs_redraw = true;
+            return true;
+        }
+        if text.eq_ignore_ascii_case("w") {
+            self.command_palette.delete_word_before_caret();
+            self.ui.panel_needs_redraw = true;
+            return true;
+        }
+
+        false
+    }
+
+    /// Applique `Échap` selon le contexte : effacer, remonter, puis fermer.
+    ///
+    /// Cette gradation évite qu'une recherche en cours ne soit perdue en même
+    /// temps que le panneau : une première pression rend la liste, une seconde
+    /// remonte, une troisième ferme.
+    fn handle_palette_escape(&mut self) {
+        if !self.command_palette.query().is_empty() {
+            self.command_palette.clear_query();
+            return;
+        }
+        if self.command_palette.ascend() {
+            return;
+        }
+        self.toggle_palette();
     }
 
     /// Exécute le résultat d'une commande sélectionnée dans la palette ou le systray.
@@ -811,13 +1446,13 @@ impl GremlinApp {
             PaletteExecutionResult::FeedPet => self.apply_care("nourrir", PetState::feed),
             PaletteExecutionResult::PetGremlin => self.apply_care("caresser", PetState::pet),
             PaletteExecutionResult::HealPet => self.apply_care("soigner", PetState::heal),
-            PaletteExecutionResult::RevivePet => {
-                match self.pet_state.revive() {
-                    Ok(_) => info!("Gremlin a été réanimé"),
-                    Err(e) => warn!("Réanimation impossible : {e}"),
+            PaletteExecutionResult::RevivePet => match self.pet_state.revive() {
+                Ok(events) => {
+                    info!("Gremlin a été réanimé");
+                    self.apply_core_events(&events);
                 }
-                self.sync_animation_with_mood();
-            }
+                Err(e) => warn!("Réanimation impossible : {e}"),
+            },
             PaletteExecutionResult::ToggleClickThrough => {
                 self.config.click_through_enabled = !self.config.click_through_enabled;
                 if let Some(tray) = &self.tray_manager {
@@ -836,13 +1471,13 @@ impl GremlinApp {
                 }
             }
             PaletteExecutionResult::ToggleSleep => {
-                if let Err(e) = self.pet_state.toggle_sleep() {
-                    warn!("Bascule du sommeil impossible : {e}");
+                match self.pet_state.toggle_sleep() {
+                    Ok(events) => self.apply_core_events(&events),
+                    Err(e) => warn!("Bascule du sommeil impossible : {e}"),
                 }
                 if let Some(tray) = &self.tray_manager {
                     tray.set_sleep_state(self.pet_state.is_sleeping());
                 }
-                self.sync_animation_with_mood();
             }
             PaletteExecutionResult::ReloadAssets => {
                 info!("Rechargement complet des assets demandé");
@@ -859,6 +1494,29 @@ impl GremlinApp {
                 Self::open_folder(&target);
             }
             PaletteExecutionResult::SaveNow => self.persist_state("action utilisateur"),
+            PaletteExecutionResult::CycleTextSize => {
+                self.config.ui.text_size = self.config.ui.text_size.next();
+                self.resync_panel_metrics();
+                self.persist_state("changement de taille de texte");
+            }
+            PaletteExecutionResult::CycleTheme => {
+                self.config.ui.theme = self.config.ui.theme.next();
+                self.ui.panel_needs_redraw = true;
+                self.persist_state("changement de thème");
+            }
+            PaletteExecutionResult::ToggleReducedMotion => {
+                self.config.ui.reduced_motion = !self.config.ui.reduced_motion;
+                // Curseur figé en position visible : le laisser dans son dernier
+                // état aléatoire pourrait l'éteindre définitivement.
+                self.ui.cursor_blink_state = true;
+                self.ui.panel_needs_redraw = true;
+                self.persist_state("changement du réglage d'animation");
+            }
+            PaletteExecutionResult::ToggleCloseOnFocusLoss => {
+                self.config.ui.close_on_focus_loss = !self.config.ui.close_on_focus_loss;
+                self.ui.panel_needs_redraw = true;
+                self.persist_state("changement de fermeture automatique");
+            }
             PaletteExecutionResult::None => {}
         }
     }
@@ -870,10 +1528,12 @@ impl GremlinApp {
         action: fn(&mut PetState, Option<f32>) -> Result<Vec<CoreEvent>, gremlin_core::CoreError>,
     ) {
         match action(&mut self.pet_state, None) {
-            Ok(_) => info!("Action « {label} » appliquée au familier"),
+            Ok(events) => {
+                info!("Action « {label} » appliquée au familier");
+                self.apply_core_events(&events);
+            }
             Err(e) => warn!("Action « {label} » refusée : {e}"),
         }
-        self.sync_animation_with_mood();
     }
 
     /// Bascule le lancement automatique au démarrage de session.
@@ -1039,7 +1699,6 @@ impl GremlinApp {
                         r.last_commit_msg = message;
                     }
 
-                    self.sync_animation_with_mood();
                     self.ui.needs_redraw = true;
                 }
                 DevSignal::BranchChanged {
@@ -1049,8 +1708,9 @@ impl GremlinApp {
                     ..
                 } => {
                     info!(repo = %repo_name, from = %old_branch, to = %new_branch, "Bascule de branche");
-                    if let Err(e) = self.pet_state.pet(Some(2.0)) {
-                        warn!("Récompense de bascule de branche ignorée : {e}");
+                    match self.pet_state.pet(Some(2.0)) {
+                        Ok(events) => core_events.extend(events),
+                        Err(e) => warn!("Récompense de bascule de branche ignorée : {e}"),
                     }
 
                     if let Some(r) = self
@@ -1061,7 +1721,6 @@ impl GremlinApp {
                         r.branch = Some(new_branch);
                     }
 
-                    self.sync_animation_with_mood();
                     self.ui.needs_redraw = true;
                 }
                 DevSignal::RepoDiscovered { repo_name, .. } => {
@@ -1085,6 +1744,7 @@ impl GremlinApp {
             }
         }
 
+        self.apply_core_events(&core_events);
         core_events
     }
 
@@ -1096,53 +1756,107 @@ impl GremlinApp {
         }
 
         self.clocks.simulation = now;
-        let previous_mood = self.pet_state.mood();
         let events = self.pet_state.tick(elapsed);
-
-        if self.pet_state.mood() != previous_mood {
-            self.sync_animation_with_mood();
-            self.ui.needs_redraw = true;
-        }
-
+        self.apply_core_events(&events);
         events
     }
 
-    /// Recompose le framebuffer logiciel avec la frame active ou l'UI Raycast.
+    /// Compose le panneau de paramètres dans son propre tampon.
+    ///
+    /// Les emprunts restent disjoints par champ : le tampon vient de
+    /// `self.settings`, la scène de `self.visuals` et `self.config`, la liste de
+    /// `self.command_palette`.
+    fn compose_panel(&mut self) {
+        let mood_key = accessory_mood_key(self.pet_state.mood());
+        let base_frame_key = self
+            .visuals
+            .animation_controller
+            .current_frame_key()
+            .unwrap_or("idle_0");
+
+        let interaction = PanelInteraction {
+            cursor_visible: self.ui.cursor_blink_state,
+            hovered_item: self.ui.hovered_item,
+        };
+        let scene = PanelScene {
+            wardrobe: &self.config.wardrobe,
+            atlas: &self.visuals.sprite_atlas,
+            manifest: self.visuals.active_manifest.as_ref(),
+            catalog: &self.visuals.accessory_catalog,
+            base_frame_key,
+            mood_key,
+        };
+
+        let theme = self.resolve_theme();
+        let Some(panel) = self.settings.as_mut() else {
+            return;
+        };
+        let style = PanelStyle {
+            metrics: *panel.metrics(),
+            theme,
+        };
+        RaycastRenderer::render_panel(
+            panel.buffer_mut(),
+            &style,
+            &self.command_palette,
+            &scene,
+            interaction,
+        );
+    }
+
+    /// Recompose la scène du familier.
+    ///
+    /// Ne dépend plus de l'état du panneau : le familier vit sa vie dans sa
+    /// fenêtre pendant que les réglages sont ouverts.
     fn compose_frame(&mut self) {
         let mood_key = accessory_mood_key(self.pet_state.mood());
 
-        if self.ui.is_palette_open {
-            let base_key = self
-                .visuals
-                .animation_controller
-                .current_frame_key()
-                .unwrap_or("idle_0");
-
-            RaycastRenderer::render_ui(
-                &mut self.visuals.pixel_buffer,
-                &self.command_palette,
-                &self.config.wardrobe,
-                &self.visuals.sprite_atlas,
-                self.visuals.active_manifest.as_ref(),
-                &self.visuals.accessory_catalog,
-                base_key,
-                mood_key,
-                self.ui.cursor_blink_state,
-            );
-            return;
-        }
-
-        self.visuals.pixel_buffer.clear(0, 0, 0, 0);
+        self.visuals.scene_buffers.current.clear(0, 0, 0, 0);
         if let Some(frame_key) = self.visuals.animation_controller.current_frame_key() {
-            LayerCompositor::compose_layered_pet(
-                &mut self.visuals.pixel_buffer,
+            LayerCompositor::compose_layered_pet_animated(
+                &mut self.visuals.scene_buffers.current,
                 &self.config.wardrobe,
                 &self.visuals.sprite_atlas,
                 self.visuals.active_manifest.as_ref(),
                 &self.visuals.accessory_catalog,
                 frame_key,
                 mood_key,
+                self.visuals.scene_elapsed,
             );
+        }
+
+        self.visuals.scene_buffers.presented.clear(0, 0, 0, 0);
+        let transition = self.visuals.feedback.transition();
+        if transition.is_active() {
+            TransitionRenderer::blend(
+                &self.visuals.scene_buffers.outgoing,
+                &self.visuals.scene_buffers.current,
+                &mut self.visuals.scene_buffers.presented,
+                transition.progress(),
+                transition.incoming_offset_y(),
+            );
+        } else {
+            self.visuals
+                .scene_buffers
+                .presented
+                .as_bytes_mut()
+                .copy_from_slice(self.visuals.scene_buffers.current.as_bytes());
+        }
+        self.visuals.scene_buffers.has_presented = true;
+
+        self.visuals.pixel_buffer.clear(0, 0, 0, 0);
+        self.visuals.pixel_buffer.blit(
+            self.visuals.scene_buffers.presented.as_bytes(),
+            NATIVE_WIDTH,
+            NATIVE_HEIGHT,
+            0,
+            0,
+        );
+        self.visuals
+            .feedback
+            .render_particles(&mut self.visuals.pixel_buffer);
+        if let Some(view) = self.visuals.feedback.dialogue_view() {
+            SpeechBubbleRenderer::render(&mut self.visuals.pixel_buffer, view);
         }
     }
 
@@ -1201,17 +1915,60 @@ impl GremlinApp {
     }
 
     /// Délai avant le prochain réveil de la boucle.
+    ///
+    /// # Le panneau ne confisque plus la cadence
+    ///
+    /// Le panneau imposait auparavant son intervalle de 100 ms et court-circuitait
+    /// tout le reste, ce qui se justifiait tant qu'il *remplaçait* la scène du
+    /// familier. Maintenant qu'il occupe sa propre fenêtre, ce plancher plafonnait
+    /// l'animation du familier à dix images par seconde pendant tout le réglage.
+    /// La cadence du familier est donc toujours calculée, et celle du panneau ne
+    /// vient que la resserrer.
+    ///
+    /// Ce resserrement n'a qu'une raison d'être : faire clignoter le curseur de
+    /// saisie. Le mode mouvement réduit l'éteint, et le plancher disparaît avec
+    /// lui — la boucle n'a plus alors à se réveiller que sur événement.
     fn next_wake_delay(&self) -> Duration {
-        if self.ui.is_dragging {
-            return DRAG_FRAME_INTERVAL;
+        let mut delay = if self.ui.is_dragging {
+            DRAG_FRAME_INTERVAL
+        } else {
+            self.visuals
+                .animation_controller
+                .time_until_next_frame()
+                .map_or(IDLE_WAKE_INTERVAL, |wait| wait.max(MIN_FRAME_INTERVAL))
+        };
+        if let Some(accessory_delay) = self.next_accessory_frame_delay() {
+            delay = delay.min(accessory_delay.max(MIN_FRAME_INTERVAL));
         }
-        if self.ui.is_palette_open {
-            return PALETTE_FRAME_INTERVAL;
+        if let Some(feedback_delay) = self.visuals.feedback.next_wake_delay() {
+            delay = delay.min(feedback_delay.max(MIN_FRAME_INTERVAL));
         }
-        self.visuals
-            .animation_controller
-            .time_until_next_frame()
-            .map_or(IDLE_WAKE_INTERVAL, |wait| wait.max(MIN_FRAME_INTERVAL))
+        if self.ui.is_palette_open && !self.config.ui.reduced_motion {
+            delay = delay.min(PALETTE_FRAME_INTERVAL);
+        }
+        delay
+    }
+
+    fn next_accessory_frame_delay(&self) -> Option<Duration> {
+        self.config
+            .wardrobe
+            .equipped_slots()
+            .filter_map(|(_, accessory_id)| {
+                self.visuals
+                    .accessory_catalog
+                    .get(accessory_id)?
+                    .manifest
+                    .time_until_next_frame(self.visuals.scene_elapsed)
+            })
+            .min()
+    }
+
+    fn accessory_frame_changed(&self, before: Duration, after: Duration) -> bool {
+        self.config
+            .wardrobe
+            .equipped_slots()
+            .filter_map(|(_, accessory_id)| self.visuals.accessory_catalog.get(accessory_id))
+            .any(|item| item.manifest.frame_key_at(before) != item.manifest.frame_key_at(after))
     }
 }
 
@@ -1289,6 +2046,7 @@ impl ApplicationHandler<CustomAppEvent> for GremlinApp {
             decorations: false,
             always_on_top: true,
             resizable: false,
+            visible: true,
             icon: gremlin_system::load_app_icon(),
         };
 
@@ -1327,82 +2085,53 @@ impl ApplicationHandler<CustomAppEvent> for GremlinApp {
                 // immédiatement : il suffit ici d'avoir interrompu l'attente.
                 self.ui.needs_redraw = true;
             }
+            #[cfg(feature = "a11y")]
+            CustomAppEvent::Accessibility(event) => self.handle_accessibility_event(event),
         }
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
-        match event {
-            WindowEvent::CloseRequested => {
-                info!("Demande de fermeture reçue : sauvegarde puis arrêt");
-                self.persist_state("fermeture de la fenêtre");
-                event_loop.exit();
-            }
-            WindowEvent::ModifiersChanged(new_modifiers) => {
-                self.ui.modifiers = Modifiers::state(&new_modifiers);
-            }
-            WindowEvent::Resized(size) => {
-                if let Some(renderer) = &mut self.renderer {
-                    if let Err(e) = renderer.resize_surface(size.width, size.height) {
-                        warn!("Erreur lors du redimensionnement de la surface Pixels : {e}");
-                    }
-                }
-                self.request_redraw();
-            }
-            WindowEvent::KeyboardInput {
-                event: key_event, ..
-            } => {
-                if self.ui.is_palette_open {
-                    self.handle_palette_key(&key_event);
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                } else if key_event.state == ElementState::Pressed
-                    && key_event.logical_key == Key::Named(NamedKey::Space)
-                {
-                    self.toggle_palette();
-                }
-            }
-            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
-                (MouseButton::Right, ElementState::Pressed) => self.toggle_palette(),
-                (MouseButton::Left, ElementState::Pressed) if !self.ui.is_palette_open => {
-                    self.ui.is_dragging = true;
-                    self.visuals.animation_controller.play("dragged", false);
-                    self.request_redraw();
-                    if let Some(window) = &self.window {
-                        let _ = window.drag_window();
-                    }
-                }
-                (MouseButton::Left, ElementState::Released) if !self.ui.is_palette_open => {
-                    if self.ui.is_dragging {
-                        self.ui.is_dragging = false;
-                        self.sync_animation_with_mood();
-                        self.request_redraw();
-                    }
-                }
-                _ => {}
-            },
-            WindowEvent::RedrawRequested => {
-                self.compose_frame();
-                if let Some(renderer) = &mut self.renderer {
-                    if let Err(e) = renderer.render_buffer(&self.visuals.pixel_buffer) {
-                        warn!("Erreur lors du rendu GPU Pixels : {e}");
-                    }
-                }
-                self.ui.needs_redraw = false;
-            }
-            _ => {}
+        // Deux fenêtres coexistent désormais : l'identifiant, jusqu'ici ignoré,
+        // décide de la destination. Sans ce routage, une frappe destinée au
+        // panneau déplacerait le familier, et une fermeture du panneau
+        // arrêterait l'application.
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|panel| panel.id() == window_id)
+        {
+            self.handle_panel_event(event);
+            return;
         }
+
+        self.handle_pet_event(event_loop, event);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let frame_delta = now.duration_since(self.clocks.frame);
         self.clocks.frame = now;
+
+        let previous_scene_elapsed = self.visuals.scene_elapsed;
+        self.visuals.scene_elapsed = self.visuals.scene_elapsed.saturating_add(frame_delta);
+        if !self.ui.is_palette_open
+            && self.accessory_frame_changed(previous_scene_elapsed, self.visuals.scene_elapsed)
+        {
+            self.ui.needs_redraw = true;
+        }
+
+        if !self.ui.is_palette_open && self.visuals.animation_controller.update(frame_delta) {
+            self.ui.needs_redraw = true;
+        }
+
+        if self.visuals.feedback.update(frame_delta) && !self.ui.is_palette_open {
+            self.ui.needs_redraw = true;
+        }
 
         self.pump_events();
 
@@ -1421,21 +2150,30 @@ impl ApplicationHandler<CustomAppEvent> for GremlinApp {
             self.persist_state("sauvegarde automatique");
         }
 
+        // Mouvement réduit : le curseur reste allumé plutôt que de clignoter, ce
+        // qui supprime la seule animation permanente du panneau.
         if self.ui.is_palette_open
+            && !self.config.ui.reduced_motion
             && now.duration_since(self.clocks.cursor_blink) >= CURSOR_BLINK_INTERVAL
         {
             self.clocks.cursor_blink = now;
             self.ui.cursor_blink_state = !self.ui.cursor_blink_state;
-            self.ui.needs_redraw = true;
+            self.ui.panel_needs_redraw = true;
         }
 
-        if self.visuals.animation_controller.update(frame_delta) {
-            self.ui.needs_redraw = true;
-        }
+        // Seul endroit disposant de la boucle d'événements : la fenêtre de
+        // paramètres y est créée, affichée ou masquée selon l'état.
+        self.reconcile_settings_window(event_loop);
 
         if self.ui.needs_redraw {
             if let Some(window) = &self.window {
                 window.request_redraw();
+            }
+        }
+
+        if self.ui.panel_needs_redraw {
+            if let Some(panel) = &self.settings {
+                panel.window().request_redraw();
             }
         }
 
@@ -1573,7 +2311,11 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_palette_and_click_through_suspension() {
+    fn test_opening_the_panel_leaves_the_companion_window_intact() {
+        // Le panneau occupe désormais sa propre fenêtre. La fenêtre du familier
+        // ne doit donc plus être métamorphosée : elle gardait auparavant les
+        // dimensions du panneau, ce qui faisait disparaître le familier pendant
+        // tout le réglage et rendait la fenêtre immobilisable.
         let env = TempEnv::new("palette");
         let mut app = headless_app(
             &env,
@@ -1588,10 +2330,22 @@ mod tests {
 
         app.toggle_palette();
         assert!(app.is_palette_open());
-        assert!(app.ui.suspended_click_through);
-        assert_eq!(app.visuals.pixel_buffer.width(), RaycastLayout::WIDTH);
-        assert_eq!(app.visuals.pixel_buffer.height(), RaycastLayout::HEIGHT);
+        assert_eq!(
+            app.visuals.pixel_buffer.width(),
+            NATIVE_WIDTH,
+            "la fenêtre du familier a été redimensionnée par l'ouverture du panneau"
+        );
+        assert_eq!(app.visuals.pixel_buffer.height(), NATIVE_HEIGHT);
+        assert!(
+            app.ui.panel_needs_redraw,
+            "l'ouverture doit demander une composition du panneau"
+        );
 
+        // Le click-through n'a plus à être suspendu : la saisie arrive sur une
+        // fenêtre distincte, qui n'est pas traversante.
+        assert!(app.config.click_through_enabled);
+
+        // Le familier continue de se composer pendant que le panneau est ouvert.
         app.compose_frame();
         assert!(app.visuals.pixel_buffer.as_bytes().iter().any(|&b| b > 0));
 
@@ -1602,8 +2356,50 @@ mod tests {
 
         app.toggle_palette();
         assert!(!app.is_palette_open());
-        assert!(!app.ui.suspended_click_through);
         assert_eq!(app.visuals.pixel_buffer.width(), NATIVE_WIDTH);
+    }
+
+    #[test]
+    fn test_mouse_row_targeting_agrees_with_the_rendered_scroll() {
+        // Le clic doit activer exactement la ligne dessinée : le rendu et le
+        // pointage partagent `scroll_offset`, et ce test le verrouille.
+        let env = TempEnv::new("survol");
+        let mut app = headless_app(&env, AppConfig::default());
+        app.toggle_palette();
+
+        // On descend dans la garde-robe : la racine n'énumère que cinq groupes,
+        // trop peu pour déborder de la fenêtre visible.
+        app.command_palette
+            .enter_group(crate::ui::PaletteGroup::Wardrobe);
+
+        let metrics = crate::ui::UiMetrics::for_display(1.0, TextSize::Normal);
+        let visible = metrics.visible_rows();
+        let total = app.command_palette.filtered_len();
+        assert!(
+            total > visible,
+            "liste trop courte pour exercer le défilement"
+        );
+
+        // Sélection poussée au-delà de la fenêtre visible.
+        for _ in 0..visible + 2 {
+            app.command_palette.select_next();
+        }
+
+        let scroll = app.command_palette.scroll_offset(visible);
+        for row in 0..visible {
+            assert_eq!(
+                app.command_palette.item_at_visible_row(row, visible),
+                Some(scroll + row),
+                "ligne visible {row} désalignée avec le défilement"
+            );
+        }
+
+        // Hors liste, aucun item ciblé.
+        assert_eq!(
+            app.command_palette
+                .item_at_visible_row(visible + 50, visible),
+            None
+        );
     }
 
     #[test]
@@ -1650,6 +2446,11 @@ mod tests {
             .any(|e| matches!(e, CoreEvent::CommitReceived { .. })));
         assert!(app.pet_state.progression().total_xp() > xp_before);
         assert_eq!(app.pet_state.progression().total_commits(), 1);
+        assert_eq!(
+            app.visuals.feedback.active_dialogue(),
+            Some(crate::dialogue::DialogueId::Commit)
+        );
+        assert!(app.visuals.feedback.active_particle_count() > 0);
     }
 
     #[test]
@@ -1751,12 +2552,77 @@ mod tests {
         app.ui.is_dragging = true;
         assert_eq!(app.next_wake_delay(), DRAG_FRAME_INTERVAL);
 
+        // Panneau ouvert : sa cadence resserre celle du familier sans la
+        // remplacer. Au repos, le familier demanderait une seconde entière ; le
+        // curseur de saisie exige davantage.
         app.ui.is_dragging = false;
         app.ui.is_palette_open = true;
         assert_eq!(app.next_wake_delay(), PALETTE_FRAME_INTERVAL);
 
+        // Mouvement réduit : plus de curseur clignotant, donc plus de plancher.
+        // La boucle retombe sur le seul besoin du familier.
+        app.config.ui.reduced_motion = true;
+        assert!(
+            app.next_wake_delay() > PALETTE_FRAME_INTERVAL,
+            "le mouvement réduit doit relâcher la cadence du panneau"
+        );
+        app.config.ui.reduced_motion = false;
+
+        // Le familier garde sa cadence d'animation même panneau ouvert : sa
+        // scène n'est plus remplacée, elle continue de vivre à côté.
+        app.visuals.scene_elapsed = Duration::from_millis(225);
+        app.config
+            .wardrobe
+            .equip(AccessoryCategory::Hat, "wizard_hat");
+        assert_eq!(
+            app.next_wake_delay(),
+            Duration::from_millis(25),
+            "le panneau ne doit pas plafonner l'animation du familier"
+        );
+        app.config.wardrobe.unequip(AccessoryCategory::Hat);
+        app.visuals.scene_elapsed = Duration::ZERO;
+
         app.ui.is_palette_open = false;
         assert!(app.next_wake_delay() >= MIN_FRAME_INTERVAL);
         assert!(app.next_wake_delay() <= IDLE_WAKE_INTERVAL);
+    }
+
+    #[test]
+    fn test_animated_accessory_sets_an_exact_wake_deadline() {
+        let env = TempEnv::new("animated-accessory");
+        let mut app = headless_app(&env, AppConfig::default());
+        app.visuals.animation_controller = AnimationController::new();
+        app.visuals.scene_elapsed = Duration::from_millis(225);
+        app.config
+            .wardrobe
+            .equip(AccessoryCategory::Hat, "wizard_hat");
+
+        assert_eq!(app.next_wake_delay(), Duration::from_millis(25));
+    }
+
+    #[test]
+    fn test_skin_effect_anchors_are_consumed_by_the_feedback_adapter() {
+        let env = TempEnv::new("skin-anchors");
+        let mut app = headless_app(&env, AppConfig::default());
+
+        app.load_skin("baby");
+
+        assert_eq!(
+            app.visuals.feedback.anchors(),
+            VisualAnchors {
+                head: (32, 18),
+                effect: (32, 31),
+            }
+        );
+    }
+
+    #[test]
+    fn test_sprite_keys_cannot_escape_their_mod_directory() {
+        assert!(is_safe_sprite_key("wizard_hat_0"));
+        assert!(!is_safe_sprite_key(""));
+        assert!(!is_safe_sprite_key(".."));
+        assert!(!is_safe_sprite_key("../outside"));
+        assert!(!is_safe_sprite_key("..\\outside"));
+        assert!(!is_safe_sprite_key("frame.png"));
     }
 }
