@@ -63,9 +63,9 @@ impl AnimationDef {
 /// # Convention d'ancrage
 ///
 /// Voir [`crate::layer::LayerCompositor`] : les sprites de calque sont dessinés sur un
-/// canevas pleine taille et déjà positionnés. Le champ [`SkinManifest::anchors`] est
-/// une **métadonnée descriptive** (point d'attache de référence pour les auteurs de
-/// skins et l'outillage), il n'est jamais ajouté comme translation à la composition.
+/// canevas pleine taille et déjà positionnés. Le champ [`SkinManifest::anchors`] porte
+/// des points sémantiques pour les auteurs, l'outillage et les effets (`head`,
+/// `effect_origin`) ; il n'est jamais ajouté comme translation à la composition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkinManifest {
     /// Nom du skin (ex: "Classic Gremlin").
@@ -80,8 +80,8 @@ pub struct SkinManifest {
     pub frame_height: u32,
     /// Points d'ancrage de référence pour chaque calque ("hat", "glasses", "held", etc.).
     ///
-    /// Purement descriptif : consulté par l'outillage d'édition de skins, jamais
-    /// appliqué comme décalage par le compositeur.
+    /// Métadonnées sémantiques : consultées par l'outillage et éventuellement par
+    /// l'orchestrateur d'effets, jamais appliquées comme décalage par le compositeur.
     #[serde(default)]
     pub anchors: BTreeMap<String, AnchorPoint>,
     /// Définitions des animations configurées dans le skin.

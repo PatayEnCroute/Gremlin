@@ -2,7 +2,7 @@
 
 Ce document décrit les étapes d'implémentation incrémentales pour développer **Gremlin**, du moteur autonome jusqu'aux binaires finaux distribuables.
 
-Les phases 1 à 5 sont livrées. Les phases 6 à 10 constituent la feuille de route active pour étendre l'expérience de jeu, les animations, l'outillage développeur, la personnalisation et la distribution certifiée.
+Les phases 1 à 6 sont livrées, ainsi que la phase 6bis consacrée au panneau de paramètres et à son accessibilité. Les phases 7 à 10 constituent la feuille de route active pour étendre l'outillage développeur, les interactions de bureau, la personnalisation et la distribution certifiée.
 
 ---
 
@@ -63,7 +63,7 @@ Les phases 1 à 5 sont livrées. Les phases 6 à 10 constituent la feuille de ro
   * [x] Créer l'observateur du dossier utilisateur pour recharger les mods à chaud sans redémarrage.
 * **Livrable :** Gremlin peut équiper des accessoires superposés sur n'importe lequel de ses états émotionnels.
 
-> **Convention arrêtée :** les sprites sont fournis pré-positionnés sur une toile de 64×64. Les ancres du manifest décrivent la morphologie mais ne translatent aucun calque ; seuls les décalages par humeur déplacent les accessoires.
+> **Convention arrêtée :** les sprites sont fournis pré-positionnés sur une toile de 64×64. Les ancres du manifest décrivent la morphologie et les origines d'effets mais ne translatent aucun calque ; seuls les décalages par humeur déplacent les accessoires.
 
 ---
 
@@ -81,17 +81,46 @@ Les phases 1 à 5 sont livrées. Les phases 6 à 10 constituent la feuille de ro
 
 ---
 
-## Phase 6 : Animations avancées & Effets visuels (*Dynamic FX & Layer Animation*) — planifiée
+## Phase 6 : Animations avancées & Effets visuels (*Dynamic FX & Layer Animation*) — livrée
 
 **Objectif :** Enrichir le rendu visuel avec l'animation complète des accessoires superposés, un moteur de micro-particules 2D et des phylactères pixel-art non intrusifs.
 
 * **Tâches :**
-  * [ ] Activer l'animation synchronisée des accessoires dans le pipeline de composition (`compose_layered_pet_animated`).
-  * [ ] Implémenter un système de micro-particules pixel-art ultra-léger (étincelles de commit, confettis de level-up, Zzz de sommeil, gouttes de sueur).
-  * [ ] Créer un moteur de phylactères / bulles de dialogue pixel-art contextuelles (encouragements, alertes d'humeur, astuces) sans rupture du mode *click-through*.
-  * [ ] Gérer l'interpolation et l'adoucissement des transitions entre états émotionnels pour éviter les coupures brutes de sprites.
-  * [ ] Maintenir la contrainte zéro-allocation dans la boucle de rendu et la réutilisation stricte des tampons graphiques.
+  * [x] Activer l'animation synchronisée des accessoires dans le pipeline de composition (`compose_layered_pet_animated`).
+  * [x] Implémenter un système de micro-particules pixel-art ultra-léger (étincelles de commit, confettis de level-up, Zzz de sommeil, gouttes de sueur).
+  * [x] Créer un moteur de phylactères / bulles de dialogue pixel-art contextuelles (encouragements, alertes d'humeur, astuces) sans rupture du mode *click-through*.
+  * [x] Gérer l'interpolation et l'adoucissement des transitions entre états émotionnels pour éviter les coupures brutes de sprites.
+  * [x] Maintenir la contrainte zéro-allocation dans la boucle de rendu et la réutilisation stricte des tampons graphiques.
 * **Livrable :** rendu multi-calques dynamique avec accessoires animés, retours visuels particulaires et bulles d'expression contextuelles.
+
+---
+
+## Phase 6bis : Panneau de paramètres accessible (*Accessible Panel*) — livrée
+
+**Objectif :** rendre le panneau de paramètres lisible, pilotable à la souris comme au clavier, navigable malgré un nombre de dépôts non plafonné, et utilisable au lecteur d'écran.
+
+**Point de départ.** Le panneau était fonctionnel mais brut, pour cinq raisons distinctes : une police bitmap 5×7 non lissée dont les majuscules accentuées étaient dégradées (`É` → `E`) ; un tampon de taille fixe déclaré en unités logiques, donc réétiré d'un facteur non entier sur tout écran à 125 % ou 150 % ; aucune gestion de la souris, la fenêtre étant de surcroît immobilisable et jamais centrée ; une liste plate de vingt items plus un par dépôt détecté, sans en-tête, ascenseur ni compteur ; et rien du tout d'exposé au système d'accessibilité.
+
+* **Tâches :**
+  * [x] Séparer la géométrie, exprimée en points de conception et projetée par un facteur fractionnaire, du choix des corps de police, qui ne peut être qu'entier. Allouer le tampon en pixels physiques, pour une présentation un pour un.
+  * [x] Dessiner à la main une police bitmap en couverture de niveaux de gris, à avances proportionnelles, avec accents composés — ce qui lève la limite historique sur les capitales accentuées.
+  * [x] Déplacer le panneau dans sa propre fenêtre, présentée par `softbuffer`, centrée sur l'écran du familier, déplaçable, et refermée sur `Échap` ou à la perte de focus.
+  * [x] Router les événements de fenêtre par `WindowId`, jusqu'ici ignoré, et faire vivre la scène du familier pendant le réglage.
+  * [x] Réécrire la composition du panneau : en-têtes de section, sous-titres, pastilles à largeur mesurée, ascenseur, compteur de résultats, état vide, descriptions sur plusieurs lignes.
+  * [x] Introduire une navigation à deux niveaux et une recherche floue insensible aux diacritiques, classée par pertinence et globale depuis n'importe quel niveau.
+  * [x] Brancher la souris : survol, clic, molette, déplacement de fenêtre.
+  * [x] Exposer l'arbre sémantique du panneau au système via AccessKit, avec focus suivant la sélection et bascules annoncées comme des interrupteurs.
+  * [x] Servir trois thèmes — sombre, clair, contraste renforcé — et vérifier leurs rapports de contraste par la suite de tests aux seuils WCAG 2.1.
+  * [x] Persister les préférences d'interface : taille du texte, thème, mouvement réduit, fermeture à la perte de focus.
+* **Livrable :** panneau net à toutes les densités, navigable au clavier comme à la souris, exposé aux lecteurs d'écran, et dont la lisibilité est verrouillée par des tests.
+
+> **Écart assumé :** le panneau est présenté par `softbuffer` et non par une seconde surface `pixels`. Chaque instance de `pixels` construit son propre contexte wgpu — instance, adaptateur, device — et une seconde fenêtre aurait donc coûté un contexte graphique entier, de l'ordre de dix à vingt mégaoctets, ce qui aurait compromis la cible d'empreinte mémoire de la phase 10. Le panneau étant de toute façon composé en logiciel, `softbuffer` le présente par un simple transfert mémoire.
+
+> **Écart assumé :** la pile d'accessibilité est isolée derrière la feature Cargo `a11y`, activée par défaut. Sous Linux, `accesskit_unix` entraîne la pile AT-SPI par D-Bus ; la feature permet de produire un binaire sans elle, et la CI vérifie les deux configurations.
+
+> **Reste à faire :** le corps de police 11×20 déclaré par `FontSize` n'est pas encore dessiné. Le moteur sert le corps 8×15 à sa place, ce qui donne aux densités élevées un texte net mais un peu plus petit que la maquette ne le prévoit. Le sélecteur de corps est indépendant de cet état : les brancher ne demandera que du dessin.
+
+> **Vérification manuelle non automatisable :** la forme de l'arbre d'accessibilité est couverte par des tests, mais ce qu'une voix de synthèse en fait ne l'est pas. Une passe au lecteur d'écran (NVDA, VoiceOver, Orca) reste nécessaire avant de considérer l'accessibilité comme validée.
 
 ---
 
@@ -142,7 +171,7 @@ Les phases 1 à 5 sont livrées. Les phases 6 à 10 constituent la feuille de ro
 **Objectif :** Garantir une distribution irréprochable avec des binaires signés, une consommation mesurée et des mises à jour fiables.
 
 * **Tâches :**
-  * [ ] Mettre en place un banc de mesure instrumenté des ressources (CPU < 0.1 % au repos, mémoire RSS < 25 Mo) validé en CI.
+  * [ ] Mettre en place un banc de mesure instrumenté des ressources (CPU < 0.1 % au repos, mémoire RSS < 35 Mo) validé en CI.
   * [ ] Configurer la signature de code et la notarisation sur les trois OS (Windows SmartScreen / Authenticode, macOS Notarization & Gatekeeper, paquets Linux Flatpak / AppImage / AUR).
   * [ ] Développer un tableau de bord local de statistiques hors-ligne (commits cumulés, historique des humeurs, temps de code, arbre généalogique d'évolution).
   * [ ] Implémenter un mécanisme de mise à jour automatique sécurisé (vérification cryptographique des sommes de contrôle, remplacement atomique avec reprise sur erreur).

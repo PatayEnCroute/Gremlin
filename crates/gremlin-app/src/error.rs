@@ -25,6 +25,18 @@ pub enum AppError {
     #[error("erreur de texture pixels : {0}")]
     Texture(#[from] pixels::TextureError),
 
+    /// Erreur de présentation logicielle du panneau de paramètres.
+    ///
+    /// Le panneau est présenté par `softbuffer` — un transfert mémoire sans
+    /// GPU — et non par `pixels` : une seconde surface wgpu coûterait un
+    /// contexte graphique entier, contre l'objectif d'empreinte mémoire.
+    #[error("erreur de surface logicielle : {0}")]
+    Softbuffer(#[from] softbuffer::SoftBufferError),
+
+    /// Échec de création d'une fenêtre.
+    #[error("erreur de création de fenêtre : {0}")]
+    Window(#[from] winit::error::OsError),
+
     /// Erreur système / OS.
     #[error("erreur système : {0}")]
     System(#[from] gremlin_system::SystemError),

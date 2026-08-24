@@ -6,6 +6,7 @@
 //! produirait une fenêtre de dimension nulle, et un intervalle de sauvegarde
 //! nul déclencherait une écriture disque à chaque réveil de la boucle.
 
+use crate::ui::UiPreferences;
 use gremlin_render::WardrobeEquipment;
 use gremlin_watcher::WatcherConfig;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,8 @@ pub struct AppConfig {
     pub watcher: WatcherConfig,
     /// Échelle d'affichage de la fenêtre (multiplicateur de pixels).
     pub scale_factor: u32,
+    /// Préférences d'affichage et d'accessibilité du panneau de paramètres.
+    pub ui: UiPreferences,
 }
 
 impl Default for AppConfig {
@@ -46,6 +49,7 @@ impl Default for AppConfig {
             max_offline_catchup_hours: 48,
             watcher: WatcherConfig::default(),
             scale_factor: 2,
+            ui: UiPreferences::default(),
         }
     }
 }
@@ -84,6 +88,10 @@ impl AppConfig {
             .max_offline_catchup_hours
             .clamp(1, Self::MAX_OFFLINE_CATCHUP_HOURS);
 
+        // La normalisation des préférences d'interface est déléguée : le
+        // conteneur ne connaît pas leurs bornes.
+        let ui_adjusted = self.ui.normalize();
+
         // Un identifiant de skin ne doit ni être vide, ni contenir de
         // séparateur de chemin : il est concaténé à un répertoire de base.
         let sanitized_skin: String = self
@@ -103,7 +111,7 @@ impl AppConfig {
             sanitized_skin
         };
 
-        before != *self
+        ui_adjusted || before != *self
     }
 
     /// Échelle d'affichage suivante dans le cycle, avec bouclage au minimum.

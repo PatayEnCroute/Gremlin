@@ -96,6 +96,43 @@ Tout bloc `unsafe` porte un `#[allow(unsafe_code)]` local et un commentaire `SAF
 * Les tests d'intégration attendent un **signal précis** avec un délai généreux, jamais une durée fixe pendant laquelle ils espèrent que quelque chose arrive.
 * Couvrir explicitement les entrées hostiles : durée nulle, durée absurde, `NaN`, valeurs hors bornes, JSON malformé, chaînes accentuées et multi-octets.
 
+### Features Cargo
+
+La pile d'accessibilité — UI Automation sous Windows, NSAccessibility sous macOS,
+AT-SPI par D-Bus sous Linux — est isolée derrière la feature `a11y` de
+`gremlin-app`, activée par défaut. **Les deux configurations doivent rester
+compilables et sans avertissement** : une feature dont un seul chemin est
+vérifié se dégrade sans que personne ne le voie. La CI passe donc Clippy deux
+fois.
+
+### Interface : ce qui se juge en regardant
+
+La police du panneau et sa mise en page sont dessinées à la main. Une retouche ne
+se valide pas à la lecture du code : il faut regarder le rendu. Deux exemples le
+produisent hors écran, sous `target/` :
+
+```bash
+cargo run -p gremlin-app --example font_proof_sheet
+```
+
+```bash
+cargo run -p gremlin-app --example panel_proof_sheet
+```
+
+Sur la planche de police, les traits rouges verticaux marquent la largeur
+renvoyée par `font::measure` : ils doivent affleurer la fin du texte. Un écart
+signale que la mesure et le rendu ont divergé, ce qui décale le curseur de saisie.
+
+### Contraste : vérifié, jamais supposé
+
+Toute couleur de `ui::theme` est soumise aux tests de contraste WCAG 2.1 —
+4,5:1 pour le texte, 3:1 pour les composants porteurs d'état, seuil de
+perceptibilité pour le décoratif. **Ne pas contourner un échec en abaissant le
+seuil.** Deux issues légitimes existent : corriger la couleur, ou démontrer que
+l'information est portée par un autre élément — et alors tester *cet* élément.
+C'est ce qui a été fait pour la sélection et le survol, signalés par un liseré
+d'accent plutôt que par une teinte de fond.
+
 ### Commandes de vérification systématiques avant tout commit
 
 ```bash
@@ -107,7 +144,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ```bash
+cargo clippy -p gremlin-app --no-default-features --all-targets -- -D warnings
+```
+
+```bash
 cargo test --workspace
+```
+
+```bash
+cargo deny check
 ```
 
 ---

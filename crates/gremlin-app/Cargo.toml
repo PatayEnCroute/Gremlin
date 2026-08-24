@@ -19,6 +19,13 @@ path = "src/lib.rs"
 name = "gremlin"
 path = "src/main.rs"
 
+[features]
+default = ["a11y"]
+# Expose l'arbre d'accessibilité du panneau de paramètres à l'OS, ce qui rend
+# l'interface utilisable au lecteur d'écran. Isolée derrière une feature pour
+# pouvoir produire un binaire sans la pile UI Automation / AT-SPI.
+a11y = ["dep:accesskit", "dep:accesskit_winit"]
+
 [dependencies]
 gremlin-core.workspace = true
 gremlin-watcher.workspace = true
@@ -33,7 +40,21 @@ tracing-subscriber.workspace = true
 crossbeam-channel.workspace = true
 winit.workspace = true
 pixels.workspace = true
+softbuffer.workspace = true
 image.workspace = true
+
+accesskit = { workspace = true, optional = true }
+accesskit_winit = { workspace = true, optional = true }
+
+# La pile d'accessibilité Unix (AT-SPI par D-Bus, et sa boucle asynchrone) n'a
+# de sens que sur Linux et les BSD. L'activer par cible évite de la traîner
+# dans le graphe de dépendances de Windows et de macOS, qui disposent d'un
+# adaptateur natif.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+accesskit_winit = { workspace = true, optional = true, features = [
+    "accesskit_unix",
+    "async-io",
+] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"

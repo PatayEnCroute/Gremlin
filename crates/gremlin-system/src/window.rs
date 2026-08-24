@@ -96,6 +96,13 @@ pub struct WindowConfig {
     pub decorations: bool,
     pub always_on_top: bool,
     pub resizable: bool,
+    /// Visible dès sa création.
+    ///
+    /// Le panneau de paramètres naît **invisible** : l'adaptateur
+    /// d'accessibilité doit être installé avant le premier affichage de la
+    /// fenêtre, sans quoi certaines plateformes servent un arbre vide au lecteur
+    /// d'écran pour toute la durée de vie de la fenêtre.
+    pub visible: bool,
     pub icon: Option<Icon>,
 }
 
@@ -109,12 +116,40 @@ impl Default for WindowConfig {
             decorations: false,
             always_on_top: true,
             resizable: false,
+            visible: true,
             icon: load_app_icon(),
         }
     }
 }
 
 impl WindowConfig {
+    /// Préréglage de la fenêtre du panneau de paramètres.
+    ///
+    /// Elle diffère de la fenêtre du familier sur trois points qui comptent :
+    ///
+    /// * **opaque** — elle est présentée par un transfert mémoire sans canal
+    ///   alpha, et un panneau de réglages n'a pas à laisser voir le bureau ;
+    /// * **titrée** — « Paramètres Gremlin » est le nom que reprennent la barre
+    ///   des tâches et, surtout, les lecteurs d'écran. La fenêtre du familier
+    ///   n'a pas cette exigence, elle n'accueille pas de texte ;
+    /// * **sans décoration mais focalisable** — l'aspect Raycast exige l'absence
+    ///   de barre de titre, alors que la saisie clavier et l'accessibilité
+    ///   exigent qu'elle puisse recevoir le focus.
+    #[must_use]
+    pub fn settings_panel(width: u32, height: u32) -> Self {
+        Self {
+            title: String::from("Paramètres Gremlin"),
+            width,
+            height,
+            transparent: false,
+            decorations: false,
+            always_on_top: true,
+            resizable: false,
+            visible: false,
+            icon: load_app_icon(),
+        }
+    }
+
     /// Construit les attributs de fenêtre pour `winit` avec le logo officiel de Gremlin.
     #[must_use]
     pub fn to_window_attributes(&self) -> WindowAttributes {
@@ -126,7 +161,8 @@ impl WindowConfig {
             ))
             .with_transparent(self.transparent)
             .with_decorations(self.decorations)
-            .with_resizable(self.resizable);
+            .with_resizable(self.resizable)
+            .with_visible(self.visible);
 
         if let Some(icon) = self.icon.clone().or_else(load_app_icon) {
             attrs = attrs.with_window_icon(Some(icon));
@@ -153,7 +189,19 @@ mod tests {
         assert!(config.transparent);
         assert!(!config.decorations);
         assert!(config.always_on_top);
+        assert!(config.visible);
         assert!(config.icon.is_some());
+    }
+
+    #[test]
+    fn test_settings_panel_starts_hidden() {
+        // L'adaptateur d'accessibilité s'installe entre la création et le premier
+        // affichage : la fenêtre doit donc naître invisible.
+        let config = WindowConfig::settings_panel(720, 480);
+        assert!(!config.visible);
+        assert!(!config.transparent, "le panneau est opaque");
+        assert!(!config.decorations);
+        assert_eq!(config.title, "Paramètres Gremlin");
     }
 
     #[test]

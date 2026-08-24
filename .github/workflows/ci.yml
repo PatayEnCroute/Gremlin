@@ -58,6 +58,12 @@ jobs:
       - name: Strict static analysis (Clippy)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Le panneau de paramètres peut être bâti sans la pile d'accessibilité
+      # (UI Automation, NSAccessibility, AT-SPI). Sans ce second passage, ce
+      # chemin de repli se dégraderait sans que personne ne le voie.
+      - name: Strict static analysis without the a11y feature
+        run: cargo clippy -p gremlin-app --no-default-features --all-targets -- -D warnings
+
   test:
     name: Test Suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

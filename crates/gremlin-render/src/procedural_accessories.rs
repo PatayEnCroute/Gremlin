@@ -29,6 +29,13 @@ fn body_mood_offsets() -> BTreeMap<String, AnchorPoint> {
 }
 
 /// Recette de génération d'un accessoire procédural intégré.
+#[derive(Clone, Copy)]
+struct AccessoryAnimationSpec {
+    frame_count: usize,
+    frame_duration_ms: u64,
+    overlay: fn(&mut [u8], usize, usize),
+}
+
 struct AccessorySpec {
     id: &'static str,
     name: &'static str,
@@ -36,6 +43,8 @@ struct AccessorySpec {
     category: AccessoryCategory,
     /// Routine de peinture sur le canevas pleine taille.
     paint: fn(&mut [u8], usize),
+    /// Animation optionnelle ajoutée au dessin de base.
+    animation: Option<AccessoryAnimationSpec>,
     /// Les auras flottent autour du familier et ne suivent pas son rebond.
     follows_body: bool,
 }
@@ -43,32 +52,52 @@ struct AccessorySpec {
 impl AccessorySpec {
     /// Peint le sprite, l'insère dans l'atlas et enregistre le manifest au catalogue.
     fn register(&self, atlas: &mut SpriteAtlas, catalog: &mut AccessoryCatalog) {
-        let mut pixels = blank_canvas();
-        (self.paint)(&mut pixels, CANVAS_SIZE as usize);
+        let frame_count = self.animation.map_or(1, |animation| animation.frame_count);
+        let mut frames = Vec::with_capacity(frame_count);
 
-        match SpriteFrame::from_raw(CANVAS_SIZE, CANVAS_SIZE, pixels) {
-            Ok(frame) => atlas.insert(self.id, frame),
-            Err(err) => {
-                warn!(
-                    accessory = self.id,
-                    error = %err,
-                    "Génération procédurale incohérente : accessoire non enregistré"
-                );
-                return;
+        for frame_index in 0..frame_count {
+            let mut pixels = blank_canvas();
+            (self.paint)(&mut pixels, CANVAS_SIZE as usize);
+            if let Some(animation) = self.animation {
+                (animation.overlay)(&mut pixels, CANVAS_SIZE as usize, frame_index);
             }
+
+            let frame = match SpriteFrame::from_raw(CANVAS_SIZE, CANVAS_SIZE, pixels) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    warn!(
+                        accessory = self.id,
+                        frame_index,
+                        error = %err,
+                        "Génération procédurale incohérente : accessoire non enregistré"
+                    );
+                    return;
+                }
+            };
+            let key = if frame_index == 0 {
+                self.id.to_string()
+            } else {
+                format!("{}_{frame_index}", self.id)
+            };
+            atlas.insert(key.clone(), frame);
+            frames.push(key);
         }
 
         catalog.register(AccessoryItem::procedural(AccessoryManifest {
             id: self.id.to_string(),
             name: self.name.to_string(),
             author: String::from("Gremlin Studio"),
-            version: String::from("1.0.0"),
+            version: String::from("2.0.0"),
             category: self.category,
             description: self.description.to_string(),
             frame_width: CANVAS_SIZE,
             frame_height: CANVAS_SIZE,
-            frames: vec![self.id.to_string()],
-            frame_duration_ms: DEFAULT_FRAME_DURATION_MS,
+            frames,
+            frame_duration_ms: self
+                .animation
+                .map_or(DEFAULT_FRAME_DURATION_MS, |animation| {
+                    animation.frame_duration_ms
+                }),
             offsets_per_mood: if self.follows_body {
                 body_mood_offsets()
             } else {
@@ -86,6 +115,11 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Confère +10 en concentration lors du débogage Rust.",
         category: AccessoryCategory::Hat,
         paint: paint_wizard_hat,
+        animation: Some(AccessoryAnimationSpec {
+            frame_count: 3,
+            frame_duration_ms: 250,
+            overlay: animate_wizard_hat,
+        }),
         follows_body: true,
     },
     AccessorySpec {
@@ -94,6 +128,7 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Symbole suprême d'une architecture sans warning.",
         category: AccessoryCategory::Hat,
         paint: paint_royal_crown,
+        animation: None,
         follows_body: true,
     },
     AccessorySpec {
@@ -102,6 +137,7 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Casquette portée à l'envers, pour coder à 200 commits/h.",
         category: AccessoryCategory::Hat,
         paint: paint_dev_cap,
+        animation: None,
         follows_body: true,
     },
     AccessorySpec {
@@ -110,6 +146,11 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Immersion totale dans le graphe Git.",
         category: AccessoryCategory::Glasses,
         paint: paint_vr_visor,
+        animation: Some(AccessoryAnimationSpec {
+            frame_count: 2,
+            frame_duration_ms: 300,
+            overlay: animate_vr_visor,
+        }),
         follows_body: true,
     },
     AccessorySpec {
@@ -118,6 +159,7 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Quand la CI passe au vert du premier coup.",
         category: AccessoryCategory::Glasses,
         paint: paint_cool_shades,
+        animation: None,
         follows_body: true,
     },
     AccessorySpec {
@@ -126,6 +168,7 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "L'uniforme officiel du développeur nocturne.",
         category: AccessoryCategory::Outfit,
         paint: paint_cozy_hoodie,
+        animation: None,
         follows_body: true,
     },
     AccessorySpec {
@@ -134,6 +177,11 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Carburant universel à conversion d'idées en code.",
         category: AccessoryCategory::Held,
         paint: paint_coffee_mug,
+        animation: Some(AccessoryAnimationSpec {
+            frame_count: 3,
+            frame_duration_ms: 200,
+            overlay: animate_coffee_mug,
+        }),
         follows_body: true,
     },
     AccessorySpec {
@@ -142,6 +190,7 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Switches tactiles lubrifiés pour cliquetis satisfaisant.",
         category: AccessoryCategory::Held,
         paint: paint_dev_keyboard,
+        animation: None,
         follows_body: true,
     },
     AccessorySpec {
@@ -150,6 +199,7 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Se manifeste lors des sessions de rush intensif.",
         category: AccessoryCategory::Aura,
         paint: paint_fire_aura,
+        animation: None,
         follows_body: false,
     },
     AccessorySpec {
@@ -158,6 +208,11 @@ const BUILTIN_ACCESSORIES: [AccessorySpec; 10] = [
         description: "Symboles et glyphes fluorescents flottant autour de Gremlin.",
         category: AccessoryCategory::Aura,
         paint: paint_matrix_aura,
+        animation: Some(AccessoryAnimationSpec {
+            frame_count: 4,
+            frame_duration_ms: 180,
+            overlay: animate_matrix_aura,
+        }),
         follows_body: false,
     },
 ];
@@ -196,6 +251,20 @@ fn paint_wizard_hat(buf: &mut [u8], size: usize) {
     set_px(buf, size, 31, 16, c_gold);
     set_px(buf, size, 29, 13, c_gold);
     set_px(buf, size, 34, 13, c_gold);
+}
+
+/// Déplace le reflet autour de l'étoile du chapeau.
+fn animate_wizard_hat(buf: &mut [u8], size: usize, frame: usize) {
+    let color = [255, 248, 180, 245];
+    let (x, y) = match frame % 3 {
+        0 => (35, 11),
+        1 => (36, 13),
+        _ => (34, 9),
+    };
+    set_px(buf, size, x, y, color);
+    if frame % 3 == 1 {
+        set_px(buf, size, x + 1, y, color);
+    }
 }
 
 /// Couronne Royale : bandeau doré à trois pointes serties de rubis.
@@ -241,6 +310,14 @@ fn paint_vr_visor(buf: &mut [u8], size: usize) {
     fill_rect(buf, size, 34, 29, 10, 4, c_magenta);
 }
 
+/// Fait circuler un reflet clair sur la visière.
+fn animate_vr_visor(buf: &mut [u8], size: usize, frame: usize) {
+    let color = [235, 255, 255, 245];
+    let start_x = if frame.is_multiple_of(2) { 21 } else { 37 };
+    set_px(buf, size, start_x, 29, color);
+    set_px(buf, size, start_x + 1, 30, color);
+}
+
 /// Lunettes de soleil pixel : verres noirs avec reflets en escalier.
 fn paint_cool_shades(buf: &mut [u8], size: usize) {
     let c_dark_glass = [18, 18, 18, 255];
@@ -278,7 +355,6 @@ fn paint_cozy_hoodie(buf: &mut [u8], size: usize) {
 fn paint_coffee_mug(buf: &mut [u8], size: usize) {
     let c_mug = [236, 240, 241, 255];
     let c_coffee = [109, 76, 65, 255];
-    let c_steam = [200, 200, 200, 180];
 
     // Corps de la tasse
     fill_rect(buf, size, 42, 40, 10, 12, c_mug);
@@ -286,10 +362,30 @@ fn paint_coffee_mug(buf: &mut [u8], size: usize) {
     // Anse (le rectangle transparent creuse l'intérieur)
     fill_rect(buf, size, 52, 42, 3, 7, c_mug);
     fill_rect(buf, size, 52, 44, 1, 3, [0, 0, 0, 0]);
-    // Vapeur
-    set_px(buf, size, 45, 37, c_steam);
-    set_px(buf, size, 46, 36, c_steam);
-    set_px(buf, size, 48, 35, c_steam);
+}
+
+/// Anime les arabesques de vapeur au-dessus de la tasse.
+fn animate_coffee_mug(buf: &mut [u8], size: usize, frame: usize) {
+    let color = [220, 230, 235, 185];
+    match frame % 3 {
+        0 => {
+            set_px(buf, size, 45, 37, color);
+            set_px(buf, size, 46, 36, color);
+            set_px(buf, size, 46, 35, color);
+        }
+        1 => {
+            set_px(buf, size, 47, 37, color);
+            set_px(buf, size, 48, 36, color);
+            set_px(buf, size, 47, 35, color);
+            set_px(buf, size, 46, 34, color);
+        }
+        _ => {
+            set_px(buf, size, 49, 37, color);
+            set_px(buf, size, 48, 36, color);
+            set_px(buf, size, 48, 35, color);
+            set_px(buf, size, 49, 34, color);
+        }
+    }
 }
 
 /// Clavier mécanique aux touches RGB.
@@ -339,6 +435,17 @@ fn paint_matrix_aura(buf: &mut [u8], size: usize) {
         (40, 8, c_matrix),
     ] {
         set_px(buf, size, x, y, color);
+    }
+}
+
+/// Ajoute une rangée lumineuse qui descend autour du familier.
+fn animate_matrix_aura(buf: &mut [u8], size: usize, frame: usize) {
+    let color = [185, 246, 202, 245];
+    let offset = (frame % 4) as i32 * 3;
+    for x in [6, 16, 48, 57] {
+        let y = 8 + (x + offset * 5).rem_euclid(34);
+        set_px(buf, size, x, y, color);
+        set_px(buf, size, x, y + 1, [0, 230, 118, 190]);
     }
 }
 
@@ -436,6 +543,32 @@ mod tests {
                 item.id()
             );
             assert!(item.manifest.primary_frame_key().is_some());
+        }
+    }
+
+    #[test]
+    fn test_accessoires_animes_exposent_des_frames_distinctes() {
+        let mut atlas = SpriteAtlas::new();
+        let mut catalog = AccessoryCatalog::new();
+        register_default_procedural_accessories(&mut atlas, &mut catalog);
+
+        for (id, expected_count) in [
+            ("wizard_hat", 3),
+            ("coffee_mug", 3),
+            ("vr_visor", 2),
+            ("matrix_aura", 4),
+        ] {
+            let Some(item) = catalog.get(id) else {
+                panic!("accessoire animé manquant : {id}");
+            };
+            assert_eq!(item.manifest.frames.len(), expected_count);
+            let Some(first) = atlas.get(&item.manifest.frames[0]) else {
+                panic!("première frame manquante : {id}");
+            };
+            let Some(second) = atlas.get(&item.manifest.frames[1]) else {
+                panic!("deuxième frame manquante : {id}");
+            };
+            assert_ne!(first.rgba, second.rgba, "frames identiques : {id}");
         }
     }
 }

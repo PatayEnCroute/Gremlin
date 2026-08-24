@@ -1,9 +1,10 @@
 //! Moteur de recherche et logique de la palette de commande style Raycast.
 
 use crate::config::AppConfig;
+use crate::ui::search;
 use gremlin_core::PetState;
 use gremlin_render::{AccessoryCatalog, AccessoryCategory, WardrobeEquipment};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Section logique regroupant les éléments dans la liste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,7 +45,121 @@ impl PaletteSection {
             Self::Held => "OBJETS TENUS",
             Self::Auras => "AURAS",
             Self::GitWatcher => "SURVEILLANCE GIT",
-            Self::GeneralSettings => "PREFERENCES SYSTEME",
+            Self::GeneralSettings => "PRÉFÉRENCES SYSTÈME",
+        }
+    }
+
+    /// Groupe de premier niveau auquel appartient la section.
+    ///
+    /// Correspondance totale et unique : c'est elle qui rattache chaque feuille
+    /// à son entrée de racine, sans qu'aucune section ne puisse être orpheline.
+    #[must_use]
+    pub const fn group(self) -> PaletteGroup {
+        match self {
+            Self::PetProfile => PaletteGroup::Profile,
+            Self::PetCare => PaletteGroup::Care,
+            Self::ActiveEquipment
+            | Self::Hats
+            | Self::Glasses
+            | Self::Outfits
+            | Self::Held
+            | Self::Auras => PaletteGroup::Wardrobe,
+            Self::GitWatcher => PaletteGroup::Repos,
+            Self::GeneralSettings => PaletteGroup::Preferences,
+        }
+    }
+}
+
+/// Groupe de premier niveau affiché à la racine du panneau.
+///
+/// La liste présentait une vingtaine d'items — plus un par dépôt Git détecté,
+/// sans plafond, le scan ratissant le répertoire personnel sur cinq niveaux — à
+/// plat sur neuf lignes visibles, sans en-tête ni ascenseur. Regrouper en cinq
+/// entrées de racine rend la liste parcourable, et c'est le modèle de Raycast :
+/// la racine énumère des commandes, chacune ouvrant sa propre liste, la
+/// recherche restant globale et traversant tous les niveaux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PaletteGroup {
+    /// Profil, niveau et jauges vitales.
+    Profile,
+    /// Soins et interactions directes.
+    Care,
+    /// Garde-robe : toutes les catégories d'accessoires.
+    Wardrobe,
+    /// Dépôts Git surveillés.
+    Repos,
+    /// Préférences système et actions de maintenance.
+    Preferences,
+}
+
+impl PaletteGroup {
+    /// Tous les groupes, dans l'ordre d'affichage à la racine.
+    pub const ALL: [Self; 5] = [
+        Self::Profile,
+        Self::Care,
+        Self::Wardrobe,
+        Self::Repos,
+        Self::Preferences,
+    ];
+
+    /// Titre affiché de l'entrée de racine.
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Profile => "Profil du Gremlin",
+            Self::Care => "Soins et actions",
+            Self::Wardrobe => "Garde-robe",
+            Self::Repos => "Dépôts surveillés",
+            Self::Preferences => "Préférences système",
+        }
+    }
+
+    /// Section représentative du groupe.
+    ///
+    /// Ne sert qu'à donner une valeur cohérente au champ `section` d'une entrée
+    /// de racine ; le rendu n'affiche pas de libellé de section sur ces lignes,
+    /// puisqu'elles *sont* les sections.
+    #[must_use]
+    pub const fn sections_head(self) -> PaletteSection {
+        match self {
+            Self::Profile => PaletteSection::PetProfile,
+            Self::Care => PaletteSection::PetCare,
+            Self::Wardrobe => PaletteSection::Hats,
+            Self::Repos => PaletteSection::GitWatcher,
+            Self::Preferences => PaletteSection::GeneralSettings,
+        }
+    }
+
+    /// Sous-titre expliquant ce que le groupe contient.
+    #[must_use]
+    pub const fn subtitle(self) -> &'static str {
+        match self {
+            Self::Profile => "Niveau, humeur, expérience et constantes vitales",
+            Self::Care => "Nourrir, soigner, endormir, réanimer",
+            Self::Wardrobe => "Chapeaux, lunettes, tenues, objets, auras",
+            Self::Repos => "Branches et derniers commits détectés",
+            Self::Preferences => "Démarrage, échelle, dossiers, sauvegarde",
+        }
+    }
+}
+
+/// Niveau de navigation courant du panneau.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaletteView {
+    /// Racine : une entrée par groupe.
+    #[default]
+    Root,
+    /// Contenu d'un groupe.
+    Group(PaletteGroup),
+}
+
+impl PaletteView {
+    /// Fil d'Ariane affiché en tête de la barre de recherche.
+    #[must_use]
+    pub const fn breadcrumb(self) -> Option<&'static str> {
+        match self {
+            Self::Root => None,
+            Self::Group(group) => Some(group.title()),
         }
     }
 }
@@ -89,6 +204,19 @@ pub enum PaletteAction {
     OpenDataFolder,
     /// Force une sauvegarde immédiate de l'état.
     SaveNow,
+    /// Applique la taille de texte suivante du cycle.
+    CycleTextSize,
+    /// Applique le thème suivant du cycle.
+    CycleTheme,
+    /// Bascule la réduction des animations.
+    ToggleReducedMotion,
+    /// Bascule la fermeture du panneau à la perte de focus.
+    ToggleCloseOnFocusLoss,
+    /// Descend dans un groupe de la racine.
+    ///
+    /// Traitée intégralement par la palette : la navigation est un état
+    /// d'interface, elle n'a pas à remonter jusqu'à l'orchestrateur.
+    EnterGroup(PaletteGroup),
     /// Action sans effet direct.
     None,
 }
@@ -155,6 +283,14 @@ pub enum PaletteExecutionResult {
     OpenDataFolder,
     /// Sauvegarde immédiatement.
     SaveNow,
+    /// Applique la taille de texte suivante.
+    CycleTextSize,
+    /// Applique le thème suivant.
+    CycleTheme,
+    /// Bascule la réduction des animations.
+    ToggleReducedMotion,
+    /// Bascule la fermeture à la perte de focus.
+    ToggleCloseOnFocusLoss,
     /// Aucune action.
     None,
 }
@@ -172,6 +308,36 @@ pub struct RepoDisplayInfo {
     pub branch: Option<String>,
     /// Dernier message de commit connu.
     pub last_commit_msg: Option<String>,
+}
+
+impl PaletteItem {
+    /// Indique si l'item est une entrée de racine ouvrant un groupe.
+    ///
+    /// Le rendu s'en sert pour ne pas coiffer ces lignes d'un libellé de
+    /// section : elles *sont* les sections, le libellé ne dirait rien de plus
+    /// que le titre juste à côté.
+    #[must_use]
+    pub const fn is_group_entry(&self) -> bool {
+        matches!(self.action, PaletteAction::EnterGroup(_))
+    }
+
+    /// Indique si l'item représente un réglage à deux états.
+    ///
+    /// L'arbre d'accessibilité s'en sert pour l'annoncer comme un interrupteur,
+    /// avec son état, plutôt que comme une simple ligne de liste dont la
+    /// validation resterait mystérieuse à l'oreille.
+    #[must_use]
+    pub const fn is_toggle(&self) -> bool {
+        matches!(
+            self.action,
+            PaletteAction::ToggleAccessory { .. }
+                | PaletteAction::ToggleSleep
+                | PaletteAction::ToggleClickThrough
+                | PaletteAction::ToggleAutostart
+                | PaletteAction::ToggleReducedMotion
+                | PaletteAction::ToggleCloseOnFocusLoss
+        )
+    }
 }
 
 impl RepoDisplayInfo {
@@ -208,13 +374,32 @@ pub struct PaletteContext<'a> {
 #[derive(Debug, Clone)]
 pub struct CommandPalette {
     query: String,
-    selected_index: usize,
-    all_items: Vec<PaletteItem>,
-    /// Indices dans `all_items` retenus par le filtre courant.
+    /// Position du curseur de saisie, en octets dans `query`.
     ///
-    /// Stocker des indices plutôt que des copies évite de cloner la totalité
+    /// Toujours sur une frontière de caractère : la saisie n'était auparavant
+    /// possible qu'en fin de chaîne, `pop_char` retirant systématiquement le
+    /// dernier caractère quelle que soit l'intention de l'utilisateur.
+    caret: usize,
+    view: PaletteView,
+    selected_index: usize,
+    /// Feuilles : les items réellement actionnables.
+    all_items: Vec<PaletteItem>,
+    /// Entrées de racine, une par groupe non vide.
+    root_items: Vec<PaletteItem>,
+    /// Lignes retenues par le filtre courant.
+    ///
+    /// Stocker des références plutôt que des copies évite de cloner la totalité
     /// des items — `HashMap` de métadonnées comprises — à chaque frappe.
-    filtered_indices: Vec<usize>,
+    filtered: Vec<FilteredRef>,
+}
+
+/// Référence vers une ligne retenue par le filtre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilteredRef {
+    /// Entrée de racine, indice dans `root_items`.
+    Root(usize),
+    /// Feuille, indice dans `all_items`.
+    Leaf(usize),
 }
 
 impl CommandPalette {
@@ -223,9 +408,12 @@ impl CommandPalette {
     pub fn new(context: &PaletteContext<'_>) -> Self {
         let mut palette = Self {
             query: String::new(),
+            caret: 0,
+            view: PaletteView::Root,
             selected_index: 0,
             all_items: Vec::new(),
-            filtered_indices: Vec::new(),
+            root_items: Vec::new(),
+            filtered: Vec::new(),
         };
 
         palette.rebuild_items(context);
@@ -320,7 +508,7 @@ impl CommandPalette {
             subtitle: format!("Satiété actuelle : {:.0}%", stats.satiety()),
             section: PaletteSection::PetCare,
             category: None,
-            badge: Some(format!("+{feed_amount:.0} SATIETE")),
+            badge: Some(format!("+{feed_amount:.0} SATIÉTÉ")),
             is_equipped: false,
             action: PaletteAction::FeedPet,
             metadata: meta_feed,
@@ -370,7 +558,7 @@ impl CommandPalette {
             },
             section: PaletteSection::PetCare,
             category: None,
-            badge: Some(if is_sleeping { "DORT" } else { "EVEILLE" }.into()),
+            badge: Some(if is_sleeping { "DORT" } else { "ÉVEILLÉ" }.into()),
             is_equipped: is_sleeping,
             action: PaletteAction::ToggleSleep,
             metadata: meta_sleep,
@@ -389,7 +577,7 @@ impl CommandPalette {
                 subtitle: "Redonne vie à votre fidèle compagnon".into(),
                 section: PaletteSection::PetCare,
                 category: None,
-                badge: Some("RESURRECTION".into()),
+                badge: Some("RÉSURRECTION".into()),
                 is_equipped: false,
                 action: PaletteAction::RevivePet,
                 metadata: meta_revive,
@@ -409,9 +597,9 @@ impl CommandPalette {
             for item in catalog.items_by_category(cat) {
                 let is_equipped = wardrobe.is_equipped_in(cat, item.id());
                 let badge = if is_equipped {
-                    Some(String::from("EQUIPE"))
+                    Some(String::from("ÉQUIPÉ"))
                 } else if item.is_procedural {
-                    Some(String::from("INTEGRE"))
+                    Some(String::from("INTÉGRÉ"))
                 } else {
                     Some(String::from("MOD"))
                 };
@@ -489,6 +677,112 @@ impl CommandPalette {
             metadata: meta_autostart,
         });
 
+        // Réglages d'accessibilité, groupés avant les réglages de fenêtre : ce
+        // sont eux qui conditionnent la lisibilité de tout le reste.
+        let mut meta_text_size = HashMap::new();
+        meta_text_size.insert("name".into(), "Taille du texte".into());
+        meta_text_size.insert(
+            "description".into(),
+            "La police est dessinée en bitmap : elle ne suit l'échelle du système que par paliers. Ce réglage permet de choisir le palier."
+                .into(),
+        );
+        items.push(PaletteItem {
+            id: "setting_text_size".into(),
+            title: format!("Taille du texte : {}", config.ui.text_size.display_name()),
+            subtitle: format!(
+                "Validez pour passer à « {} »",
+                config.ui.text_size.next().display_name()
+            ),
+            section: PaletteSection::GeneralSettings,
+            category: None,
+            badge: Some(config.ui.text_size.display_name().to_uppercase()),
+            is_equipped: false,
+            action: PaletteAction::CycleTextSize,
+            metadata: meta_text_size,
+        });
+
+        let mut meta_theme = HashMap::new();
+        meta_theme.insert("name".into(), "Thème du panneau".into());
+        meta_theme.insert(
+            "description".into(),
+            "Sombre, clair, ou contraste renforcé pour vision basse. « Système » suit le réglage de l'OS."
+                .into(),
+        );
+        items.push(PaletteItem {
+            id: "setting_theme".into(),
+            title: format!("Thème : {}", config.ui.theme.display_name()),
+            subtitle: format!(
+                "Validez pour passer à « {} »",
+                config.ui.theme.next().display_name()
+            ),
+            section: PaletteSection::GeneralSettings,
+            category: None,
+            badge: Some(config.ui.theme.display_name().to_uppercase()),
+            is_equipped: false,
+            action: PaletteAction::CycleTheme,
+            metadata: meta_theme,
+        });
+
+        let mut meta_motion = HashMap::new();
+        meta_motion.insert("name".into(), "Animations".into());
+        meta_motion.insert(
+            "description".into(),
+            "Le mode réduit fige le curseur de saisie, qui est une animation permanente dans le champ de vision."
+                .into(),
+        );
+        items.push(PaletteItem {
+            id: "setting_reduced_motion".into(),
+            title: format!("Animations : {}", config.ui.motion_label()),
+            subtitle: if config.ui.reduced_motion {
+                "Curseur de saisie fixe".into()
+            } else {
+                "Curseur de saisie clignotant".into()
+            },
+            section: PaletteSection::GeneralSettings,
+            category: None,
+            badge: Some(
+                if config.ui.reduced_motion {
+                    "RÉDUIT"
+                } else {
+                    "COMPLET"
+                }
+                .into(),
+            ),
+            is_equipped: config.ui.reduced_motion,
+            action: PaletteAction::ToggleReducedMotion,
+            metadata: meta_motion,
+        });
+
+        let mut meta_focus = HashMap::new();
+        meta_focus.insert("name".into(), "Fermeture automatique".into());
+        meta_focus.insert(
+            "description".into(),
+            "Referme le panneau dès qu'il perd le focus. Désactivez-le pour le consulter en travaillant à côté."
+                .into(),
+        );
+        items.push(PaletteItem {
+            id: "setting_close_on_focus_loss".into(),
+            title: "Fermer à la perte de focus".into(),
+            subtitle: if config.ui.close_on_focus_loss {
+                "Le panneau se referme dès qu'on clique ailleurs".into()
+            } else {
+                "Le panneau reste ouvert en arrière-plan".into()
+            },
+            section: PaletteSection::GeneralSettings,
+            category: None,
+            badge: Some(
+                if config.ui.close_on_focus_loss {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+                .into(),
+            ),
+            is_equipped: config.ui.close_on_focus_loss,
+            action: PaletteAction::ToggleCloseOnFocusLoss,
+            metadata: meta_focus,
+        });
+
         let next_scale = config.next_scale_factor();
         let mut meta_scale = HashMap::new();
         meta_scale.insert("name".into(), "Échelle de la fenêtre".into());
@@ -560,7 +854,7 @@ impl CommandPalette {
             section: PaletteSection::GeneralSettings,
             category: None,
             badge: Some(if last_save_error.is_some() {
-                "ECHEC".into()
+                "ÉCHEC".into()
             } else {
                 "PERSISTANCE".into()
             }),
@@ -617,20 +911,57 @@ impl CommandPalette {
             subtitle: "Accéder au fichier save.json".into(),
             section: PaletteSection::GeneralSettings,
             category: None,
-            badge: Some("DONNEES".into()),
+            badge: Some("DONNÉES".into()),
             is_equipped: false,
             action: PaletteAction::OpenDataFolder,
             metadata: meta_data_folder,
         });
 
         self.all_items = items;
+        self.rebuild_root_items();
         self.apply_filter();
         self.clamp_selection();
     }
 
-    /// Filtre les items en fonction du texte de recherche.
+    /// Reconstruit les entrées de racine depuis les feuilles disponibles.
+    ///
+    /// Un groupe sans feuille n'apparaît pas : proposer « Dépôts surveillés »
+    /// quand aucun dépôt n'a été détecté mènerait à une liste vide.
+    fn rebuild_root_items(&mut self) {
+        self.root_items.clear();
+
+        for group in PaletteGroup::ALL {
+            let count = self
+                .all_items
+                .iter()
+                .filter(|item| item.section.group() == group)
+                .count();
+            if count == 0 {
+                continue;
+            }
+
+            let mut metadata = HashMap::new();
+            metadata.insert("name".into(), group.title().to_owned());
+            metadata.insert("description".into(), group.subtitle().to_owned());
+
+            self.root_items.push(PaletteItem {
+                id: format!("group_{}", group.title().to_lowercase().replace(' ', "_")),
+                title: group.title().to_owned(),
+                subtitle: group.subtitle().to_owned(),
+                section: group.sections_head(),
+                category: None,
+                badge: Some(count.to_string()),
+                is_equipped: false,
+                action: PaletteAction::EnterGroup(group),
+                metadata,
+            });
+        }
+    }
+
+    /// Remplace la recherche et replace le curseur en fin de saisie.
     pub fn set_query(&mut self, query: impl Into<String>) {
         self.query = query.into();
+        self.caret = self.query.len();
         self.apply_filter();
         self.selected_index = 0;
     }
@@ -641,61 +972,231 @@ impl CommandPalette {
         &self.query
     }
 
-    /// Ajoute un caractère à la recherche.
-    pub fn push_char(&mut self, ch: char) {
-        self.query.push(ch);
+    /// Position du curseur de saisie, en octets.
+    #[must_use]
+    pub const fn caret(&self) -> usize {
+        self.caret
+    }
+
+    /// Niveau de navigation courant.
+    #[must_use]
+    pub const fn view(&self) -> PaletteView {
+        self.view
+    }
+
+    /// Insère un caractère à la position du curseur.
+    pub fn insert_char(&mut self, ch: char) {
+        self.query.insert(self.caret, ch);
+        self.caret += ch.len_utf8();
         self.apply_filter();
         self.selected_index = 0;
     }
 
-    /// Supprime le dernier caractère de la recherche.
-    pub fn pop_char(&mut self) {
-        self.query.pop();
+    /// Supprime le caractère précédant le curseur.
+    pub fn delete_before_caret(&mut self) {
+        let Some((offset, _)) = self.query[..self.caret].char_indices().next_back() else {
+            return;
+        };
+        self.query.remove(offset);
+        self.caret = offset;
         self.apply_filter();
         self.clamp_selection();
     }
 
-    fn apply_filter(&mut self) {
-        let q = self.query.trim().to_lowercase();
-        self.filtered_indices.clear();
+    /// Supprime le mot précédant le curseur.
+    pub fn delete_word_before_caret(&mut self) {
+        let head = &self.query[..self.caret];
+        let trimmed = head.trim_end();
+        let boundary = trimmed
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
 
-        if q.is_empty() {
-            self.filtered_indices.extend(0..self.all_items.len());
+        self.query.replace_range(boundary..self.caret, "");
+        self.caret = boundary;
+        self.apply_filter();
+        self.clamp_selection();
+    }
+
+    /// Efface entièrement la recherche.
+    pub fn clear_query(&mut self) {
+        self.query.clear();
+        self.caret = 0;
+        self.apply_filter();
+        self.selected_index = 0;
+    }
+
+    /// Déplace le curseur d'un caractère vers la gauche.
+    pub fn move_caret_left(&mut self) {
+        if let Some((offset, _)) = self.query[..self.caret].char_indices().next_back() {
+            self.caret = offset;
+        }
+    }
+
+    /// Déplace le curseur d'un caractère vers la droite.
+    pub fn move_caret_right(&mut self) {
+        if let Some(ch) = self.query[self.caret..].chars().next() {
+            self.caret += ch.len_utf8();
+        }
+    }
+
+    /// Place le curseur au début de la saisie.
+    pub const fn move_caret_to_start(&mut self) {
+        self.caret = 0;
+    }
+
+    /// Place le curseur à la fin de la saisie.
+    pub fn move_caret_to_end(&mut self) {
+        self.caret = self.query.len();
+    }
+
+    /// Descend dans un groupe.
+    ///
+    /// La recherche est effacée : elle est globale par nature, la conserver en
+    /// entrant dans un groupe afficherait des résultats venus d'ailleurs.
+    pub fn enter_group(&mut self, group: PaletteGroup) {
+        self.view = PaletteView::Group(group);
+        self.query.clear();
+        self.caret = 0;
+        self.apply_filter();
+        self.selected_index = 0;
+    }
+
+    /// Remonte d'un niveau, en signalant si un niveau a été quitté.
+    ///
+    /// La sélection est reposée sur le groupe qu'on quitte : remonter ne fait
+    /// pas perdre le fil de là où l'on était.
+    pub fn ascend(&mut self) -> bool {
+        let PaletteView::Group(group) = self.view else {
+            return false;
+        };
+
+        self.view = PaletteView::Root;
+        self.query.clear();
+        self.caret = 0;
+        self.apply_filter();
+
+        let target = self
+            .root_items
+            .iter()
+            .position(|item| item.action == PaletteAction::EnterGroup(group));
+        self.selected_index = target
+            .and_then(|root| {
+                self.filtered
+                    .iter()
+                    .position(|reference| *reference == FilteredRef::Root(root))
+            })
+            .unwrap_or(0);
+
+        true
+    }
+
+    fn apply_filter(&mut self) {
+        self.filtered.clear();
+        let query = self.query.trim();
+
+        if query.is_empty() {
+            match self.view {
+                PaletteView::Root => self
+                    .filtered
+                    .extend((0..self.root_items.len()).map(FilteredRef::Root)),
+                PaletteView::Group(group) => self.filtered.extend(
+                    self.all_items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| item.section.group() == group)
+                        .map(|(index, _)| FilteredRef::Leaf(index)),
+                ),
+            }
             return;
         }
 
-        for (idx, item) in self.all_items.iter().enumerate() {
-            if item.title.to_lowercase().contains(&q)
-                || item.subtitle.to_lowercase().contains(&q)
-                || item.id.to_lowercase().contains(&q)
-            {
-                self.filtered_indices.push(idx);
+        // Toute saisie bascule en recherche globale, quel que soit le niveau où
+        // l'on se trouve : c'est le comportement de Raycast, et cela évite
+        // d'obliger l'utilisateur à remonter pour chercher ailleurs.
+        let mut scored: Vec<(PaletteSection, i32, usize)> = Vec::new();
+        for (index, item) in self.all_items.iter().enumerate() {
+            let fields = [
+                item.title.as_str(),
+                item.subtitle.as_str(),
+                item.id.as_str(),
+            ];
+            if let Some(score) = search::best_score(&fields, query) {
+                scored.push((item.section, score, index));
             }
         }
+
+        // Les sections sont ordonnées par leur meilleur score, et les résultats
+        // d'une même section restent contigus : la section la plus pertinente
+        // arrive en tête, et le rendu peut poser un libellé de groupe unique.
+        let mut best_by_section: BTreeMap<PaletteSection, i32> = BTreeMap::new();
+        for (section, score, _) in &scored {
+            let slot = best_by_section.entry(*section).or_insert(i32::MIN);
+            *slot = (*slot).max(*score);
+        }
+
+        scored.sort_by(|left, right| {
+            let left_group = best_by_section.get(&left.0).copied().unwrap_or(i32::MIN);
+            let right_group = best_by_section.get(&right.0).copied().unwrap_or(i32::MIN);
+            right_group
+                .cmp(&left_group)
+                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+
+        self.filtered.extend(
+            scored
+                .into_iter()
+                .map(|(_, _, index)| FilteredRef::Leaf(index)),
+        );
     }
 
     fn clamp_selection(&mut self) {
         self.selected_index = self
             .selected_index
-            .min(self.filtered_indices.len().saturating_sub(1));
+            .min(self.filtered.len().saturating_sub(1));
     }
 
     /// Sélectionne l'élément suivant dans la liste.
     pub fn select_next(&mut self) {
-        if !self.filtered_indices.is_empty() {
-            self.selected_index = (self.selected_index + 1) % self.filtered_indices.len();
+        if !self.filtered.is_empty() {
+            self.selected_index = (self.selected_index + 1) % self.filtered.len();
         }
     }
 
     /// Sélectionne l'élément précédent dans la liste.
     pub fn select_prev(&mut self) {
-        if !self.filtered_indices.is_empty() {
+        if !self.filtered.is_empty() {
             if self.selected_index == 0 {
-                self.selected_index = self.filtered_indices.len() - 1;
+                self.selected_index = self.filtered.len() - 1;
             } else {
                 self.selected_index -= 1;
             }
         }
+    }
+
+    /// Avance la sélection d'une page, sans bouclage.
+    pub fn select_page_down(&mut self, page: usize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let last = self.filtered.len() - 1;
+        self.selected_index = self.selected_index.saturating_add(page.max(1)).min(last);
+    }
+
+    /// Recule la sélection d'une page, sans bouclage.
+    pub fn select_page_up(&mut self, page: usize) {
+        self.selected_index = self.selected_index.saturating_sub(page.max(1));
+    }
+
+    /// Sélectionne le premier élément.
+    pub const fn select_first(&mut self) {
+        self.selected_index = 0;
+    }
+
+    /// Sélectionne le dernier élément.
+    pub fn select_last(&mut self) {
+        self.selected_index = self.filtered.len().saturating_sub(1);
     }
 
     /// Récupère l'élément actuellement sélectionné.
@@ -710,35 +1211,84 @@ impl CommandPalette {
         self.selected_index
     }
 
+    /// Indice du premier élément affiché, pour une fenêtre de `visible` lignes.
+    ///
+    /// Source de vérité **unique** du défilement : le moteur de rendu et le test
+    /// de survol à la souris l'appellent tous deux. Dupliquer ce calcul ferait
+    /// activer une ligne différente de celle que l'utilisateur a cliquée dès que
+    /// les deux formules divergeraient d'une unité.
+    #[must_use]
+    pub const fn scroll_offset(&self, visible: usize) -> usize {
+        self.selected_index
+            .saturating_sub(visible.saturating_sub(1))
+    }
+
+    /// Élément affiché à la `row`-ième ligne visible, s'il existe.
+    #[must_use]
+    pub fn item_at_visible_row(&self, row: usize, visible: usize) -> Option<usize> {
+        let index = self.scroll_offset(visible).checked_add(row)?;
+        (index < self.filtered.len()).then_some(index)
+    }
+
+    /// Place la sélection sur un élément désigné, en bornant l'indice reçu.
+    ///
+    /// Le survol et le clic proviennent de coordonnées de souris : l'indice
+    /// dérivé doit être borné plutôt que supposé valide.
+    pub fn select_index(&mut self, index: usize) {
+        if index < self.filtered.len() {
+            self.selected_index = index;
+        }
+    }
+
     /// Nombre d'éléments retenus par le filtre courant.
     #[must_use]
     pub fn filtered_len(&self) -> usize {
-        self.filtered_indices.len()
+        self.filtered.len()
     }
 
     /// Élément filtré à la position donnée.
     #[must_use]
     pub fn filtered_item(&self, index: usize) -> Option<&PaletteItem> {
-        self.filtered_indices
+        self.filtered
             .get(index)
-            .and_then(|&idx| self.all_items.get(idx))
+            .and_then(|reference| self.resolve(*reference))
     }
 
     /// Itère sur les éléments retenus par le filtre courant.
     pub fn filtered_items(&self) -> impl Iterator<Item = &PaletteItem> + '_ {
-        self.filtered_indices
+        self.filtered
             .iter()
-            .filter_map(|&idx| self.all_items.get(idx))
+            .filter_map(|reference| self.resolve(*reference))
+    }
+
+    /// Résout une référence filtrée vers l'item correspondant.
+    fn resolve(&self, reference: FilteredRef) -> Option<&PaletteItem> {
+        match reference {
+            FilteredRef::Root(index) => self.root_items.get(index),
+            FilteredRef::Leaf(index) => self.all_items.get(index),
+        }
     }
 
     /// Exécute l'action associée à l'élément actuellement sélectionné.
+    ///
+    /// Prend `&mut self` parce que la descente dans un groupe est une action au
+    /// même titre que les autres, et qu'elle modifie l'état de navigation. La
+    /// faire remonter jusqu'à l'orchestrateur pour qu'il la renvoie ensuite à la
+    /// palette n'aurait fait qu'éparpiller la logique.
     #[must_use]
-    pub fn execute_selected(&self, wardrobe: &WardrobeEquipment) -> PaletteExecutionResult {
-        let Some(item) = self.current_selected_item() else {
+    pub fn execute_selected(&mut self, wardrobe: &WardrobeEquipment) -> PaletteExecutionResult {
+        // L'action est copiée avant toute mutation : la navigation emprunte
+        // `self` en écriture, ce qui est incompatible avec la référence prêtée
+        // par `current_selected_item`.
+        let Some(action) = self.current_selected_item().map(|item| item.action.clone()) else {
             return PaletteExecutionResult::None;
         };
 
-        match &item.action {
+        match &action {
+            PaletteAction::EnterGroup(group) => {
+                self.enter_group(*group);
+                PaletteExecutionResult::None
+            }
             PaletteAction::ToggleAccessory { category, id } => {
                 if wardrobe.is_equipped_in(*category, id) {
                     PaletteExecutionResult::UnequipAccessory {
@@ -765,6 +1315,10 @@ impl CommandPalette {
             PaletteAction::OpenModsFolder => PaletteExecutionResult::OpenModsFolder,
             PaletteAction::OpenDataFolder => PaletteExecutionResult::OpenDataFolder,
             PaletteAction::SaveNow => PaletteExecutionResult::SaveNow,
+            PaletteAction::CycleTextSize => PaletteExecutionResult::CycleTextSize,
+            PaletteAction::CycleTheme => PaletteExecutionResult::CycleTheme,
+            PaletteAction::ToggleReducedMotion => PaletteExecutionResult::ToggleReducedMotion,
+            PaletteAction::ToggleCloseOnFocusLoss => PaletteExecutionResult::ToggleCloseOnFocusLoss,
             PaletteAction::None => PaletteExecutionResult::None,
         }
     }
@@ -883,7 +1437,7 @@ mod tests {
         let item = palette
             .filtered_item(0)
             .expect("l'item de sauvegarde doit exister");
-        assert_eq!(item.badge.as_deref(), Some("ECHEC"));
+        assert_eq!(item.badge.as_deref(), Some("ÉCHEC"));
         assert!(item.subtitle.contains("disque plein"));
     }
 
@@ -893,8 +1447,11 @@ mod tests {
         let wardrobe = WardrobeEquipment::default();
         let config = AppConfig::default();
 
+        // La racine n'énumère plus que les groupes : il faut descendre dans
+        // « Profil du Gremlin » pour atteindre la feuille qui porte le badge.
         let healthy = PetState::new("Gizmo");
-        let palette = CommandPalette::new(&context(&catalog, &wardrobe, &healthy, &config));
+        let mut palette = CommandPalette::new(&context(&catalog, &wardrobe, &healthy, &config));
+        palette.enter_group(PaletteGroup::Profile);
         let badge = palette
             .filtered_item(0)
             .and_then(|item| item.badge.clone())
@@ -903,7 +1460,8 @@ mod tests {
 
         let mut critical = PetState::new("Gizmo");
         critical.set_stats(gremlin_core::PetStats::new(5.0, 60.0, 60.0));
-        let palette = CommandPalette::new(&context(&catalog, &wardrobe, &critical, &config));
+        let mut palette = CommandPalette::new(&context(&catalog, &wardrobe, &critical, &config));
+        palette.enter_group(PaletteGroup::Profile);
         let item = palette.filtered_item(0).expect("item de profil");
         assert_eq!(item.badge.as_deref(), Some("CRITIQUE"));
         assert!(item

@@ -15,7 +15,7 @@
 //!    [`ActiveLayer::offset_y`], alimenté par les décalages d'humeur et d'animation).
 //! 2. Le champ `anchors` du [`SkinManifest`] est une **métadonnée descriptive** — le
 //!    point d'attache de référence documenté par l'auteur du skin, exploité par
-//!    l'outillage d'édition. Il n'est **jamais** ajouté comme translation, sans quoi
+//!    l'outillage ou les effets visuels. Il n'est **jamais** ajouté comme translation, sans quoi
 //!    tout skin déclarant un ancrage non nul décalerait deux fois les accessoires
 //!    déjà positionnés.
 //!
@@ -144,39 +144,60 @@ impl LayerCompositor {
         atlas: &SpriteAtlas,
         manifest: Option<&SkinManifest>,
     ) {
-        // Trier les calques par ordre d'affichage (z-index)
-        let mut sorted_layers = layers.to_vec();
-        sorted_layers.sort_by_key(|l| l.layer_type);
-
-        for layer in sorted_layers {
-            let Some(sprite) = atlas.get(&layer.sprite_key) else {
-                warn!(
-                    sprite_key = %layer.sprite_key,
-                    layer = ?layer.layer_type,
-                    "Sprite absent de l'atlas : calque ignoré"
+        // L'ordre est imposé par la petite table statique plutôt que par un
+        // clone et un tri du slice à chaque frame.
+        for layer_type in LayerType::ALL {
+            for layer in layers.iter().filter(|layer| layer.layer_type == layer_type) {
+                Self::compose_sprite(
+                    buffer,
+                    atlas,
+                    manifest,
+                    layer.sprite_key.as_str(),
+                    layer.layer_type,
+                    layer.offset_x,
+                    layer.offset_y,
                 );
-                continue;
-            };
-
-            if let Some(m) = manifest {
-                if let Err(err) = m.validate_frame_size(sprite.width, sprite.height) {
-                    warn!(
-                        sprite_key = %layer.sprite_key,
-                        layer = ?layer.layer_type,
-                        error = %err,
-                        "Dimensions de sprite incohérentes avec le manifest du skin"
-                    );
-                }
             }
-
-            buffer.blit(
-                &sprite.rgba,
-                sprite.width,
-                sprite.height,
-                layer.offset_x,
-                layer.offset_y,
-            );
         }
+    }
+
+    /// Dessine un sprite de calque déjà résolu, sans allocation intermédiaire.
+    fn compose_sprite(
+        buffer: &mut PixelBuffer,
+        atlas: &SpriteAtlas,
+        manifest: Option<&SkinManifest>,
+        sprite_key: &str,
+        layer_type: LayerType,
+        offset_x: i32,
+        offset_y: i32,
+    ) {
+        let Some(sprite) = atlas.get(sprite_key) else {
+            warn!(
+                sprite_key,
+                layer = ?layer_type,
+                "Sprite absent de l'atlas : calque ignoré"
+            );
+            return;
+        };
+
+        if let Some(m) = manifest {
+            if let Err(err) = m.validate_frame_size(sprite.width, sprite.height) {
+                warn!(
+                    sprite_key,
+                    layer = ?layer_type,
+                    error = %err,
+                    "Dimensions de sprite incohérentes avec le manifest du skin"
+                );
+            }
+        }
+
+        buffer.blit(
+            &sprite.rgba,
+            sprite.width,
+            sprite.height,
+            offset_x,
+            offset_y,
+        );
     }
 
     /// Compose entièrement le familier avec sa tenue, ses accessoires équipés et son humeur.
@@ -222,13 +243,31 @@ impl LayerCompositor {
         mood_key: &str,
         elapsed: Duration,
     ) {
-        let mut layers = Vec::with_capacity(LayerType::ALL.len());
+        for layer_type in LayerType::ALL {
+            if layer_type == LayerType::Base {
+                Self::compose_sprite(
+                    buffer,
+                    atlas,
+                    manifest,
+                    base_frame_key,
+                    LayerType::Base,
+                    0,
+                    0,
+                );
+                continue;
+            }
 
-        // Corps du familier : toujours présent, z-index intermédiaire.
-        layers.push(ActiveLayer::new(LayerType::Base, base_frame_key));
-
-        // Accessoires équipés, parcourus dans l'ordre d'empilement des catégories.
-        for (category, accessory_id) in equipment.equipped_slots() {
+            let category = match layer_type {
+                LayerType::Aura => crate::AccessoryCategory::Aura,
+                LayerType::Outfit => crate::AccessoryCategory::Outfit,
+                LayerType::Glasses => crate::AccessoryCategory::Glasses,
+                LayerType::Hat => crate::AccessoryCategory::Hat,
+                LayerType::Held => crate::AccessoryCategory::Held,
+                LayerType::Base => continue,
+            };
+            let Some(accessory_id) = equipment.get_equipped(category) else {
+                continue;
+            };
             let Some(item) = catalog.get(accessory_id) else {
                 warn!(
                     accessory_id,
@@ -237,7 +276,6 @@ impl LayerCompositor {
                 );
                 continue;
             };
-
             let Some(frame) = item.manifest.frame_key_at(elapsed) else {
                 warn!(
                     accessory_id,
@@ -246,17 +284,11 @@ impl LayerCompositor {
                 );
                 continue;
             };
-
-            let (mx, my) = item.manifest.mood_offset(mood_key);
-            layers.push(ActiveLayer::with_offset(
-                category.to_layer_type(),
-                frame,
-                mx,
-                my,
-            ));
+            let (offset_x, offset_y) = item.manifest.mood_offset(mood_key);
+            Self::compose_sprite(
+                buffer, atlas, manifest, frame, layer_type, offset_x, offset_y,
+            );
         }
-
-        Self::compose(buffer, &layers, atlas, manifest);
     }
 }
 
