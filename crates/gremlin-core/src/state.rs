@@ -9,9 +9,11 @@ use crate::action::ActionKind;
 use crate::config::{CoreConfig, MAX_CATCHUP_DURATION_SECS};
 use crate::error::CoreError;
 use crate::events::CoreEvent;
+use crate::focus::{ActivityState, FocusTracker};
 use crate::mood::PetMood;
 use crate::progression::PetProgression;
 use crate::stats::PetStats;
+use crate::tooling::{BreakReason, BuildSummary, RepositoryId, TestSummary, ToolingSession};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -26,6 +28,8 @@ pub const SAVE_FORMAT_VERSION: u32 = 1;
 const DEFAULT_NAME: &str = "Gremlin";
 /// Longueur maximale du nom, en caractères (et non en octets).
 const MAX_NAME_CHARS: usize = 48;
+/// Longueur maximale d'un libellé de dépôt recopié dans un événement.
+const MAX_REPO_LABEL_CHARS: usize = 96;
 
 /// État complet et persistant du compagnon virtuel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -39,6 +43,12 @@ pub struct PetState {
     config: CoreConfig,
     is_sleeping: bool,
     coding_timer_secs: f32,
+    /// Cooldowns et transitions propres au processus courant.
+    #[serde(skip)]
+    tooling_session: ToolingSession,
+    /// Session de focus courante, volontairement non persistée.
+    #[serde(skip)]
+    focus_tracker: FocusTracker,
 }
 
 impl Default for PetState {
@@ -52,6 +62,8 @@ impl Default for PetState {
             config: CoreConfig::default(),
             is_sleeping: false,
             coding_timer_secs: 0.0,
+            tooling_session: ToolingSession::default(),
+            focus_tracker: FocusTracker::default(),
         }
     }
 }
@@ -166,11 +178,12 @@ impl PetState {
     pub fn tick(&mut self, elapsed: Duration) -> Vec<CoreEvent> {
         let mut events = Vec::new();
 
+        let capped = Self::cap_elapsed(elapsed);
+        self.tooling_session.advance(capped);
+
         if self.mood == PetMood::Dead {
             return events;
         }
-
-        let capped = Self::cap_elapsed(elapsed);
         if capped.is_zero() {
             return events;
         }
@@ -208,11 +221,7 @@ impl PetState {
 
         let mut events = Vec::new();
 
-        // Un commit réveille le familier endormi.
-        if self.is_sleeping {
-            self.is_sleeping = false;
-            events.push(CoreEvent::WokeUp);
-        }
+        self.wake_for_development(&mut events);
 
         self.stats.boost_from_commit(
             self.config.actions.commit_energy_boost,
@@ -230,19 +239,159 @@ impl PetState {
             xp_gained: self.config.actions.commit_xp_reward,
         });
 
-        if levels_gained > 0 {
-            events.push(CoreEvent::LevelUp {
-                new_level: self.progression.level(),
-                total_xp: self.progression.total_xp(),
-            });
-        }
-
-        if let Some(new_stage) = evolution {
-            events.push(CoreEvent::EvolutionUnlocked { new_stage });
-        }
+        self.push_progression_events(&mut events, levels_gained, evolution);
 
         self.reevaluate_mood(&mut events);
         Ok(events)
+    }
+
+    /// Assimile un rapport de tests déjà validé par l'orchestrateur.
+    ///
+    /// # Errors
+    /// Renvoie `CoreError::PetIsDead` si le familier doit être réanimé avant
+    /// de pouvoir recevoir une activité de développement.
+    pub fn handle_test_run(
+        &mut self,
+        repository_id: RepositoryId,
+        repo_label: &str,
+        summary: TestSummary,
+    ) -> Result<Vec<CoreEvent>, CoreError> {
+        self.ensure_not_dead(ActionKind::TestRun)?;
+        let tooling = self.config.tooling;
+        let decision = self.tooling_session.register_test_run(
+            repository_id,
+            summary.failed() > 0,
+            summary.has_executed_tests(),
+            Duration::from_secs(tooling.reward_cooldown_secs),
+            Duration::from_secs(tooling.feedback_cooldown_secs),
+        );
+
+        let mut events = Vec::new();
+        self.wake_for_development(&mut events);
+        self.coding_timer_secs = self.config.actions.coding_duration_secs;
+
+        let xp_gained = if decision.reward_allowed {
+            let fix_bonus = if decision.is_fixed {
+                tooling.test_fix_bonus_xp
+            } else {
+                0
+            };
+            self.stats
+                .adjust_happiness(tooling.test_pass_happiness_boost);
+            tooling.test_pass_xp.saturating_add(fix_bonus)
+        } else {
+            if decision.entered_failure {
+                self.stats
+                    .adjust_happiness(-tooling.test_fail_happiness_penalty);
+            }
+            0
+        };
+
+        let (levels_gained, evolution) =
+            self.progression
+                .record_test_run(summary.passed(), summary.failed(), xp_gained);
+        events.push(CoreEvent::TestRunReceived {
+            repo: Self::normalize_repo_label(repo_label),
+            summary,
+            xp_gained,
+            is_fixed: decision.is_fixed,
+            feedback_allowed: decision.feedback_allowed,
+        });
+        self.push_progression_events(&mut events, levels_gained, evolution);
+        self.reevaluate_mood(&mut events);
+        Ok(events)
+    }
+
+    /// Assimile un résultat de build explicite.
+    ///
+    /// # Errors
+    /// Renvoie `CoreError::PetIsDead` si le familier est décédé.
+    pub fn handle_build_result(
+        &mut self,
+        repository_id: RepositoryId,
+        repo_label: &str,
+        summary: BuildSummary,
+    ) -> Result<Vec<CoreEvent>, CoreError> {
+        self.ensure_not_dead(ActionKind::Build)?;
+        let tooling = self.config.tooling;
+        let (reward_allowed, feedback_allowed) = self.tooling_session.register_build(
+            repository_id,
+            summary.success(),
+            Duration::from_secs(tooling.reward_cooldown_secs),
+            Duration::from_secs(tooling.feedback_cooldown_secs),
+        );
+
+        let mut events = Vec::new();
+        self.wake_for_development(&mut events);
+        self.coding_timer_secs = self.config.actions.coding_duration_secs;
+        let xp_gained = if reward_allowed {
+            tooling.build_success_xp
+        } else {
+            0
+        };
+        let (levels_gained, evolution) =
+            self.progression.record_build(summary.success(), xp_gained);
+        events.push(CoreEvent::BuildCompleted {
+            repo: Self::normalize_repo_label(repo_label),
+            summary,
+            xp_gained,
+            feedback_allowed,
+        });
+        self.push_progression_events(&mut events, levels_gained, evolution);
+        self.reevaluate_mood(&mut events);
+        Ok(events)
+    }
+
+    /// Avance l'estimation de focus avec un état d'activité injecté.
+    ///
+    /// Cette méthode est réservée au temps live ; le rattrapage hors-ligne ne
+    /// doit appeler que [`Self::tick`].
+    pub fn track_focus(
+        &mut self,
+        elapsed: Duration,
+        activity: ActivityState,
+        development_seen: bool,
+    ) -> Vec<CoreEvent> {
+        if self.mood == PetMood::Dead {
+            return Vec::new();
+        }
+
+        let update =
+            self.focus_tracker
+                .track(elapsed, activity, development_seen, &self.config.focus);
+        let rewards = self.config.focus.milestone_rewards();
+        let bonus_xp = update
+            .milestones
+            .iter()
+            .zip(rewards)
+            .filter_map(|(reached, reward)| reached.then_some(reward))
+            .fold(0_u64, u64::saturating_add);
+        let (levels_gained, evolution) = self.progression.record_focus(update.credited, bonus_xp);
+
+        let mut events = Vec::new();
+        if let Some(is_idle) = update.idle_changed {
+            events.push(CoreEvent::IdleStateChanged { is_idle });
+        }
+        for (index, reached) in update.milestones.into_iter().enumerate() {
+            if reached {
+                events.push(CoreEvent::FocusMilestoneReached {
+                    duration: self.config.focus.milestone_durations()[index],
+                    bonus_xp: rewards[index],
+                });
+            }
+        }
+        if update.break_recommended {
+            events.push(CoreEvent::BreakRecommended {
+                reason: BreakReason::FocusProlonged,
+            });
+        }
+        self.push_progression_events(&mut events, levels_gained, evolution);
+        events
+    }
+
+    /// Réinitialise la session de focus sans toucher aux statistiques cumulées.
+    pub fn reset_focus_session(&mut self) {
+        self.focus_tracker.reset();
     }
 
     /// Nourrit le Gremlin.
@@ -390,6 +539,7 @@ impl PetState {
         self.stats = PetStats::default();
         self.is_sleeping = false;
         self.coding_timer_secs = 0.0;
+        self.focus_tracker.reset();
         self.mood = PetMood::Happy;
 
         Ok(vec![
@@ -510,6 +660,40 @@ impl PetState {
         }
     }
 
+    fn normalize_repo_label(label: &str) -> String {
+        let trimmed = label.trim();
+        let source = if trimmed.is_empty() {
+            "Dépôt"
+        } else {
+            trimmed
+        };
+        source.chars().take(MAX_REPO_LABEL_CHARS).collect()
+    }
+
+    fn wake_for_development(&mut self, events: &mut Vec<CoreEvent>) {
+        if self.is_sleeping {
+            self.is_sleeping = false;
+            events.push(CoreEvent::WokeUp);
+        }
+    }
+
+    fn push_progression_events(
+        &self,
+        events: &mut Vec<CoreEvent>,
+        levels_gained: u32,
+        evolution: Option<crate::progression::EvolutionStage>,
+    ) {
+        if levels_gained > 0 {
+            events.push(CoreEvent::LevelUp {
+                new_level: self.progression.level(),
+                total_xp: self.progression.total_xp(),
+            });
+        }
+        if let Some(new_stage) = evolution {
+            events.push(CoreEvent::EvolutionUnlocked { new_stage });
+        }
+    }
+
     /// Recalcule l'humeur à partir des statistiques courantes.
     fn refresh_mood(&mut self) {
         self.mood = PetMood::evaluate_from(
@@ -582,6 +766,7 @@ impl PetState {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::{BuildTool, TestFramework};
 
     #[test]
     fn test_handle_commit_and_level_up() {
@@ -607,6 +792,124 @@ mod tests {
             pet.handle_commit("repo", "main"),
             Err(CoreError::PetIsDead(ActionKind::Commit))
         ));
+    }
+
+    #[test]
+    fn test_test_runs_apply_cooldown_and_red_to_green_once() {
+        let mut pet = PetState::new("Gizmo");
+        let repo = RepositoryId::new(7);
+        let failing = TestSummary::new(TestFramework::CargoTest, 3, 1, 0, Duration::from_secs(1));
+        let happiness_before = pet.stats().happiness();
+        let first_failure = pet.handle_test_run(repo, "gremlin", failing).unwrap();
+        assert!(pet.stats().happiness() < happiness_before);
+        assert!(matches!(
+            first_failure.first(),
+            Some(CoreEvent::TestRunReceived {
+                xp_gained: 0,
+                feedback_allowed: true,
+                ..
+            })
+        ));
+
+        let happiness_after_failure = pet.stats().happiness();
+        let repeated_failure = pet.handle_test_run(repo, "gremlin", failing).unwrap();
+        assert_eq!(pet.stats().happiness(), happiness_after_failure);
+        assert!(matches!(
+            repeated_failure.first(),
+            Some(CoreEvent::TestRunReceived {
+                feedback_allowed: false,
+                ..
+            })
+        ));
+
+        let green = TestSummary::new(TestFramework::CargoTest, 4, 0, 0, Duration::from_secs(1));
+        let fixed = pet.handle_test_run(repo, "gremlin", green).unwrap();
+        assert!(matches!(
+            fixed.first(),
+            Some(CoreEvent::TestRunReceived {
+                xp_gained: 75,
+                is_fixed: true,
+                ..
+            })
+        ));
+        let repeated_green = pet.handle_test_run(repo, "gremlin", green).unwrap();
+        assert!(matches!(
+            repeated_green.first(),
+            Some(CoreEvent::TestRunReceived {
+                xp_gained: 0,
+                is_fixed: false,
+                feedback_allowed: false,
+                ..
+            })
+        ));
+        assert_eq!(pet.progression().total_test_runs(), 4);
+        assert_eq!(pet.progression().total_tests_failed(), 2);
+    }
+
+    #[test]
+    fn test_empty_test_run_is_neutral_and_build_reward_is_cooled_down() {
+        let mut pet = PetState::new("Gizmo");
+        let repo = RepositoryId::new(2);
+        let empty = TestSummary::new(TestFramework::GenericJunit, 0, 0, 5, Duration::ZERO);
+        let events = pet.handle_test_run(repo, "gremlin", empty).unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(CoreEvent::TestRunReceived {
+                xp_gained: 0,
+                feedback_allowed: false,
+                ..
+            })
+        ));
+
+        let build = BuildSummary::new(BuildTool::Cargo, true, Duration::from_secs(1));
+        let first = pet.handle_build_result(repo, "gremlin", build).unwrap();
+        let second = pet.handle_build_result(repo, "gremlin", build).unwrap();
+        assert!(matches!(
+            first.first(),
+            Some(CoreEvent::BuildCompleted { xp_gained: 15, .. })
+        ));
+        assert!(matches!(
+            second.first(),
+            Some(CoreEvent::BuildCompleted {
+                xp_gained: 0,
+                feedback_allowed: false,
+                ..
+            })
+        ));
+        assert_eq!(pet.progression().total_builds_succeeded(), 2);
+    }
+
+    #[test]
+    fn test_focus_milestone_is_unique_and_unavailable_time_is_not_credited() {
+        let mut config = CoreConfig::default();
+        config.focus.milestone_secs = [60, 120, 180];
+        config.focus.break_reminder_secs = 180;
+        let mut pet = PetState::with_config("Gizmo", config);
+
+        assert!(pet
+            .track_focus(Duration::from_secs(5), ActivityState::Unavailable, true)
+            .is_empty());
+        assert_eq!(pet.progression().total_focus_secs(), 0);
+
+        let mut milestones = 0;
+        for _ in 0..13 {
+            milestones += pet
+                .track_focus(Duration::from_secs(5), ActivityState::Active, false)
+                .iter()
+                .filter(|event| matches!(event, CoreEvent::FocusMilestoneReached { .. }))
+                .count();
+        }
+        assert_eq!(milestones, 1);
+        assert_eq!(pet.progression().total_focus_secs(), 65);
+
+        let events = pet.track_focus(
+            Duration::from_secs(1),
+            ActivityState::Idle(config.focus.idle_reset_threshold()),
+            false,
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::IdleStateChanged { is_idle: true })));
     }
 
     #[test]

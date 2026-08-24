@@ -28,30 +28,42 @@ use crate::ui::{
 };
 use crate::visual_feedback::{VisualAnchors, VisualCue, VisualFeedback};
 use crossbeam_channel::{Receiver, Sender};
-use gremlin_core::{CoreEvent, PetMood, PetState};
+use gremlin_core::{
+    ActivityState, BuildSummary, BuildTool, CoreEvent, PetMood, PetState, RepositoryId,
+    TestFramework, TestSummary,
+};
 use gremlin_render::{
     register_default_procedural_accessories, AccessoryCatalog, AccessoryItem, AccessoryManifest,
     AnimationController, LayerCompositor, PixelBuffer, PlayMode, SkinManifest,
     SpeechBubbleRenderer, SpriteAnimation, SpriteAtlas, SpriteFrame, TransitionRenderer,
 };
 use gremlin_system::{
-    AppPaths, AutostartManager, PlatformImpl, PlatformWindowExt, SystemTrayManager, TrayMenuAction,
-    WindowConfig,
+    ActivityEvent, ActivityMonitor, AppPaths, AutostartManager, LayeredSurface, PlatformImpl,
+    PlatformWindowExt, SystemTrayManager, TrayMenuAction, WindowConfig,
 };
-use gremlin_watcher::{AssetSignal, AssetWatcher, DevSignal, RepoWatcher, WatcherStatus};
-use std::collections::BTreeSet;
+use gremlin_watcher::{
+    AssetSignal, AssetWatcher, DevSignal, ParsedBuildReport, ParsedTestReport, RepoWatcher,
+    ReportBuildTool, ReportFramework, ToolingStateAck, WatcherStatus,
+};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Agrandissement maximal de la scène du familier à la présentation.
+///
+/// Reprend la borne du module de présentation en couches, afin que les deux
+/// chemins ne puissent pas diverger.
+const MAX_PRESENTATION_SCALE: u32 = 8;
 
 /// Largeur native du framebuffer interne, en pixels.
 pub const NATIVE_WIDTH: u32 = 64;
@@ -75,6 +87,8 @@ const SIMULATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// Bornée volontairement : sous un flot d'événements de système de fichiers,
 /// un canal non borné laisserait la mémoire croître sans limite.
 const SIGNAL_CHANNEL_CAPACITY: usize = 1024;
+/// Nombre maximal de chemins associés à des identifiants de session.
+const REPOSITORY_ID_CAPACITY: usize = 64;
 
 /// Vérifie qu'une clé de sprite désigne uniquement un fichier voisin du manifest.
 ///
@@ -274,6 +288,10 @@ struct UiState {
     exit_requested: bool,
     modifiers: ModifiersState,
     last_save_error: Option<String>,
+    /// Dernier incident de surveillance présenté dans le panneau.
+    last_observation_error: Option<String>,
+    /// État demandé au worker, en attente de confirmation asynchrone.
+    pending_tooling_enabled: Option<bool>,
 }
 
 impl Default for UiState {
@@ -289,6 +307,8 @@ impl Default for UiState {
             exit_requested: false,
             modifiers: ModifiersState::empty(),
             last_save_error: None,
+            last_observation_error: None,
+            pending_tooling_enabled: None,
         }
     }
 }
@@ -329,6 +349,40 @@ struct WatcherBridge {
     dev_sender: Sender<DevSignal>,
     #[cfg_attr(not(test), allow(dead_code))]
     asset_sender: Sender<AssetSignal>,
+    repository_ids: HashMap<PathBuf, RepositoryId>,
+    next_repository_id: u64,
+    tooling_ack: Option<Receiver<ToolingStateAck>>,
+}
+
+fn convert_test_summary(report: ParsedTestReport) -> TestSummary {
+    let framework = match report.framework {
+        ReportFramework::Rust => TestFramework::CargoTest,
+        ReportFramework::JavaScript => TestFramework::JavaScript,
+        ReportFramework::Python => TestFramework::Pytest,
+        ReportFramework::Go => TestFramework::GoTest,
+        ReportFramework::Dotnet => TestFramework::DotnetTest,
+        ReportFramework::Generic => TestFramework::GenericJunit,
+    };
+    TestSummary::new(
+        framework,
+        report.passed,
+        report.failed,
+        report.skipped,
+        report.duration,
+    )
+}
+
+fn convert_build_summary(report: ParsedBuildReport) -> BuildSummary {
+    let tool = match report.tool {
+        ReportBuildTool::Cargo => BuildTool::Cargo,
+        ReportBuildTool::Npm => BuildTool::Npm,
+        ReportBuildTool::WebpackOrVite => BuildTool::WebpackOrVite,
+        ReportBuildTool::Python => BuildTool::Python,
+        ReportBuildTool::Go => BuildTool::Go,
+        ReportBuildTool::Dotnet => BuildTool::Dotnet,
+        ReportBuildTool::Generic => BuildTool::Generic,
+    };
+    BuildSummary::new(tool, report.success, report.duration)
 }
 
 impl WatcherBridge {
@@ -336,6 +390,95 @@ impl WatcherBridge {
     fn shutdown(&mut self) {
         self.repo_watcher = None;
         self.asset_watcher = None;
+    }
+
+    fn repository_id(&mut self, path: &Path) -> RepositoryId {
+        if let Some(id) = self.repository_ids.get(path) {
+            return *id;
+        }
+        if self.repository_ids.len() >= REPOSITORY_ID_CAPACITY {
+            if let Some(oldest) = self.repository_ids.keys().next().cloned() {
+                let _ = self.repository_ids.remove(&oldest);
+            }
+        }
+        let id = RepositoryId::new(self.next_repository_id);
+        self.next_repository_id = self.next_repository_id.saturating_add(1);
+        let _ = self.repository_ids.insert(path.to_path_buf(), id);
+        id
+    }
+
+    fn remove_repository(&mut self, path: &Path) {
+        let _ = self.repository_ids.remove(path);
+    }
+}
+
+/// Mesure d'activité et état de session associés, séparés des watchers disque.
+struct ActivityBridge {
+    monitor: Option<ActivityMonitor>,
+    latest: ActivityState,
+    development_seen: bool,
+    system_integration_available: bool,
+}
+
+impl ActivityBridge {
+    fn new(enabled: bool, system_integration_available: bool) -> (Self, Option<String>) {
+        let mut bridge = Self {
+            monitor: None,
+            latest: ActivityState::Unavailable,
+            development_seen: false,
+            system_integration_available,
+        };
+        let error = if enabled {
+            bridge.start().err().map(|error| error.to_string())
+        } else {
+            None
+        };
+        (bridge, error)
+    }
+
+    fn start(&mut self) -> Result<(), gremlin_system::SystemError> {
+        if !self.system_integration_available {
+            return Err(gremlin_system::SystemError::ActivityUnavailable(
+                "intégration système désactivée".to_owned(),
+            ));
+        }
+        if self.monitor.is_some() {
+            return Ok(());
+        }
+        self.monitor = Some(ActivityMonitor::start()?);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        self.monitor = None;
+        self.latest = ActivityState::Unavailable;
+        self.development_seen = false;
+    }
+
+    fn drain(&mut self, idle_threshold: Duration) -> Option<String> {
+        let Some(monitor) = &self.monitor else {
+            self.latest = ActivityState::Unavailable;
+            return None;
+        };
+        let mut latest_event = None;
+        while let Ok(event) = monitor.events().try_recv() {
+            latest_event = Some(event);
+        }
+        match latest_event {
+            Some(ActivityEvent::Sample(sample)) => {
+                self.latest = if sample.idle_for() >= idle_threshold {
+                    ActivityState::Idle(sample.idle_for())
+                } else {
+                    ActivityState::Active
+                };
+                None
+            }
+            Some(ActivityEvent::Unavailable(reason) | ActivityEvent::ReadFailed(reason)) => {
+                self.latest = ActivityState::Unavailable;
+                Some(reason)
+            }
+            None => None,
+        }
     }
 }
 
@@ -348,6 +491,7 @@ pub struct GremlinApp {
     ui: UiState,
     clocks: LoopClocks,
     watchers: WatcherBridge,
+    activity: ActivityBridge,
     wake_bridge: Option<JoinHandle<()>>,
     window: Option<Arc<Window>>,
     renderer: Option<AppRenderer>,
@@ -357,6 +501,14 @@ pub struct GremlinApp {
     /// n'ouvre jamais les réglages n'en paie pas le coût, et les ouvertures
     /// suivantes sont immédiates.
     settings: Option<SettingsWindow>,
+    /// Présentation à alpha par pixel de la fenêtre du familier.
+    ///
+    /// Renseignée uniquement là où elle est nécessaire et disponible — sous
+    /// Windows. Une surface graphique attachée à un HWND n'y propose aucun mode
+    /// de composition honorant l'alpha : la fenêtre transparente s'y afficherait
+    /// dans un carré noir. Ailleurs, le chemin GPU habituel suffit et ce champ
+    /// reste vide.
+    layered: Option<LayeredSurface>,
     /// Proxy de la boucle d'événements, requis par l'adaptateur d'accessibilité.
     ///
     /// Conservé même sans la feature `a11y`, pour que la construction de
@@ -393,6 +545,9 @@ impl GremlinApp {
     ///
     /// # Errors
     /// Renvoie `AppError` si l'initialisation des chemins échoue.
+    // Le constructeur assemble les cinq caisses et leurs points d'injection ;
+    // les états runtime restent regroupés dans leurs sous-structures dédiées.
+    #[allow(clippy::too_many_lines)]
     pub fn with_options(
         pet_state: PetState,
         mut config: AppConfig,
@@ -469,6 +624,11 @@ impl GremlinApp {
             .as_ref()
             .is_some_and(AutostartManager::is_enabled);
 
+        let (activity, activity_error) = ActivityBridge::new(
+            config.focus_tracking_enabled,
+            options.enable_system_integration,
+        );
+
         let monitored_repos = Vec::new();
         let command_palette = CommandPalette::new(&PaletteContext {
             catalog: &accessory_catalog,
@@ -478,6 +638,8 @@ impl GremlinApp {
             autostart_active,
             repos: &monitored_repos,
             last_save_error: None,
+            last_observation_error: activity_error.as_deref(),
+            pending_tooling_enabled: None,
         });
 
         let now = Instant::now();
@@ -487,7 +649,10 @@ impl GremlinApp {
             paths,
             pet_state,
             visuals,
-            ui: UiState::default(),
+            ui: UiState {
+                last_observation_error: activity_error,
+                ..UiState::default()
+            },
             clocks: LoopClocks::new(now),
             watchers: WatcherBridge {
                 repo_watcher,
@@ -497,11 +662,16 @@ impl GremlinApp {
                 status_receiver,
                 dev_sender,
                 asset_sender,
+                repository_ids: HashMap::new(),
+                next_repository_id: 1,
+                tooling_ack: None,
             },
+            activity,
             wake_bridge,
             window: None,
             renderer: None,
             settings: None,
+            layered: None,
             proxy: retained_proxy,
             platform: PlatformImpl,
             tray_manager,
@@ -833,6 +1003,8 @@ impl GremlinApp {
             autostart_active,
             repos: &self.monitored_repos,
             last_save_error: self.ui.last_save_error.as_deref(),
+            last_observation_error: self.ui.last_observation_error.as_deref(),
+            pending_tooling_enabled: self.ui.pending_tooling_enabled,
         });
     }
 
@@ -1093,11 +1265,7 @@ impl GremlinApp {
             },
             WindowEvent::RedrawRequested => {
                 self.compose_frame();
-                if let Some(renderer) = &mut self.renderer {
-                    if let Err(e) = renderer.render_buffer(&self.visuals.pixel_buffer) {
-                        warn!("Erreur lors du rendu GPU Pixels : {e}");
-                    }
-                }
+                self.present_companion();
                 self.ui.needs_redraw = false;
             }
             _ => {}
@@ -1463,6 +1631,9 @@ impl GremlinApp {
                 }
             }
             PaletteExecutionResult::ToggleAutostart => self.toggle_autostart(),
+            PaletteExecutionResult::ToggleToolingWatcher => self.toggle_tooling_watcher(),
+            PaletteExecutionResult::ToggleFocusTracking => self.toggle_focus_tracking(),
+            PaletteExecutionResult::ToggleBreakReminders => self.toggle_break_reminders(),
             PaletteExecutionResult::SetScaleFactor(factor) => {
                 self.config.scale_factor =
                     factor.clamp(AppConfig::MIN_SCALE_FACTOR, AppConfig::MAX_SCALE_FACTOR);
@@ -1521,6 +1692,54 @@ impl GremlinApp {
         }
     }
 
+    fn toggle_tooling_watcher(&mut self) {
+        let target = !self.config.watcher.tooling_enabled;
+        if let Some(watcher) = &self.watchers.repo_watcher {
+            match watcher.request_tooling_enabled(target) {
+                Ok(receiver) => {
+                    self.watchers.tooling_ack = Some(receiver);
+                    self.ui.pending_tooling_enabled = Some(target);
+                }
+                Err(error) => {
+                    warn!("Bascule de la surveillance d'outillage refusée : {error}");
+                    self.ui.last_observation_error = Some(error.to_string());
+                }
+            }
+        } else {
+            self.config.watcher.tooling_enabled = target;
+            self.ui.last_observation_error = Some(
+                "Watcher indisponible ; préférence enregistrée pour le prochain démarrage"
+                    .to_owned(),
+            );
+        }
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+    }
+
+    fn toggle_focus_tracking(&mut self) {
+        if self.config.focus_tracking_enabled {
+            self.activity.stop();
+            self.pet_state.reset_focus_session();
+            self.config.focus_tracking_enabled = false;
+        } else {
+            match self.activity.start() {
+                Ok(()) => self.config.focus_tracking_enabled = true,
+                Err(error) => {
+                    warn!("Activation du suivi de focus impossible : {error}");
+                    self.ui.last_observation_error = Some(error.to_string());
+                }
+            }
+        }
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+    }
+
+    fn toggle_break_reminders(&mut self) {
+        self.config.break_reminders_enabled = !self.config.break_reminders_enabled;
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+    }
+
     /// Applique une action de soin et journalise son éventuel refus.
     fn apply_care(
         &mut self,
@@ -1575,16 +1794,49 @@ impl GremlinApp {
     /// par `GremlinApp::advance_simulation`.
     pub fn pump_events(&mut self) -> Vec<CoreEvent> {
         self.drain_tray_actions();
+        self.drain_tooling_ack();
         self.drain_watcher_status();
         self.drain_asset_signals();
         self.drain_dev_signals()
+    }
+
+    fn drain_tooling_ack(&mut self) {
+        let received = self.watchers.tooling_ack.as_ref().map(|receiver| {
+            receiver.try_recv().map_err(|error| match error {
+                crossbeam_channel::TryRecvError::Empty => None,
+                crossbeam_channel::TryRecvError::Disconnected => Some(
+                    "Le worker s'est arrêté avant de confirmer la bascule d'outillage".to_owned(),
+                ),
+            })
+        });
+        let ack = match received {
+            Some(Ok(ack)) => ack,
+            Some(Err(Some(error))) => {
+                self.watchers.tooling_ack = None;
+                self.ui.pending_tooling_enabled = None;
+                self.ui.last_observation_error = Some(error);
+                self.rebuild_palette_items();
+                self.ui.panel_needs_redraw = true;
+                return;
+            }
+            Some(Err(None)) | None => return,
+        };
+        self.watchers.tooling_ack = None;
+        self.ui.pending_tooling_enabled = None;
+        self.config.watcher.tooling_enabled = ack.enabled;
+        if let Some(error) = ack.error {
+            self.ui.last_observation_error = Some(error);
+        }
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
     }
 
     /// Remonte les incidents de fiabilité de la surveillance Git.
     ///
     /// Un enregistrement raté ou une perte d'événements signifie que des
     /// commits ne seront pas comptabilisés : le silence n'est pas acceptable.
-    fn drain_watcher_status(&self) {
+    fn drain_watcher_status(&mut self) {
+        let mut palette_changed = false;
         while let Ok(status) = self.watchers.status_receiver.try_recv() {
             match status {
                 WatcherStatus::WatchFailed { path, reason } => {
@@ -1592,14 +1844,40 @@ impl GremlinApp {
                         path = %path.display(),
                         "Surveillance non enregistrée, les commits de ce chemin seront ignorés : {reason}"
                     );
+                    self.ui.last_observation_error = Some(format!(
+                        "Surveillance impossible pour {} : {reason}",
+                        path.display()
+                    ));
+                    palette_changed = true;
                 }
                 WatcherStatus::EventsLost { dropped, reason } => {
                     warn!(
                         dropped,
                         "Événements de système de fichiers perdus, resynchronisation : {reason}"
                     );
+                    self.ui.last_observation_error =
+                        Some(format!("{dropped} événement(s) perdu(s) : {reason}"));
+                    palette_changed = true;
+                }
+                WatcherStatus::ReportRejected { path, reason } => {
+                    warn!(path = %path.display(), "Rapport d'outillage refusé : {reason}");
+                    self.ui.last_observation_error =
+                        Some(format!("Rapport {} refusé : {reason}", path.display()));
+                    palette_changed = true;
+                }
+                WatcherStatus::ToolingStateChanged { enabled, error } => {
+                    self.config.watcher.tooling_enabled = enabled;
+                    self.ui.pending_tooling_enabled = None;
+                    if let Some(reason) = error {
+                        self.ui.last_observation_error = Some(reason);
+                    }
+                    palette_changed = true;
                 }
             }
+        }
+        if palette_changed {
+            self.rebuild_palette_items();
+            self.ui.panel_needs_redraw = true;
         }
     }
 
@@ -1676,7 +1954,7 @@ impl GremlinApp {
                     branch,
                     commit_sha,
                     message,
-                    ..
+                    repo_path,
                 } => {
                     info!(
                         repo = %repo_name,
@@ -1689,6 +1967,8 @@ impl GremlinApp {
                         Ok(events) => core_events.extend(events),
                         Err(e) => warn!("Commit ignoré : {e}"),
                     }
+                    let _repository_id = self.watchers.repository_id(&repo_path);
+                    self.activity.development_seen = true;
 
                     if let Some(r) = self
                         .monitored_repos
@@ -1723,7 +2003,8 @@ impl GremlinApp {
 
                     self.ui.needs_redraw = true;
                 }
-                DevSignal::RepoDiscovered { repo_name, .. } => {
+                DevSignal::RepoDiscovered { repo_name, path } => {
+                    let _repository_id = self.watchers.repository_id(&path);
                     if !self.monitored_repos.iter().any(|r| r.name == repo_name) {
                         // La branche reste inconnue jusqu'au premier signal qui
                         // la renseigne : aucune valeur n'est inventée ici.
@@ -1736,16 +2017,66 @@ impl GremlinApp {
                         self.ui.needs_redraw = true;
                     }
                 }
-                DevSignal::RepoRemoved { repo_name, .. } => {
+                DevSignal::RepoRemoved { repo_name, path } => {
+                    self.watchers.remove_repository(&path);
                     self.monitored_repos.retain(|r| r.name != repo_name);
                     self.rebuild_palette_items();
                     self.ui.needs_redraw = true;
+                }
+                signal @ (DevSignal::TestCompleted { .. } | DevSignal::BuildCompleted { .. }) => {
+                    self.handle_tooling_signal(signal, &mut core_events);
                 }
             }
         }
 
         self.apply_core_events(&core_events);
         core_events
+    }
+
+    fn handle_tooling_signal(&mut self, signal: DevSignal, core_events: &mut Vec<CoreEvent>) {
+        let result = match signal {
+            DevSignal::TestCompleted {
+                repo_name,
+                repo_path,
+                report_path,
+                run_id,
+                summary,
+            } => {
+                info!(repo = %repo_name, report = %report_path.display(), run_id = ?run_id, "Rapport de tests assimilé");
+                let repository_id = self.watchers.repository_id(&repo_path);
+                self.pet_state.handle_test_run(
+                    repository_id,
+                    &repo_name,
+                    convert_test_summary(summary),
+                )
+            }
+            DevSignal::BuildCompleted {
+                repo_name,
+                repo_path,
+                report_path,
+                run_id,
+                summary,
+            } => {
+                info!(repo = %repo_name, report = %report_path.display(), run_id = %run_id, "Rapport de build assimilé");
+                let repository_id = self.watchers.repository_id(&repo_path);
+                self.pet_state.handle_build_result(
+                    repository_id,
+                    &repo_name,
+                    convert_build_summary(summary),
+                )
+            }
+            DevSignal::CommitCreated { .. }
+            | DevSignal::BranchChanged { .. }
+            | DevSignal::RepoDiscovered { .. }
+            | DevSignal::RepoRemoved { .. } => return,
+        };
+        self.activity.development_seen = true;
+        match result {
+            Ok(events) => core_events.extend(events),
+            Err(error) => warn!("Rapport d'outillage ignoré : {error}"),
+        }
+        self.ui.needs_redraw = true;
+        self.ui.panel_needs_redraw = true;
     }
 
     /// Fait avancer la simulation métier si le pas minimal est écoulé.
@@ -1756,9 +2087,82 @@ impl GremlinApp {
         }
 
         self.clocks.simulation = now;
-        let events = self.pet_state.tick(elapsed);
+        if let Some(error) = self
+            .activity
+            .drain(self.pet_state.config().focus.idle_reset_threshold())
+        {
+            warn!("Mesure de focus indisponible : {error}");
+            self.ui.last_observation_error = Some(error);
+            self.rebuild_palette_items();
+            self.ui.panel_needs_redraw = true;
+        }
+
+        let mut events = self.pet_state.tick(elapsed);
+        if self.config.focus_tracking_enabled {
+            let development_seen = std::mem::take(&mut self.activity.development_seen);
+            let mut focus_events =
+                self.pet_state
+                    .track_focus(elapsed, self.activity.latest, development_seen);
+            if !self.config.break_reminders_enabled {
+                focus_events.retain(|event| !matches!(event, CoreEvent::BreakRecommended { .. }));
+            }
+            events.extend(focus_events);
+        }
         self.apply_core_events(&events);
         events
+    }
+
+    /// Présente la scène du familier par le chemin disponible.
+    ///
+    /// La présentation en couches a la priorité : elle seule honore le canal
+    /// alpha. Le chemin GPU ne sert que là où elle n'existe pas.
+    fn present_companion(&mut self) {
+        let scale = self.presentation_scale();
+
+        if let Some(surface) = &mut self.layered {
+            if let Err(e) = surface.present(
+                self.visuals.pixel_buffer.as_bytes(),
+                NATIVE_WIDTH,
+                NATIVE_HEIGHT,
+                scale,
+            ) {
+                warn!("Échec de présentation en couches : {e}");
+            }
+            return;
+        }
+
+        if let Some(renderer) = &mut self.renderer {
+            if let Err(e) = renderer.render_buffer(&self.visuals.pixel_buffer) {
+                warn!("Erreur lors du rendu GPU Pixels : {e}");
+            }
+        }
+    }
+
+    /// Facteur d'agrandissement entier appliqué à la scène du familier.
+    ///
+    /// Combine la préférence d'échelle de l'utilisateur et la densité de l'écran.
+    /// Il doit rester **entier** : c'est la seule mise à l'échelle qui préserve le
+    /// pixel-art. Le résultat est borné, la densité venant du système et l'échelle
+    /// d'un fichier de configuration éditable à la main.
+    fn presentation_scale(&self) -> u32 {
+        let density = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor());
+        let density = if density.is_finite() && density > 0.0 {
+            density
+        } else {
+            1.0
+        };
+
+        let combined = f64::from(self.config.scale_factor) * density;
+        let rounded = if combined.is_finite() {
+            combined.round()
+        } else {
+            1.0
+        };
+
+        (rounded as u32).clamp(1, MAX_PRESENTATION_SCALE)
     }
 
     /// Compose le panneau de paramètres dans son propre tampon.
@@ -1996,21 +2400,27 @@ fn spawn_wake_bridge(
         .spawn(move || {
             let mut dev_open = true;
             let mut asset_open = true;
+            let never_dev = crossbeam_channel::never();
+            let never_asset = crossbeam_channel::never();
 
             while dev_open || asset_open {
+                let dev_receiver = if dev_open { &raw_dev } else { &never_dev };
+                let asset_receiver = if asset_open { &raw_asset } else { &never_asset };
                 crossbeam_channel::select! {
-                    recv(raw_dev) -> msg => match msg {
+                    recv(dev_receiver) -> msg => match msg {
                         Ok(signal) => {
-                            if dev_out.send(signal).is_err() {
-                                break;
+                            match dev_out.try_send(signal) {
+                                Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
                             }
                         }
                         Err(_) => dev_open = false,
                     },
-                    recv(raw_asset) -> msg => match msg {
+                    recv(asset_receiver) -> msg => match msg {
                         Ok(signal) => {
-                            if asset_out.send(signal).is_err() {
-                                break;
+                            match asset_out.try_send(signal) {
+                                Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
                             }
                         }
                         Err(_) => asset_open = false,
@@ -2062,12 +2472,27 @@ impl ApplicationHandler<CustomAppEvent> for GremlinApp {
                     self.apply_click_through(true);
                 }
 
-                match AppRenderer::new(arc_window.clone(), NATIVE_WIDTH, NATIVE_HEIGHT) {
-                    Ok(renderer) => {
-                        self.renderer = Some(renderer);
-                        info!("Surface GPU Pixels initialisée avec succès");
+                // La présentation en couches est tentée d'abord : là où elle
+                // fonctionne, elle est la seule à honorer le canal alpha, et elle
+                // évite au passage tout contexte graphique pour le familier.
+                match LayeredSurface::new(&arc_window) {
+                    Ok(surface) => {
+                        self.layered = Some(surface);
+                        info!("Présentation en couches active : transparence par pixel");
                     }
-                    Err(e) => warn!("Échec d'initialisation du renderer Pixels GPU : {e}"),
+                    Err(e) => {
+                        // Attendu hors Windows : le chemin GPU y suffit.
+                        debug!("Présentation en couches indisponible, repli GPU : {e}");
+                        match AppRenderer::new(arc_window.clone(), NATIVE_WIDTH, NATIVE_HEIGHT) {
+                            Ok(renderer) => {
+                                self.renderer = Some(renderer);
+                                info!("Surface GPU Pixels initialisée avec succès");
+                            }
+                            Err(e) => {
+                                warn!("Échec d'initialisation du renderer Pixels GPU : {e}");
+                            }
+                        }
+                    }
                 }
 
                 self.ui.needs_redraw = true;
@@ -2255,6 +2680,12 @@ mod tests {
         assert!(app.watchers.asset_watcher.is_none());
         assert!(app.tray_manager.is_none());
         assert!(app.autostart_manager.is_none());
+        assert!(app.activity.monitor.is_none());
+        assert!(app
+            .ui
+            .last_observation_error
+            .as_deref()
+            .is_some_and(|message| message.contains("intégration système désactivée")));
     }
 
     #[test]
@@ -2454,6 +2885,66 @@ mod tests {
     }
 
     #[test]
+    fn test_test_report_reaches_core_and_visual_feedback() {
+        let env = TempEnv::new("test-report");
+        let mut app = headless_app(&env, AppConfig::default());
+        app.dev_sender()
+            .send(DevSignal::TestCompleted {
+                repo_name: "gremlin".into(),
+                repo_path: env.root.clone(),
+                report_path: env.root.join("junit.xml"),
+                run_id: Some("run-1".into()),
+                summary: ParsedTestReport {
+                    framework: ReportFramework::Rust,
+                    passed: 12,
+                    failed: 0,
+                    skipped: 1,
+                    duration: Duration::from_secs(2),
+                },
+            })
+            .expect("envoi du rapport");
+
+        let events = app.pump_events();
+        assert!(events.iter().any(
+            |event| matches!(event, CoreEvent::TestRunReceived { xp_gained, .. } if *xp_gained > 0)
+        ));
+        assert_eq!(app.pet_state.progression().total_tests_passed(), 12);
+        assert_eq!(
+            app.visuals.feedback.active_dialogue(),
+            Some(crate::dialogue::DialogueId::TestsPassed)
+        );
+    }
+
+    #[test]
+    fn test_build_report_reaches_core_and_visual_feedback() {
+        let env = TempEnv::new("build-report");
+        let mut app = headless_app(&env, AppConfig::default());
+        app.dev_sender()
+            .send(DevSignal::BuildCompleted {
+                repo_name: "gremlin".into(),
+                repo_path: env.root.clone(),
+                report_path: env.root.join(".gremlin/results/build.json"),
+                run_id: "build-1".into(),
+                summary: ParsedBuildReport {
+                    tool: ReportBuildTool::Cargo,
+                    success: false,
+                    duration: Duration::from_secs(3),
+                },
+            })
+            .expect("envoi du rapport");
+
+        let events = app.pump_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CoreEvent::BuildCompleted { summary, .. } if !summary.success()
+        )));
+        assert_eq!(
+            app.visuals.feedback.active_dialogue(),
+            Some(crate::dialogue::DialogueId::BuildFailed)
+        );
+    }
+
+    #[test]
     fn test_repo_discovery_and_removal_update_the_palette() {
         let env = TempEnv::new("repos");
         let mut app = headless_app(&env, AppConfig::default());
@@ -2542,6 +3033,44 @@ mod tests {
 
         app.handle_execution_result(PaletteExecutionResult::RevivePet);
         assert!(app.pet_state.is_alive());
+    }
+
+    #[test]
+    fn test_composed_pet_frame_keeps_its_transparency() {
+        // La fenêtre du familier est transparente : tout pixel que le sprite ne
+        // couvre pas doit rester à alpha zéro dans le tampon. Un fond opaque ici
+        // se traduirait par un carré visible sur le bureau.
+        let env = TempEnv::new("alpha");
+        let mut app = headless_app(&env, AppConfig::default());
+        app.load_skin("default");
+        app.compose_frame();
+
+        let bytes = app.visuals.pixel_buffer.as_bytes();
+        let width = app.visuals.pixel_buffer.width() as usize;
+        let height = app.visuals.pixel_buffer.height() as usize;
+
+        // Les quatre coins sont hors silhouette dans tous les sprites livrés.
+        for (x, y) in [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ] {
+            let alpha = bytes[(y * width + x) * 4 + 3];
+            assert_eq!(
+                alpha, 0,
+                "le coin ({x}, {y}) du tampon est opaque : la fenêtre montrera un fond"
+            );
+        }
+
+        // Et le sprite ne doit pas couvrir toute la toile : sans pixels
+        // transparents du tout, le test précédent ne prouverait rien.
+        let transparent = bytes.chunks_exact(4).filter(|px| px[3] == 0).count();
+        let opaque = bytes.chunks_exact(4).filter(|px| px[3] > 0).count();
+        assert!(
+            transparent > 0 && opaque > 0,
+            "toile entièrement uniforme : {transparent} transparents, {opaque} opaques"
+        );
     }
 
     #[test]

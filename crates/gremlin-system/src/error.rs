@@ -43,6 +43,14 @@ pub enum SystemError {
     #[error("le démarrage automatique n'est pas supporté par cette plateforme")]
     AutostartUnsupported,
 
+    /// La session graphique courante n'expose pas de compteur d'inactivité.
+    #[error("mesure d'inactivité indisponible : {0}")]
+    ActivityUnavailable(String),
+
+    /// Le compteur d'inactivité existe, mais sa lecture a échoué.
+    #[error("échec de lecture de l'inactivité : {0}")]
+    ActivityReadFailed(String),
+
     /// Erreur d'I/O système.
     #[error("erreur I/O système : {0}")]
     Io(#[from] std::io::Error),

@@ -13,6 +13,14 @@ const QUEUE_CAPACITY: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogueId {
     Commit,
+    TestsPassed,
+    TestsFixed,
+    TestsFailed,
+    BuildPassed,
+    BuildFailed,
+    FocusMilestone,
+    BreakReminder,
+    Returned,
     LevelUp,
     Evolution,
     Fed,
@@ -33,6 +41,14 @@ impl DialogueId {
     pub(super) const fn text(self) -> &'static str {
         match self {
             Self::Commit => "Bon commit",
+            Self::TestsPassed => "Tests OK",
+            Self::TestsFixed => "Tout vert",
+            Self::TestsFailed => "À corriger",
+            Self::BuildPassed => "Build OK",
+            Self::BuildFailed => "Build KO",
+            Self::FocusMilestone => "Bon focus",
+            Self::BreakReminder | Self::Tired => "Une pause ?",
+            Self::Returned => "Rebonjour",
             Self::LevelUp => "Niveau +1",
             Self::Evolution => "Évolution",
             Self::Fed => "Merci !",
@@ -41,7 +57,6 @@ impl DialogueId {
             Self::Sleeping => "Au repos",
             Self::WokeUp => "Me revoilà",
             Self::Hungry => "J'ai faim",
-            Self::Tired => "Une pause ?",
             Self::Sick => "Besoin aide",
             Self::Angry => "Grrr...",
             Self::Died => "Oh non...",
@@ -57,10 +72,15 @@ impl DialogueId {
             Self::Died | Self::Revived => 80,
             Self::Healed => 70,
             Self::Fed | Self::Petted => 60,
-            Self::Commit => 50,
+            Self::Commit
+            | Self::TestsPassed
+            | Self::TestsFixed
+            | Self::TestsFailed
+            | Self::BuildPassed
+            | Self::BuildFailed => 50,
             Self::Sick | Self::Hungry | Self::Tired | Self::Angry => 40,
-            Self::Sleeping | Self::WokeUp => 30,
-            Self::Dragged => 20,
+            Self::Sleeping | Self::WokeUp | Self::Returned => 30,
+            Self::Dragged | Self::FocusMilestone | Self::BreakReminder => 20,
         }
     }
 }
@@ -273,5 +293,41 @@ mod tests {
         };
         assert_eq!(view.text, "Ça va mieux");
         assert_eq!(view.target_anchor, (30, 18));
+    }
+
+    #[test]
+    fn test_toutes_les_repliques_tiennent_dans_la_vraie_grille() {
+        let dialogues = [
+            DialogueId::Commit,
+            DialogueId::TestsPassed,
+            DialogueId::TestsFixed,
+            DialogueId::TestsFailed,
+            DialogueId::BuildPassed,
+            DialogueId::BuildFailed,
+            DialogueId::FocusMilestone,
+            DialogueId::BreakReminder,
+            DialogueId::Returned,
+            DialogueId::LevelUp,
+            DialogueId::Evolution,
+            DialogueId::Fed,
+            DialogueId::Petted,
+            DialogueId::Healed,
+            DialogueId::Sleeping,
+            DialogueId::WokeUp,
+            DialogueId::Hungry,
+            DialogueId::Tired,
+            DialogueId::Sick,
+            DialogueId::Angry,
+            DialogueId::Died,
+            DialogueId::Revived,
+            DialogueId::Dragged,
+        ];
+        for dialogue in dialogues {
+            assert!(
+                gremlin_render::SpeechBubbleRenderer::text_fits(dialogue.text()),
+                "réplique tronquée : {}",
+                dialogue.text()
+            );
+        }
     }
 }

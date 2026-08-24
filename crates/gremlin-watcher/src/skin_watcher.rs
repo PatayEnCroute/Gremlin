@@ -185,9 +185,7 @@ impl AssetWatcher {
                 }
                 Wake::Message(AssetMessage::Error(reason)) => {
                     warn!("Erreur reçue de notify dans AssetWatcher : {reason}");
-                    if signal_sender
-                        .send(AssetSignal::AssetsReloadRequested)
-                        .is_err()
+                    if !Self::emit_asset(signal_sender, AssetSignal::AssetsReloadRequested, dropped)
                     {
                         return;
                     }
@@ -199,7 +197,7 @@ impl AssetWatcher {
                             continue;
                         };
                         info!(path = %path.display(), "Modification d'asset détectée — rechargement à chaud");
-                        if signal_sender.send(signal).is_err() {
+                        if !Self::emit_asset(signal_sender, signal, dropped) {
                             // Plus personne n'écoute : inutile de continuer à travailler.
                             debug!("Consommateur d'assets fermé — arrêt de la surveillance");
                             return;
@@ -209,12 +207,21 @@ impl AssetWatcher {
             }
 
             if dropped.swap(0, Ordering::Relaxed) > 0
-                && signal_sender
-                    .send(AssetSignal::AssetsReloadRequested)
-                    .is_err()
+                && !Self::emit_asset(signal_sender, AssetSignal::AssetsReloadRequested, dropped)
             {
                 return;
             }
+        }
+    }
+
+    fn emit_asset(sender: &Sender<AssetSignal>, signal: AssetSignal, dropped: &AtomicU64) -> bool {
+        match sender.try_send(signal) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                let _ = dropped.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
         }
     }
 

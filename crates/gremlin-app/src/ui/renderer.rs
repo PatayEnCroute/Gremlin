@@ -884,6 +884,8 @@ mod tests {
             autostart_active: false,
             repos,
             last_save_error: None,
+            last_observation_error: None,
+            pending_tooling_enabled: None,
         });
         palette.set_query(query);
 
@@ -1034,6 +1036,8 @@ mod tests {
             autostart_active: false,
             repos: &repos,
             last_save_error: None,
+            last_observation_error: None,
+            pending_tooling_enabled: None,
         });
 
         // Les deux cents dépôts vivent dans leur groupe : la racine, elle, tient
@@ -1096,6 +1100,8 @@ mod tests {
             autostart_active: false,
             repos: &[],
             last_save_error: None,
+            last_observation_error: None,
+            pending_tooling_enabled: None,
         });
 
         // On descend au-delà de la fenêtre visible : le rendu doit suivre sans

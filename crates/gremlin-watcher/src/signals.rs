@@ -1,6 +1,55 @@
 //! Signaux émis par le module de surveillance Git vers l'orchestrateur.
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Écosystème identifié par le watcher, indépendant du modèle métier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportFramework {
+    Rust,
+    JavaScript,
+    Python,
+    Go,
+    Dotnet,
+    Generic,
+}
+
+/// Résumé de tests validé à la frontière disque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedTestReport {
+    pub framework: ReportFramework,
+    pub passed: u32,
+    pub failed: u32,
+    pub skipped: u32,
+    pub duration: Duration,
+}
+
+/// Outil de build identifié par le watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportBuildTool {
+    Cargo,
+    Npm,
+    WebpackOrVite,
+    Python,
+    Go,
+    Dotnet,
+    Generic,
+}
+
+/// Résumé de build validé à la frontière disque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedBuildReport {
+    pub tool: ReportBuildTool,
+    pub success: bool,
+    pub duration: Duration,
+}
+
+/// Confirmation dédiée d'une bascule de surveillance d'outillage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolingStateAck {
+    pub enabled: bool,
+    pub error: Option<String>,
+}
 
 /// Signal de développement émis par le système de surveillance de fichiers et dépôts Git.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +96,22 @@ pub enum DevSignal {
         /// Chemin absolu du dépôt.
         path: PathBuf,
     },
+    /// Un rapport de tests complet a été détecté.
+    TestCompleted {
+        repo_name: String,
+        repo_path: PathBuf,
+        report_path: PathBuf,
+        run_id: Option<String>,
+        summary: ParsedTestReport,
+    },
+    /// Un résultat de build explicite a été détecté.
+    BuildCompleted {
+        repo_name: String,
+        repo_path: PathBuf,
+        report_path: PathBuf,
+        run_id: String,
+        summary: ParsedBuildReport,
+    },
 }
 
 /// Incident de fonctionnement de la surveillance, transmis sur un canal facultatif.
@@ -70,5 +135,14 @@ pub enum WatcherStatus {
         dropped: u64,
         /// Description de la cause.
         reason: String,
+    },
+    /// Un rapport a été refusé après la fin des tentatives bornées.
+    ReportRejected { path: PathBuf, reason: String },
+    /// La surveillance des rapports a effectivement changé d'état dans le worker.
+    ToolingStateChanged {
+        /// État désormais appliqué.
+        enabled: bool,
+        /// Cause d'un éventuel échec partiel d'enregistrement.
+        error: Option<String>,
     },
 }

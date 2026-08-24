@@ -96,6 +96,11 @@ impl VisualFeedback {
                 CoreEvent::WokeUp => self.set_ambient_for_mood(PetMood::Happy),
                 CoreEvent::Died => self.set_ambient_for_mood(PetMood::Dead),
                 CoreEvent::CommitReceived { .. }
+                | CoreEvent::TestRunReceived { .. }
+                | CoreEvent::BuildCompleted { .. }
+                | CoreEvent::FocusMilestoneReached { .. }
+                | CoreEvent::BreakRecommended { .. }
+                | CoreEvent::IdleStateChanged { .. }
                 | CoreEvent::LevelUp { .. }
                 | CoreEvent::EvolutionUnlocked { .. }
                 | CoreEvent::StatsDecayed { .. }
@@ -225,6 +230,30 @@ fn reaction_for_event(event: &CoreEvent) -> Option<Reaction> {
             dialogue: DialogueId::Commit,
             particles: Some(ParticlePreset::SparkBurst),
         },
+        CoreEvent::TestRunReceived { .. } => return test_reaction(event),
+        CoreEvent::BuildCompleted {
+            summary,
+            feedback_allowed,
+            ..
+        } => return build_reaction(*summary, *feedback_allowed),
+        CoreEvent::FocusMilestoneReached { .. } => Reaction {
+            priority: 20,
+            dialogue: DialogueId::FocusMilestone,
+            particles: Some(ParticlePreset::SparkBurst),
+        },
+        CoreEvent::BreakRecommended { .. } => Reaction {
+            priority: 20,
+            dialogue: DialogueId::BreakReminder,
+            particles: None,
+        },
+        CoreEvent::IdleStateChanged { is_idle: false } => Reaction {
+            priority: 30,
+            dialogue: DialogueId::Returned,
+            particles: Some(ParticlePreset::FloatingHearts),
+        },
+        CoreEvent::IdleStateChanged { is_idle: true } | CoreEvent::StatsDecayed { .. } => {
+            return None;
+        }
         CoreEvent::LevelUp { .. } => Reaction {
             priority: 90,
             dialogue: DialogueId::LevelUp,
@@ -275,9 +304,65 @@ fn reaction_for_event(event: &CoreEvent) -> Option<Reaction> {
             dialogue: dialogue_for_mood(*to)?,
             particles: None,
         },
-        CoreEvent::StatsDecayed { .. } => return None,
     };
     Some(reaction)
+}
+
+fn test_reaction(event: &CoreEvent) -> Option<Reaction> {
+    let CoreEvent::TestRunReceived {
+        summary,
+        is_fixed,
+        feedback_allowed,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if !feedback_allowed {
+        return None;
+    }
+    if *is_fixed {
+        return Some(Reaction {
+            priority: 55,
+            dialogue: DialogueId::TestsFixed,
+            particles: Some(ParticlePreset::ConfettiBurst),
+        });
+    }
+    Some(Reaction {
+        priority: 50,
+        dialogue: if summary.is_all_passed() {
+            DialogueId::TestsPassed
+        } else {
+            DialogueId::TestsFailed
+        },
+        particles: Some(if summary.is_all_passed() {
+            ParticlePreset::SparkBurst
+        } else {
+            ParticlePreset::FallingDrop
+        }),
+    })
+}
+
+const fn build_reaction(
+    summary: gremlin_core::BuildSummary,
+    feedback_allowed: bool,
+) -> Option<Reaction> {
+    if !feedback_allowed {
+        return None;
+    }
+    Some(Reaction {
+        priority: 50,
+        dialogue: if summary.success() {
+            DialogueId::BuildPassed
+        } else {
+            DialogueId::BuildFailed
+        },
+        particles: Some(if summary.success() {
+            ParticlePreset::SparkBurst
+        } else {
+            ParticlePreset::FallingDrop
+        }),
+    })
 }
 
 const fn dialogue_for_mood(mood: PetMood) -> Option<DialogueId> {
@@ -304,7 +389,7 @@ const fn ambient_interval(preset: ParticlePreset) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gremlin_core::EvolutionStage;
+    use gremlin_core::{EvolutionStage, TestFramework, TestSummary};
 
     #[test]
     fn test_lot_compose_selectionne_evolution() {
@@ -360,5 +445,43 @@ mod tests {
         }]);
         feedback.update(CRITICAL_EMISSION_INTERVAL);
         assert!(feedback.active_particle_count() <= emitted);
+    }
+
+    #[test]
+    fn test_feedback_interdit_ne_declenche_ni_bulle_ni_particule() {
+        let mut feedback = VisualFeedback::new();
+        feedback.handle_core_events(&[CoreEvent::TestRunReceived {
+            repo: "gremlin".into(),
+            summary: TestSummary::new(TestFramework::CargoTest, 10, 0, 0, Duration::from_secs(1)),
+            xp_gained: 0,
+            is_fixed: false,
+            feedback_allowed: false,
+        }]);
+        assert_eq!(feedback.active_dialogue(), None);
+        assert_eq!(feedback.active_particle_count(), 0);
+    }
+
+    #[test]
+    fn test_evolution_prime_sur_un_result_de_tests() {
+        let mut feedback = VisualFeedback::new();
+        feedback.handle_core_events(&[
+            CoreEvent::TestRunReceived {
+                repo: "gremlin".into(),
+                summary: TestSummary::new(
+                    TestFramework::CargoTest,
+                    10,
+                    0,
+                    0,
+                    Duration::from_secs(1),
+                ),
+                xp_gained: 25,
+                is_fixed: false,
+                feedback_allowed: true,
+            },
+            CoreEvent::EvolutionUnlocked {
+                new_stage: EvolutionStage::Teen,
+            },
+        ]);
+        assert_eq!(feedback.active_dialogue(), Some(DialogueId::Evolution));
     }
 }

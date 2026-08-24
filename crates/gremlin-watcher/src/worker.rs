@@ -8,13 +8,15 @@
 //! lot **borné** d'événements de fichiers, puis les dépôts stabilisés. Aucune rafale
 //! d'événements ne peut donc affamer un `Shutdown` ni retarder indéfiniment un flush.
 
+use crate::config::WatcherConfig;
 use crate::debouncer::EventDebouncer;
 use crate::error::WatcherError;
 use crate::git_parser::GitRefParser;
 use crate::git_path::{analyze_git_path, normalize_path, GitPathKind, GIT_DIR_NAME};
 use crate::scanner::is_ignored_directory;
-use crate::signals::{DevSignal, WatcherStatus};
-use crossbeam_channel::{Receiver, Select, Sender, TryRecvError};
+use crate::signals::{DevSignal, ToolingStateAck, WatcherStatus};
+use crate::tooling::{ToolingEvent, ToolingPipeline};
+use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, TrySendError};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -93,6 +95,8 @@ pub enum WatcherControl {
     SetStatusSender(Sender<WatcherStatus>),
     /// Demander la liste des dépôts actuellement surveillés.
     ListRepos(Sender<Vec<PathBuf>>),
+    /// Activer ou désactiver réellement les ancres de rapports.
+    SetToolingEnabled(bool, Sender<ToolingStateAck>),
     /// Arrêter le worker.
     Shutdown,
 }
@@ -108,6 +112,8 @@ struct RepoEntry {
     seeded: bool,
     /// Nombre de relectures consécutives infructueuses.
     read_retries: u8,
+    /// Ancres de rapports enregistrées exclusivement pour ce dépôt.
+    tooling_watched: Vec<PathBuf>,
 }
 
 /// Suite à donner après le traitement d'une commande.
@@ -136,6 +142,7 @@ pub struct WatcherWorker {
     dropped_events: Arc<AtomicU64>,
     is_running: Arc<AtomicBool>,
     last_sweep: Instant,
+    tooling: ToolingPipeline,
 }
 
 impl WatcherWorker {
@@ -143,15 +150,15 @@ impl WatcherWorker {
     pub fn new(
         watcher: RecommendedWatcher,
         signal_sender: Sender<DevSignal>,
-        debounce_duration: Duration,
+        config: &WatcherConfig,
         dropped_events: Arc<AtomicU64>,
         is_running: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, WatcherError> {
+        Ok(Self {
             watcher,
             signal_sender,
             status_sender: None,
-            debouncer: EventDebouncer::new(debounce_duration),
+            debouncer: EventDebouncer::new(config.debounce_duration()),
             repos: HashMap::new(),
             aliases: HashMap::new(),
             roots: HashSet::new(),
@@ -160,7 +167,8 @@ impl WatcherWorker {
             dropped_events,
             is_running,
             last_sweep: Instant::now(),
-        }
+            tooling: ToolingPipeline::new(config)?,
+        })
     }
 
     /// Boucle principale du worker.
@@ -181,20 +189,24 @@ impl WatcherWorker {
             // 2. Lot borné d'événements de fichiers.
             self.drain_events(notify_rx, &mut progressed);
 
-            // 3. Événements perdus : resynchronisation complète.
+            // 3. Rapports stabilisés et résultats du parser dédié.
+            self.tooling.submit_ready();
+            self.drain_tooling(&mut progressed);
+
+            // 4. Événements perdus : resynchronisation complète.
             self.absorb_dropped_events();
 
-            // 4. Dépôts stabilisés.
+            // 5. Dépôts stabilisés.
             for repo in self.debouncer.poll_ready() {
                 self.emit_repo_signals(&repo);
             }
 
-            // 5. Contrôle périodique d'existence des dépôts.
+            // 6. Contrôle périodique d'existence des dépôts.
             if self.last_sweep.elapsed() >= LIVENESS_SWEEP_INTERVAL {
                 self.sweep_dead_repos();
             }
 
-            // 6. Rien à faire : sommeil borné jusqu'au prochain réveil utile.
+            // 7. Rien à faire : sommeil borné jusqu'au prochain réveil utile.
             if !progressed {
                 self.idle_wait(notify_rx, control_rx);
             }
@@ -241,6 +253,17 @@ impl WatcherWorker {
         }
     }
 
+    fn drain_tooling(&mut self, progressed: &mut bool) {
+        let events = self.tooling.drain_results();
+        *progressed |= !events.is_empty();
+        for event in events {
+            match event {
+                ToolingEvent::Signal(signal) => self.emit(signal),
+                ToolingEvent::Status(status) => self.report_status(status),
+            }
+        }
+    }
+
     /// Attend passivement le prochain réveil utile (événement, commande ou échéance).
     ///
     /// Sans dépôt surveillé ni stabilisation en cours, l'attente est strictement
@@ -252,14 +275,19 @@ impl WatcherWorker {
     ) {
         let sweep_deadline = (!self.repos.is_empty())
             .then(|| LIVENESS_SWEEP_INTERVAL.saturating_sub(self.last_sweep.elapsed()));
-        let deadline = [self.debouncer.time_until_next_ready(), sweep_deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        let deadline = [
+            self.debouncer.time_until_next_ready(),
+            self.tooling.time_until_next_ready(),
+            sweep_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
 
         let mut select = Select::new();
         let _ = select.recv(control_rx);
         let _ = select.recv(notify_rx);
+        let _ = select.recv(self.tooling.result_receiver());
 
         // `ready`/`ready_timeout` ne consomment pas le message : il sera traité par
         // le début de la boucle, commandes de contrôle en premier.
@@ -299,6 +327,10 @@ impl WatcherWorker {
                 repos.sort();
                 let _ = sender.send(repos);
             }
+            WatcherControl::SetToolingEnabled(enabled, ack) => {
+                let confirmation = self.set_tooling_enabled(enabled);
+                let _ = ack.try_send(confirmation);
+            }
             WatcherControl::Shutdown => {
                 debug!("Signal d'arrêt reçu par le worker de surveillance");
                 return Flow::Stop;
@@ -309,6 +341,50 @@ impl WatcherWorker {
             Flow::Continue
         } else {
             Flow::Stop
+        }
+    }
+
+    fn set_tooling_enabled(&mut self, enabled: bool) -> ToolingStateAck {
+        if self.tooling.is_enabled() == enabled {
+            self.report_status(WatcherStatus::ToolingStateChanged {
+                enabled,
+                error: None,
+            });
+            return ToolingStateAck {
+                enabled,
+                error: None,
+            };
+        }
+
+        self.tooling.set_enabled(enabled);
+        let repos: Vec<PathBuf> = self.repos.keys().cloned().collect();
+        if enabled {
+            for repo in repos {
+                self.ensure_tooling_watches(&repo);
+                self.tooling.seed_repo(&repo);
+            }
+        } else {
+            for repo in repos {
+                let watched = self
+                    .repos
+                    .get_mut(&repo)
+                    .map(|entry| std::mem::take(&mut entry.tooling_watched))
+                    .unwrap_or_default();
+                for path in watched {
+                    if !self.discovery_dirs.contains(&path) {
+                        let _ = self.watcher.unwatch(&path);
+                    }
+                }
+                self.tooling.remove_repo(&repo);
+            }
+        }
+        self.report_status(WatcherStatus::ToolingStateChanged {
+            enabled,
+            error: None,
+        });
+        ToolingStateAck {
+            enabled,
+            error: None,
         }
     }
 
@@ -354,10 +430,13 @@ impl WatcherWorker {
             git_dir,
             seeded: false,
             read_retries: 0,
+            tooling_watched: Vec::new(),
         };
         let _ = self.repos.insert(repo_root.to_path_buf(), entry);
         self.ensure_sub_watches(repo_root);
+        self.ensure_tooling_watches(repo_root);
         self.seed_repo(repo_root);
+        self.tooling.seed_repo(repo_root);
 
         info!(repo = %repo_root.display(), "Dépôt enregistré sous surveillance active");
         self.emit(DevSignal::RepoDiscovered {
@@ -433,6 +512,12 @@ impl WatcherWorker {
         for path in entry.watched {
             let _ = self.watcher.unwatch(&path);
         }
+        for path in entry.tooling_watched {
+            if !self.discovery_dirs.contains(&path) {
+                let _ = self.watcher.unwatch(&path);
+            }
+        }
+        self.tooling.remove_repo(repo_root);
         self.debouncer.remove_repo(repo_root);
         self.aliases.retain(|_, canonical| canonical != repo_root);
 
@@ -603,6 +688,7 @@ impl WatcherWorker {
 
     /// Traite un chemin issu d'un événement de fichier.
     fn handle_event_path(&mut self, path: &Path, is_removal: bool) {
+        self.handle_tooling_path(path, is_removal);
         let Some((raw_root, kind)) = analyze_git_path(path) else {
             self.handle_workspace_path(path, is_removal);
             return;
@@ -631,6 +717,93 @@ impl WatcherWorker {
         let repo_root = normalize_path(&raw_root);
         if repo_root.join(GIT_DIR_NAME).exists() {
             let _ = self.attach_repo(&repo_root, WatchOrigin::Discovery);
+        }
+    }
+
+    fn handle_tooling_path(&mut self, path: &Path, is_removal: bool) {
+        if !self.tooling.is_enabled() {
+            return;
+        }
+        let repo_root = self
+            .repos
+            .keys()
+            .filter(|repo| path.starts_with(repo))
+            .max_by_key(|repo| repo.components().count())
+            .cloned();
+        let Some(repo_root) = repo_root else {
+            return;
+        };
+
+        if is_removal {
+            self.tooling.forget_path(path);
+            return;
+        }
+        if path.is_dir() {
+            self.ensure_tooling_watches(&repo_root);
+            for status in self.tooling.record_directory(&repo_root, path) {
+                self.report_status(status);
+            }
+            return;
+        }
+        if let Some(status) = self.tooling.record_path(&repo_root, path) {
+            self.report_status(status);
+        }
+    }
+
+    /// Enregistre uniquement les ancres nécessaires aux rapports configurés.
+    fn ensure_tooling_watches(&mut self, repo_root: &Path) {
+        if !self.tooling.is_enabled() {
+            return;
+        }
+        let sources = self.tooling.sources().to_vec();
+        let already = self
+            .repos
+            .get(repo_root)
+            .map(|entry| entry.tooling_watched.clone())
+            .unwrap_or_default();
+        let mut added = Vec::new();
+
+        for source in sources {
+            let target = repo_root.join(source.relative_path);
+            let target_is_file = target.extension().is_some();
+            let mut candidate = if target_is_file {
+                target.parent().map(Path::to_path_buf)
+            } else if target.is_dir() {
+                Some(target.clone())
+            } else {
+                target.parent().map(Path::to_path_buf)
+            };
+
+            while candidate.as_ref().is_some_and(|path| !path.is_dir()) {
+                candidate = candidate.and_then(|path| path.parent().map(Path::to_path_buf));
+            }
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if !candidate.starts_with(repo_root)
+                || already.contains(&candidate)
+                || added.contains(&candidate)
+                || self.discovery_dirs.contains(&candidate)
+            {
+                continue;
+            }
+            let recursive = !target_is_file && candidate == target;
+            let mode = if recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            match self.watcher.watch(&candidate, mode) {
+                Ok(()) => added.push(candidate),
+                Err(error) => self.report_status(WatcherStatus::WatchFailed {
+                    path: candidate,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        if let Some(entry) = self.repos.get_mut(repo_root) {
+            entry.tooling_watched.extend(added);
         }
     }
 
@@ -828,18 +1001,30 @@ impl WatcherWorker {
     /// Transmet un incident sur le canal de statut s'il est installé.
     fn report_status(&mut self, status: WatcherStatus) {
         if let Some(sender) = &self.status_sender {
-            if sender.send(status).is_err() {
-                debug!("Canal de statut fermé — remontée d'incidents désactivée");
-                self.status_sender = None;
+            match sender.try_send(status) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    debug!("Canal de statut saturé — incident écarté");
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    debug!("Canal de statut fermé — remontée d'incidents désactivée");
+                    self.status_sender = None;
+                }
             }
         }
     }
 
     /// Émet un signal métier et détecte la fermeture du consommateur.
     fn emit(&self, signal: DevSignal) {
-        if self.signal_sender.send(signal).is_err() {
-            warn!("Consommateur de signaux fermé — arrêt de la surveillance Git");
-            self.is_running.store(false, Ordering::Relaxed);
+        match self.signal_sender.try_send(signal) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let _ = self.dropped_events.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                warn!("Consommateur de signaux fermé — arrêt de la surveillance Git");
+                self.is_running.store(false, Ordering::Relaxed);
+            }
         }
     }
 }

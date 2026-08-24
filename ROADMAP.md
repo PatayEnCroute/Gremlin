@@ -2,7 +2,7 @@
 
 Ce document décrit les étapes d'implémentation incrémentales pour développer **Gremlin**, du moteur autonome jusqu'aux binaires finaux distribuables.
 
-Les phases 1 à 6 sont livrées, ainsi que la phase 6bis consacrée au panneau de paramètres et à son accessibilité. Les phases 7 à 10 constituent la feuille de route active pour étendre l'outillage développeur, les interactions de bureau, la personnalisation et la distribution certifiée.
+Les phases 1 à 7 sont livrées, ainsi que la phase 6bis consacrée au panneau de paramètres et à son accessibilité. Les phases 8 à 10 constituent la feuille de route active pour étendre les interactions de bureau, la personnalisation et la distribution certifiée.
 
 ---
 
@@ -122,18 +122,20 @@ Les phases 1 à 6 sont livrées, ainsi que la phase 6bis consacrée au panneau d
 
 > **Vérification manuelle non automatisable :** la forme de l'arbre d'accessibilité est couverte par des tests, mais ce qu'une voix de synthèse en fait ne l'est pas. Une passe au lecteur d'écran (NVDA, VoiceOver, Orca) reste nécessaire avant de considérer l'accessibilité comme validée.
 
+> **Correction de la phase 2 :** la phase 2 annonçait une « transparence native OS » qui ne tenait pas sous Windows. Une surface graphique attachée à un HWND n'y propose aucun mode de composition alpha — vérifié sur les trois backends — et le familier s'affichait dans un carré noir de la taille de sa fenêtre. La présentation passe désormais par une fenêtre en couches (`WS_EX_LAYERED` + `UpdateLayeredWindow`), isolée dans `gremlin-system::platform::layered`, avec repli automatique sur le chemin GPU là où la surface honore l'alpha. Sous Windows, l'application ne crée plus aucun contexte graphique.
+
 ---
 
-## Phase 7 : Surveillance d'activité & Outillage développeur (*Tooling & Process Watcher*) — planifiée
+## Phase 7 : Surveillance d'activité & Outillage développeur (*Tooling & Process Watcher*) — livrée
 
 **Objectif :** Élargir la perception de Gremlin aux outils de développement locaux (tests unitaires, builds, sessions de code) sans saturer le CPU.
 
 * **Tâches :**
-  * [ ] Implémenter un observateur passif pour les suites de tests unitaires locales (`cargo test`, `npm test`, `pytest`, `go test`, `dotnet test`).
-  * [ ] Détecter les réussites et échecs de build/tests via la surveillance ciblée des répertoires de sortie et fichiers de compte-rendu.
-  * [ ] Intégrer de nouvelles récompenses d'XP et réactions émotionnelles : boost de joie sur tests passants, humeur paniquée / pansement / motivation sur tests brisés.
-  * [ ] Ajouter la détection d'inactivité de frappe et des sessions de code prolongées (*deep work*) pour adapter l'état de Gremlin.
-  * [ ] Encapsuler l'observateur dans `gremlin-watcher` avec des canaux bornés, sans polling agressif ni élévation de privilèges.
+  * [x] Implémenter un observateur passif pour les suites de tests unitaires locales (`cargo test`, `npm test`, `pytest`, `go test`, `dotnet test`).
+  * [x] Détecter les réussites et échecs de build/tests via la surveillance ciblée des répertoires de sortie et fichiers de compte-rendu.
+  * [x] Intégrer de nouvelles récompenses d'XP et réactions émotionnelles : boost de joie sur tests passants, humeur paniquée / pansement / motivation sur tests brisés.
+  * [x] Ajouter la détection d'inactivité de frappe et des sessions de code prolongées (*deep work*) pour adapter l'état de Gremlin.
+  * [x] Encapsuler l'observateur dans `gremlin-watcher` avec des canaux bornés, sans polling agressif ni élévation de privilèges.
 * **Livrable :** Gremlin réagit en temps réel à l'issue des tests et aux sessions de travail intensif en plus des commits Git.
 
 ---

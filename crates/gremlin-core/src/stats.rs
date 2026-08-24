@@ -159,6 +159,14 @@ impl PetStats {
         self.happiness = sanitize_gauge(self.happiness + sanitize_amount(amount));
     }
 
+    /// Ajuste le bonheur avec un delta signé fini.
+    ///
+    /// Une valeur non finie est neutralisée et le résultat reste dans `[0, 100]`.
+    pub fn adjust_happiness(&mut self, delta: f32) {
+        let safe_delta = if delta.is_finite() { delta } else { 0.0 };
+        self.happiness = sanitize_gauge(self.happiness + safe_delta);
+    }
+
     /// Soigne le Gremlin, répartissant `amount * split_ratio` sur chacune des trois jauges.
     pub fn heal(&mut self, amount: f32, split_ratio: f32) {
         let gain = sanitize_amount(amount) * sanitize_amount(split_ratio);

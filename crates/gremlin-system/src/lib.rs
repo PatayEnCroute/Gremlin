@@ -7,10 +7,12 @@
 //! ## Coutures de plateforme
 //!
 //! Toute spécificité OS est isolée dans [`platform`], derrière deux traits :
-//! [`PlatformWindowExt`] pour les capacités de fenêtre et
+//! [`PlatformWindowExt`] pour les capacités de fenêtre,
+//! [`ActivityMonitor`] pour la mesure passive de l'inactivité et
 //! [`platform::AutostartBackend`] pour le démarrage automatique. Le reste de la
 //! caisse (et l'application appelante) reste agnostique de l'OS.
 
+pub mod activity;
 pub mod autostart;
 pub mod error;
 pub mod paths;
@@ -22,12 +24,14 @@ pub mod window;
 #[cfg(test)]
 mod test_support;
 
+pub use activity::{ActivityEvent, ActivityMonitor, ActivitySample};
 pub use autostart::AutostartManager;
 pub use error::SystemError;
 pub use paths::AppPaths;
 pub use platform::{
-    AutostartBackend, AutostartTarget, BoxedAutostartBackend, LaunchAgentBackend, PlatformImpl,
-    PlatformWindowExt, UnsupportedBackend, XdgAutostartBackend,
+    presentation_buffer_len, AutostartBackend, AutostartTarget, BoxedAutostartBackend,
+    LaunchAgentBackend, LayeredSurface, PlatformImpl, PlatformWindowExt, UnsupportedBackend,
+    XdgAutostartBackend,
 };
 pub use storage::AtomicStorage;
 pub use tray::{action_for_tray_click, SystemTrayManager, TrayActionMap, TrayMenuAction};

@@ -54,6 +54,15 @@ pub struct SpeechBubbleView<'a> {
 pub struct SpeechBubbleRenderer;
 
 impl SpeechBubbleRenderer {
+    /// Indique si le texte tient dans les deux lignes sans troncature.
+    ///
+    /// Cette méthode partage exactement l'algorithme du rendu : les appelants
+    /// peuvent valider leurs libellés sans dupliquer une approximation.
+    #[must_use]
+    pub fn text_fits(text: &str) -> bool {
+        !layout_text(text).1
+    }
+
     /// Dessine une bulle entièrement clippée dans le framebuffer.
     pub fn render(buffer: &mut PixelBuffer, view: SpeechBubbleView<'_>) {
         if view.opacity == 0 || buffer.width() == 0 || buffer.height() == 0 {

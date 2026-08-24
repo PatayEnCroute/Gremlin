@@ -89,6 +89,7 @@ pub fn remove_tree(path: &Path) {
 pub fn test_config(debounce_ms: u64) -> WatcherConfig {
     WatcherConfig {
         debounce_duration_ms: debounce_ms,
+        tooling_debounce_duration_ms: debounce_ms,
         auto_discovery: false,
         max_scan_depth: 4,
         ..WatcherConfig::default()

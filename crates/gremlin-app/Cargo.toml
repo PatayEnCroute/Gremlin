@@ -56,6 +56,12 @@ accesskit_winit = { workspace = true, optional = true, features = [
     "async-io",
 ] }
 
+# Utilise uniquement par l'exemple de diagnostic `probe_surface_alpha`, qui doit
+# attendre la resolution d'un adaptateur graphique. Deja present dans le graphe
+# via `pixels`, cette declaration n'ajoute donc aucune caisse.
+[dev-dependencies]
+pollster = "0.3"
+
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"
 

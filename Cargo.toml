@@ -30,6 +30,7 @@ gremlin-system = { path = "crates/gremlin-system" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+quick-xml = "0.41"
 
 # Logging & Concurrency
 tracing = "0.1"

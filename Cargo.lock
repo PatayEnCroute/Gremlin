@@ -1339,6 +1339,7 @@ dependencies = [
  "gremlin-watcher",
  "image",
  "pixels",
+ "pollster",
  "serde",
  "serde_json",
  "softbuffer",
@@ -1373,6 +1374,7 @@ dependencies = [
 name = "gremlin-system"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "directories",
  "image",
  "muda",
@@ -1381,6 +1383,7 @@ dependencies = [
  "tray-icon",
  "windows-sys 0.59.0",
  "winit",
+ "x11-dl",
 ]
 
 [[package]]
@@ -1390,6 +1393,7 @@ dependencies = [
  "crossbeam-channel",
  "directories",
  "notify",
+ "quick-xml",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

@@ -584,7 +584,11 @@ fn test_status_channel_reports_watch_failure() {
     });
     match status {
         WatcherStatus::WatchFailed { path, .. } => assert!(path.starts_with(&missing)),
-        other @ WatcherStatus::EventsLost { .. } => panic!("statut inattendu : {other:?}"),
+        other @ (WatcherStatus::EventsLost { .. }
+        | WatcherStatus::ReportRejected { .. }
+        | WatcherStatus::ToolingStateChanged { .. }) => {
+            panic!("statut inattendu : {other:?}")
+        }
     }
 }
 
@@ -617,4 +621,149 @@ fn test_watcher_stops_when_consumer_disappears() {
         }
     }
     panic!("le worker doit s'arrêter lorsque plus personne ne consomme les signaux");
+}
+
+#[test]
+fn test_junit_report_is_detected_end_to_end() {
+    let guard = TempDirGuard::new("junit_report");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(50));
+    watch_repo(&mut watcher, &repo);
+    wait_for_discovery(&rx, &repo);
+
+    let report = repo.join("test-results").join("junit.xml");
+    write_file(
+        &report,
+        r#"<testsuites tests="4" failures="1" skipped="1" time="2.5"></testsuites>"#,
+    );
+
+    let signal = wait_for(
+        &rx,
+        "TestCompleted JUnit",
+        |signal| matches!(signal, DevSignal::TestCompleted { report_path, .. } if *report_path == report),
+    );
+    match signal {
+        DevSignal::TestCompleted { summary, .. } => {
+            assert_eq!(summary.passed, 2);
+            assert_eq!(summary.failed, 1);
+            assert_eq!(summary.skipped, 1);
+        }
+        other => panic!("signal inattendu : {other:?}"),
+    }
+}
+
+#[test]
+fn test_existing_report_is_only_a_baseline() {
+    let guard = TempDirGuard::new("junit_baseline");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+    let report = repo.join("test-results").join("junit.xml");
+    write_file(
+        &report,
+        r#"<testsuites tests="1" failures="0"></testsuites>"#,
+    );
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(50));
+    watch_repo(&mut watcher, &repo);
+    wait_for_discovery(&rx, &repo);
+    assert_no_signal(&rx, "rapport historique", |signal| {
+        matches!(signal, DevSignal::TestCompleted { .. })
+    });
+
+    write_file(
+        &report,
+        r#"<testsuites tests="2" failures="0"></testsuites>"#,
+    );
+    let _ = wait_for(
+        &rx,
+        "nouvelle écriture JUnit",
+        |signal| matches!(signal, DevSignal::TestCompleted { summary, .. } if summary.passed == 2),
+    );
+}
+
+#[test]
+fn test_gremlin_build_contract_is_detected() {
+    let guard = TempDirGuard::new("build_contract");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(50));
+    watch_repo(&mut watcher, &repo);
+    wait_for_discovery(&rx, &repo);
+
+    let report = repo.join(".gremlin").join("results").join("build.json");
+    write_file(
+        &report,
+        r#"{"schema_version":1,"run_id":"build-42","kind":"build","tool":"cargo","outcome":"passed","duration_ms":1500}"#,
+    );
+
+    let signal = wait_for(
+        &rx,
+        "BuildCompleted",
+        |signal| matches!(signal, DevSignal::BuildCompleted { run_id, .. } if run_id == "build-42"),
+    );
+    match signal {
+        DevSignal::BuildCompleted { summary, .. } => assert!(summary.success),
+        other => panic!("signal inattendu : {other:?}"),
+    }
+}
+
+#[test]
+fn test_tooling_toggle_is_confirmed_and_rebaselines_reports() {
+    let guard = TempDirGuard::new("tooling_toggle");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"a".repeat(40));
+
+    let (tx, rx) = unbounded();
+    let (status_tx, status_rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(75));
+    if let Err(error) = watcher.set_status_sender(status_tx) {
+        panic!("canal de statut indisponible : {error}");
+    }
+    watch_repo(&mut watcher, &repo);
+    wait_for_discovery(&rx, &repo);
+
+    if let Err(error) = watcher.request_tooling_enabled(false) {
+        panic!("désactivation refusée : {error}");
+    }
+    let _ = wait_for(&status_rx, "tooling disabled", |status| {
+        matches!(
+            status,
+            WatcherStatus::ToolingStateChanged {
+                enabled: false,
+                error: None
+            }
+        )
+    });
+    let report = repo.join("junit.xml");
+    write_file(&report, r#"<testsuite tests="1" failures="0" time="0.1"/>"#);
+    assert_no_signal(&rx, "TestCompleted désactivé", |signal| {
+        matches!(signal, DevSignal::TestCompleted { .. })
+    });
+
+    if let Err(error) = watcher.request_tooling_enabled(true) {
+        panic!("réactivation refusée : {error}");
+    }
+    let _ = wait_for(&status_rx, "tooling enabled", |status| {
+        matches!(
+            status,
+            WatcherStatus::ToolingStateChanged {
+                enabled: true,
+                error: None
+            }
+        )
+    });
+    assert_no_signal(&rx, "rapport de baseline", |signal| {
+        matches!(signal, DevSignal::TestCompleted { .. })
+    });
+
+    write_file(&report, r#"<testsuite tests="2" failures="0" time="0.2"/>"#);
+    let _ = wait_for(&rx, "TestCompleted", |signal| {
+        matches!(signal, DevSignal::TestCompleted { .. })
+    });
 }

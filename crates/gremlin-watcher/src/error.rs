@@ -17,6 +17,10 @@ pub enum WatcherError {
     #[error("échec de transmission sur le canal de signaux")]
     ChannelClosed,
 
+    /// Le canal de contrôle borné est resté saturé.
+    #[error("le canal de contrôle de la surveillance est saturé")]
+    ChannelFull,
+
     /// Le worker de surveillance n'a pas confirmé l'opération dans le délai imparti.
     #[error("le worker de surveillance n'a pas répondu dans le délai imparti")]
     Timeout,
