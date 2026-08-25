@@ -398,6 +398,28 @@ impl LayeredSurface {
             "la présentation en couches est spécifique à Windows",
         )))
     }
+
+    /// Contrepartie inatteignable de la présentation Windows.
+    ///
+    /// [`Self::new`] échouant toujours ici, aucune surface n'existe hors Windows
+    /// et cette méthode ne peut être appelée. Elle existe pour que l'appelant
+    /// garde une seule écriture du chemin de présentation, sans `#[cfg]` dans la
+    /// logique métier.
+    ///
+    /// # Errors
+    /// Renvoie toujours une erreur de fenêtre, pour la même raison que
+    /// [`Self::new`] : mieux vaut un échec bruyant qu'une image jamais affichée.
+    pub fn present(
+        &mut self,
+        _rgba: &[u8],
+        _width: u32,
+        _height: u32,
+        _scale: u32,
+    ) -> Result<(), crate::error::SystemError> {
+        Err(crate::error::SystemError::WindowError(String::from(
+            "la présentation en couches est spécifique à Windows",
+        )))
+    }
 }
 
 #[cfg(test)]

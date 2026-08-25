@@ -1,4 +1,4 @@
-//! Mesure d'inactivité Linux/X11 via l'extension XScreenSaver.
+//! Mesure d'inactivité Linux/X11 via l'extension `XScreenSaver`.
 
 use std::env;
 use std::ptr;
