@@ -188,6 +188,12 @@ pub enum PaletteAction {
     ToggleClickThrough,
     /// Bascule le lancement automatique au démarrage de l'OS.
     ToggleAutostart,
+    /// Bascule la détection passive des rapports de tests et builds.
+    ToggleToolingWatcher,
+    /// Bascule l'estimation des sessions de focus.
+    ToggleFocusTracking,
+    /// Bascule les rappels de pause liés au focus.
+    ToggleBreakReminders,
     /// Applique l'échelle de fenêtre suivante du cycle.
     ///
     /// La valeur est calculée à la construction de l'item depuis la
@@ -273,6 +279,12 @@ pub enum PaletteExecutionResult {
     ToggleClickThrough,
     /// Bascule l'autostart.
     ToggleAutostart,
+    /// Bascule la surveillance des rapports d'outillage.
+    ToggleToolingWatcher,
+    /// Bascule l'estimation des sessions de focus.
+    ToggleFocusTracking,
+    /// Bascule les rappels de pause.
+    ToggleBreakReminders,
     /// Applique une échelle de fenêtre.
     SetScaleFactor(u32),
     /// Recharge les assets.
@@ -334,6 +346,9 @@ impl PaletteItem {
                 | PaletteAction::ToggleSleep
                 | PaletteAction::ToggleClickThrough
                 | PaletteAction::ToggleAutostart
+                | PaletteAction::ToggleToolingWatcher
+                | PaletteAction::ToggleFocusTracking
+                | PaletteAction::ToggleBreakReminders
                 | PaletteAction::ToggleReducedMotion
                 | PaletteAction::ToggleCloseOnFocusLoss
         )
@@ -368,6 +383,10 @@ pub struct PaletteContext<'a> {
     pub repos: &'a [RepoDisplayInfo],
     /// Dernière erreur de sauvegarde à signaler à l'utilisateur.
     pub last_save_error: Option<&'a str>,
+    /// Dernier incident du watcher ou du moniteur d'activité.
+    pub last_observation_error: Option<&'a str>,
+    /// État d'outillage demandé, tant que le worker ne l'a pas confirmé.
+    pub pending_tooling_enabled: Option<bool>,
 }
 
 /// État de la palette de commande et gestionnaire de filtrage.
@@ -431,6 +450,8 @@ impl CommandPalette {
             autostart_active,
             repos,
             last_save_error,
+            last_observation_error,
+            pending_tooling_enabled,
         } = *context;
 
         let progression = pet_state.progression();
@@ -460,6 +481,18 @@ impl CommandPalette {
         meta_profile.insert("satiety".into(), format!("{:.0}%", stats.satiety()));
         meta_profile.insert("energy".into(), format!("{:.0}%", stats.energy()));
         meta_profile.insert("happiness".into(), format!("{:.0}%", stats.happiness()));
+        meta_profile.insert(
+            "tests".into(),
+            format!(
+                "{} réussis, {} échoués",
+                progression.total_tests_passed(),
+                progression.total_tests_failed()
+            ),
+        );
+        meta_profile.insert(
+            "focus".into(),
+            format!("{} min estimées", progression.total_focus_secs() / 60),
+        );
         if is_critical {
             meta_profile.insert(
                 "description".into(),
@@ -675,6 +708,102 @@ impl CommandPalette {
             is_equipped: autostart_active,
             action: PaletteAction::ToggleAutostart,
             metadata: meta_autostart,
+        });
+
+        let tooling_enabled = config.watcher.tooling_enabled;
+        let mut meta_tooling = HashMap::new();
+        meta_tooling.insert("name".into(), "Rapports de tests et builds".into());
+        meta_tooling.insert(
+            "description".into(),
+            last_observation_error.map_or_else(
+                || {
+                    "Surveille passivement les rapports configurés, sans exécuter de commande."
+                        .to_owned()
+                },
+                |error| format!("Dernier incident : {error}"),
+            ),
+        );
+        items.push(PaletteItem {
+            id: "setting_tooling_watcher".into(),
+            title: "Rapports de tests et builds".into(),
+            subtitle: pending_tooling_enabled.map_or_else(
+                || {
+                    last_observation_error.map_or_else(
+                        || "Détection passive des rapports configurés".to_owned(),
+                        |error| format!("⚠ {error}"),
+                    )
+                },
+                |enabled| {
+                    format!(
+                        "{} en cours…",
+                        if enabled {
+                            "Activation"
+                        } else {
+                            "Désactivation"
+                        }
+                    )
+                },
+            ),
+            section: PaletteSection::GeneralSettings,
+            category: None,
+            badge: Some(if tooling_enabled { "ON" } else { "OFF" }.into()),
+            is_equipped: tooling_enabled,
+            action: PaletteAction::ToggleToolingWatcher,
+            metadata: meta_tooling,
+        });
+
+        let mut meta_focus_tracking = HashMap::new();
+        meta_focus_tracking.insert("name".into(), "Focus estimé".into());
+        meta_focus_tracking.insert(
+            "description".into(),
+            "Estimation locale amorcée par un commit ou un rapport ; aucune fenêtre ni frappe n'est enregistrée."
+                .into(),
+        );
+        items.push(PaletteItem {
+            id: "setting_focus_tracking".into(),
+            title: "Estimation des sessions de focus".into(),
+            subtitle: format!(
+                "{} min cumulées • mesure d'activité globale",
+                progression.total_focus_secs() / 60
+            ),
+            section: PaletteSection::GeneralSettings,
+            category: None,
+            badge: Some(
+                if config.focus_tracking_enabled {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+                .into(),
+            ),
+            is_equipped: config.focus_tracking_enabled,
+            action: PaletteAction::ToggleFocusTracking,
+            metadata: meta_focus_tracking,
+        });
+
+        let mut meta_breaks = HashMap::new();
+        meta_breaks.insert("name".into(), "Rappels de pause".into());
+        meta_breaks.insert(
+            "description".into(),
+            "Propose discrètement une pause après une session de focus prolongée.".into(),
+        );
+        items.push(PaletteItem {
+            id: "setting_break_reminders".into(),
+            title: "Rappels de pause".into(),
+            subtitle: "Notification locale après un focus prolongé".into(),
+            section: PaletteSection::GeneralSettings,
+            category: None,
+            badge: Some(
+                if config.break_reminders_enabled {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+                .into(),
+            ),
+            is_equipped: config.break_reminders_enabled,
+            action: PaletteAction::ToggleBreakReminders,
+            metadata: meta_breaks,
         });
 
         // Réglages d'accessibilité, groupés avant les réglages de fenêtre : ce
@@ -1308,6 +1437,9 @@ impl CommandPalette {
             PaletteAction::ToggleSleep => PaletteExecutionResult::ToggleSleep,
             PaletteAction::ToggleClickThrough => PaletteExecutionResult::ToggleClickThrough,
             PaletteAction::ToggleAutostart => PaletteExecutionResult::ToggleAutostart,
+            PaletteAction::ToggleToolingWatcher => PaletteExecutionResult::ToggleToolingWatcher,
+            PaletteAction::ToggleFocusTracking => PaletteExecutionResult::ToggleFocusTracking,
+            PaletteAction::ToggleBreakReminders => PaletteExecutionResult::ToggleBreakReminders,
             PaletteAction::CycleScaleFactor { next } => {
                 PaletteExecutionResult::SetScaleFactor(*next)
             }
@@ -1343,6 +1475,8 @@ mod tests {
             autostart_active: false,
             repos: &[],
             last_save_error: None,
+            last_observation_error: None,
+            pending_tooling_enabled: None,
         }
     }
 

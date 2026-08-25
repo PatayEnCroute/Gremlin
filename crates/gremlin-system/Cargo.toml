@@ -11,18 +11,28 @@ thiserror.workspace = true
 directories.workspace = true
 winit.workspace = true
 tracing.workspace = true
+crossbeam-channel.workspace = true
 image.workspace = true
 tray-icon.workspace = true
 muda.workspace = true
 
-# Le mode click-through passe désormais par `winit::Window::set_cursor_hittest`
-# (portable Windows / macOS / X11) : plus aucune FFI fenêtrage n'est nécessaire.
-# Seule la clé de registre `Run` de l'autostart Windows requiert encore Win32.
+# Le mode click-through passe par `winit::Window::set_cursor_hittest` (portable
+# Windows / macOS / X11). Deux besoins gardent malgré tout de la FFI Win32 : la
+# clé de registre `Run` de l'autostart, et la présentation en couches du
+# familier — la seule voie, sous Windows, pour une transparence par pixel réelle
+# (voir `platform::layered`).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2.21"
 
 [lints]
 workspace = true

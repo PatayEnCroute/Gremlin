@@ -31,6 +31,10 @@ pub struct AppConfig {
     pub max_offline_catchup_hours: u32,
     /// Configuration du système de surveillance et de scan Git.
     pub watcher: WatcherConfig,
+    /// Active l'estimation locale des sessions de focus.
+    pub focus_tracking_enabled: bool,
+    /// Active les rappels discrets après une session prolongée.
+    pub break_reminders_enabled: bool,
     /// Échelle d'affichage de la fenêtre (multiplicateur de pixels).
     pub scale_factor: u32,
     /// Préférences d'affichage et d'accessibilité du panneau de paramètres.
@@ -48,6 +52,8 @@ impl Default for AppConfig {
             offline_catchup_enabled: true,
             max_offline_catchup_hours: 48,
             watcher: WatcherConfig::default(),
+            focus_tracking_enabled: true,
+            break_reminders_enabled: true,
             scale_factor: 2,
             ui: UiPreferences::default(),
         }
@@ -91,6 +97,7 @@ impl AppConfig {
         // La normalisation des préférences d'interface est déléguée : le
         // conteneur ne connaît pas leurs bornes.
         let ui_adjusted = self.ui.normalize();
+        let watcher_adjusted = self.watcher.normalize();
 
         // Un identifiant de skin ne doit ni être vide, ni contenir de
         // séparateur de chemin : il est concaténé à un répertoire de base.
@@ -111,7 +118,7 @@ impl AppConfig {
             sanitized_skin
         };
 
-        ui_adjusted || before != *self
+        ui_adjusted || watcher_adjusted || before != *self
     }
 
     /// Échelle d'affichage suivante dans le cycle, avec bouclage au minimum.

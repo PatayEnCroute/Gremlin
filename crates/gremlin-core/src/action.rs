@@ -26,6 +26,10 @@ pub enum ActionKind {
     Revive,
     /// Assimiler un commit Git.
     Commit,
+    /// Assimiler un rapport de tests.
+    TestRun,
+    /// Assimiler un résultat de build.
+    Build,
 }
 
 impl ActionKind {
@@ -41,6 +45,8 @@ impl ActionKind {
             Self::WakeUp => "réveiller",
             Self::Revive => "réanimer",
             Self::Commit => "assimiler un commit",
+            Self::TestRun => "assimiler un rapport de tests",
+            Self::Build => "assimiler un build",
         }
     }
 }
@@ -66,6 +72,8 @@ mod tests {
             ActionKind::WakeUp,
             ActionKind::Revive,
             ActionKind::Commit,
+            ActionKind::TestRun,
+            ActionKind::Build,
         ];
 
         let mut labels: Vec<&str> = actions.iter().map(|a| a.label()).collect();

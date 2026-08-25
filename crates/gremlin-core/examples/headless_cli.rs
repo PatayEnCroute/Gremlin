@@ -101,6 +101,40 @@ fn print_events(events: &[CoreEvent]) {
             } => {
                 println!("  [GIT] Commit reçu sur {repo}:{branch} (+{xp_gained} XP)");
             }
+            CoreEvent::TestRunReceived {
+                repo,
+                summary,
+                xp_gained,
+                ..
+            } => println!(
+                "  [TEST] {repo}: {} réussis, {} échoués (+{xp_gained} XP)",
+                summary.passed(),
+                summary.failed()
+            ),
+            CoreEvent::BuildCompleted {
+                repo,
+                summary,
+                xp_gained,
+                ..
+            } => println!(
+                "  [BUILD] {repo}: {} (+{xp_gained} XP)",
+                if summary.success() {
+                    "réussi"
+                } else {
+                    "échoué"
+                }
+            ),
+            CoreEvent::FocusMilestoneReached { duration, bonus_xp } => println!(
+                "  [FOCUS] Palier de {} min (+{bonus_xp} XP)",
+                duration.as_secs() / 60
+            ),
+            CoreEvent::BreakRecommended { .. } => {
+                println!("  [FOCUS] Une pause est recommandée.");
+            }
+            CoreEvent::IdleStateChanged { is_idle } => println!(
+                "  [ACTIVITÉ] {}",
+                if *is_idle { "inactif" } else { "de retour" }
+            ),
             CoreEvent::MoodChanged { from, to } => {
                 println!(
                     "  [HUMEUR] Transition : {} -> {}",

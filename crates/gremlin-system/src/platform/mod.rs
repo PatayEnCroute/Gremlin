@@ -4,16 +4,21 @@
 //! implémentation par mécanisme natif, jamais de `#[cfg]` dans la logique métier) :
 //!
 //! * [`PlatformWindowExt`] — capacités natives de fenêtre (mode click-through) ;
-//! * [`AutostartBackend`] — enregistrement au démarrage de la session.
+//! * [`AutostartBackend`] — enregistrement au démarrage de la session ;
+//! * [`LayeredSurface`] — présentation à alpha par pixel, seule voie possible
+//!   sous Windows pour une fenêtre réellement transparente.
 
+pub(crate) mod activity;
 pub mod autostart;
 mod click_through;
+pub mod layered;
 
 pub use autostart::{
     default_autostart_backend, AutostartBackend, AutostartTarget, BoxedAutostartBackend,
     LaunchAgentBackend, UnsupportedBackend, XdgAutostartBackend,
 };
 pub use click_through::PlatformImpl;
+pub use layered::{premultiplied_bgra_into, presentation_buffer_len, LayeredSurface};
 
 #[cfg(target_os = "windows")]
 pub use autostart::RegistryRunBackend;

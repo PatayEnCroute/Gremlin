@@ -14,9 +14,8 @@ walkdir.workspace = true
 tracing.workspace = true
 directories.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+quick-xml.workspace = true
 
 [lints]
 workspace = true

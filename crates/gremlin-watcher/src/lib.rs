@@ -9,24 +9,31 @@ pub mod debouncer;
 pub mod error;
 pub mod git_parser;
 pub mod git_path;
+pub mod parsers;
 pub mod scanner;
 pub mod signals;
 pub mod skin_watcher;
 pub mod watcher;
 
+mod tooling;
 mod worker;
 
 #[cfg(test)]
 mod test_support;
 
 pub use config::{
-    WatcherConfig, DEFAULT_ASSET_DEBOUNCE_MS, DEFAULT_DEBOUNCE_MS, DEFAULT_MAX_SCAN_DEPTH,
+    ToolingFrameworkHint, ToolingReportFormat, ToolingSourceConfig, WatcherConfig,
+    DEFAULT_ASSET_DEBOUNCE_MS, DEFAULT_DEBOUNCE_MS, DEFAULT_MAX_SCAN_DEPTH,
+    DEFAULT_TOOLING_DEBOUNCE_MS,
 };
 pub use debouncer::EventDebouncer;
 pub use error::WatcherError;
 pub use git_parser::{GitRefParser, ReflogEntry, RepoSnapshot};
 pub use git_path::{find_repo_root, is_relevant_git_path, normalize_path, GitPathKind};
 pub use scanner::GitScanner;
-pub use signals::{DevSignal, WatcherStatus};
+pub use signals::{
+    DevSignal, ParsedBuildReport, ParsedTestReport, ReportBuildTool, ReportFramework,
+    ToolingStateAck, WatcherStatus,
+};
 pub use skin_watcher::{AssetSignal, AssetWatcher};
 pub use watcher::RepoWatcher;

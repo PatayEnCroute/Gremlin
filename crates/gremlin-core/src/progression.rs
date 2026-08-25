@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::Duration;
 
 /// Niveau minimal du familier.
 pub const MIN_LEVEL: u32 = 1;
@@ -69,6 +70,11 @@ pub struct PetProgression {
     level: u32,
     stage: EvolutionStage,
     total_commits: u64,
+    total_tests_passed: u64,
+    total_tests_failed: u64,
+    total_test_runs: u64,
+    total_builds_succeeded: u64,
+    total_focus_secs: u64,
 }
 
 impl Default for PetProgression {
@@ -78,6 +84,11 @@ impl Default for PetProgression {
             level: MIN_LEVEL,
             stage: EvolutionStage::Baby,
             total_commits: 0,
+            total_tests_passed: 0,
+            total_tests_failed: 0,
+            total_test_runs: 0,
+            total_builds_succeeded: 0,
+            total_focus_secs: 0,
         }
     }
 }
@@ -92,6 +103,11 @@ impl PetProgression {
             level,
             stage: EvolutionStage::from_level(level),
             total_commits: 0,
+            total_tests_passed: 0,
+            total_tests_failed: 0,
+            total_test_runs: 0,
+            total_builds_succeeded: 0,
+            total_focus_secs: 0,
         }
     }
 
@@ -117,6 +133,36 @@ impl PetProgression {
     #[must_use]
     pub const fn total_commits(&self) -> u64 {
         self.total_commits
+    }
+
+    /// Nombre cumulé de tests réussis.
+    #[must_use]
+    pub const fn total_tests_passed(&self) -> u64 {
+        self.total_tests_passed
+    }
+
+    /// Nombre cumulé de tests échoués.
+    #[must_use]
+    pub const fn total_tests_failed(&self) -> u64 {
+        self.total_tests_failed
+    }
+
+    /// Nombre cumulé de rapports de tests assimilés.
+    #[must_use]
+    pub const fn total_test_runs(&self) -> u64 {
+        self.total_test_runs
+    }
+
+    /// Nombre cumulé de builds réussis.
+    #[must_use]
+    pub const fn total_builds_succeeded(&self) -> u64 {
+        self.total_builds_succeeded
+    }
+
+    /// Secondes de focus estimées et cumulées.
+    #[must_use]
+    pub const fn total_focus_secs(&self) -> u64 {
+        self.total_focus_secs
     }
 
     /// Restaure l'invariant `level`/`stage` dérivés de `total_xp`.
@@ -216,6 +262,37 @@ impl PetProgression {
     /// Enregistre la complétion d'un commit Git avec gain d'XP associé.
     pub fn record_commit(&mut self, xp_reward: u64) -> (u32, Option<EvolutionStage>) {
         self.total_commits = self.total_commits.saturating_add(1);
+        self.add_xp(xp_reward)
+    }
+
+    /// Enregistre les compteurs d'un rapport de tests et attribue l'XP fournie.
+    pub fn record_test_run(
+        &mut self,
+        passed: u32,
+        failed: u32,
+        xp_reward: u64,
+    ) -> (u32, Option<EvolutionStage>) {
+        self.total_test_runs = self.total_test_runs.saturating_add(1);
+        self.total_tests_passed = self.total_tests_passed.saturating_add(u64::from(passed));
+        self.total_tests_failed = self.total_tests_failed.saturating_add(u64::from(failed));
+        self.add_xp(xp_reward)
+    }
+
+    /// Enregistre un build et attribue l'XP fournie.
+    pub fn record_build(&mut self, success: bool, xp_reward: u64) -> (u32, Option<EvolutionStage>) {
+        if success {
+            self.total_builds_succeeded = self.total_builds_succeeded.saturating_add(1);
+        }
+        self.add_xp(xp_reward)
+    }
+
+    /// Cumule une durée de focus et attribue le bonus du palier éventuel.
+    pub fn record_focus(
+        &mut self,
+        credited: Duration,
+        xp_reward: u64,
+    ) -> (u32, Option<EvolutionStage>) {
+        self.total_focus_secs = self.total_focus_secs.saturating_add(credited.as_secs());
         self.add_xp(xp_reward)
     }
 

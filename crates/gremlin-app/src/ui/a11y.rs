@@ -235,6 +235,8 @@ mod tests {
                 autostart_active: false,
                 repos,
                 last_save_error: None,
+                last_observation_error: None,
+                pending_tooling_enabled: None,
             })
         }
     }

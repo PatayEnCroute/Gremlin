@@ -3,7 +3,9 @@
 use crate::mood::PetMood;
 use crate::progression::EvolutionStage;
 use crate::stats::PetStats;
+use crate::tooling::{BreakReason, BuildSummary, TestSummary};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Événements de cycle de vie et d'état émis par `gremlin-core`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,6 +16,27 @@ pub enum CoreEvent {
         branch: String,
         xp_gained: u64,
     },
+    /// Un rapport de tests terminé a été assimilé.
+    TestRunReceived {
+        repo: String,
+        summary: TestSummary,
+        xp_gained: u64,
+        is_fixed: bool,
+        feedback_allowed: bool,
+    },
+    /// Un résultat de build explicite a été assimilé.
+    BuildCompleted {
+        repo: String,
+        summary: BuildSummary,
+        xp_gained: u64,
+        feedback_allowed: bool,
+    },
+    /// Un palier d'une session de focus estimée a été franchi.
+    FocusMilestoneReached { duration: Duration, bonus_xp: u64 },
+    /// Une pause discrète est recommandée.
+    BreakRecommended { reason: BreakReason },
+    /// L'état d'inactivité prolongée a changé.
+    IdleStateChanged { is_idle: bool },
     /// L'humeur du Gremlin a changé suite à un tick ou une action.
     MoodChanged { from: PetMood, to: PetMood },
     /// Le Gremlin a gagné un ou plusieurs niveaux.

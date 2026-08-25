@@ -11,8 +11,9 @@
 * **Accessible :** le panneau de paramètres expose son arbre sémantique au système (UI Automation, NSAccessibility, AT-SPI) et s'utilise donc au lecteur d'écran. Trois thèmes dont un à contraste renforcé, taille de texte réglable, mode mouvement réduit, et des rapports de contraste vérifiés par la suite de tests.
 * **Cross-platform pur :** Fonctionne de manière native sur Windows, macOS et Linux sans empaquetage lourd ni Webview.
 * **Forte personnalisation :** Moteur de rendu multi-calques modulaire (skins, chapeaux, accessoires, auras) extensible via de simples fichiers JSON et PNG.
-* **Non intrusif :** Fenêtre transparente flottante sans bordure avec mode *click-through* pour coder sans gêne visuelle. Le panneau de paramètres occupe sa propre fenêtre : le familier reste visible et continue de s'animer pendant le réglage.
+* **Non intrusif :** Fenêtre transparente flottante sans bordure avec mode *click-through* pour coder sans gêne visuelle. La transparence est réellement par pixel : sous Windows elle passe par une fenêtre en couches, la seule voie possible (voir *Transparence de la fenêtre du familier*). Le panneau de paramètres occupe sa propre fenêtre : le familier reste visible et continue de s'animer pendant le réglage.
 * **Résistant aux fichiers abîmés :** sauvegardes, configuration et manifests de skins sont validés au chargement. Une sauvegarde illisible est mise de côté plutôt qu'écrasée, et un manifest hostile ne peut ni figer ni faire planter l'application.
+* **Outillage développeur passif :** Gremlin assimile les rapports JUnit, TRX, Jest JSON et son contrat JSON versionné. Il n'exécute aucune commande, n'installe aucun hook et ne lit ni les frappes ni la fenêtre active.
 
 ---
 
@@ -25,6 +26,50 @@ Gremlin possède un cycle de vie autonome régulé par une boucle d'état intern
 * **XP et Évolution :** Chaque commit rapporte de l'expérience, débloquant des formes évoluées (Bébé -> Adolescent -> Adulte -> Cyber-Gremlin) et de nouveaux cosmétiques. Seuls les vrais commits comptent : un `git checkout` ne rapporte pas d'XP.
 * **États émotionnels :** Sprites dynamiques dédiés (*Happy*, *Coding*, *Hungry*, *Tired*, *Sick*, *Angry*, *Sleeping*, *Dead*).
 * **Rattrapage hors-ligne :** au redémarrage, le temps écoulé depuis la dernière sauvegarde est simulé, dans la limite du plafond configuré.
+* **Focus estimé :** après un commit ou un rapport reconnu, l'activité clavier/souris globale peut alimenter une estimation locale de session. Cette estimation est désactivable et ne progresse jamais si le compteur natif est indisponible.
+
+---
+
+## Rapports de tests et builds
+
+Gremlin observe uniquement des résultats explicites écrits dans un dépôt déjà surveillé. Une commande nue comme `cargo test`, `npm test`, `pytest`, `go test` ou `dotnet test` sans reporter ne fournit pas toujours un résultat final exploitable : Gremlin ne tente donc jamais de le deviner à partir d'un cache, d'un binaire ou d'un dossier de sortie.
+
+Les emplacements reconnus par défaut sont `target/nextest/`, `test-results/`, `TestResults/`, `.gremlin/results/` et le fichier racine `junit.xml`. Quelques exemples de production de rapports :
+
+```bash
+pytest --junitxml=junit.xml
+```
+
+```bash
+gotestsum --junitfile junit.xml
+```
+
+```bash
+jest --json --outputFile=test-results/jest.json
+```
+
+```bash
+dotnet test --logger "trx;LogFileName=results.trx"
+```
+
+Pour `cargo-nextest`, un profil peut écrire son JUnit sous `target/nextest/`, par exemple `target/nextest/default/junit.xml`. Les reporters JUnit de Vitest, Mocha et autres outils peuvent écrire dans `test-results/` ou `junit.xml`.
+
+Les builds ne sont jamais inférés. Un script ou un outil peut déposer ce contrat JSON v1 sous `.gremlin/results/` :
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "2026-08-24T12:00:00Z-42",
+  "kind": "build",
+  "tool": "cargo",
+  "outcome": "passed",
+  "duration_ms": 4210
+}
+```
+
+Pour `kind: "test"`, ajouter `passed`, `failed` et éventuellement `skipped`; `outcome` doit rester cohérent avec ces compteurs. `run_id` identifie un run et empêche sa double assimilation.
+
+Les trois bascules « Rapports de tests et builds », « Estimation des sessions de focus » et « Rappels de pause » se trouvent dans les préférences système du panneau. Les chemins supplémentaires peuvent être déclarés dans `watcher.tooling_sources`; ils doivent rester relatifs au dépôt. Les plateformes prises en charge pour l'inactivité sont Windows, macOS et Linux/X11. Wayland pur, XWayland seul et les environnements headless affichent explicitement l'indisponibilité au lieu de fabriquer du temps de focus.
 
 ---
 
@@ -43,6 +88,30 @@ Il n'y a pas de fréquence d'affichage fixe : le rythme de réveil s'adapte au c
 Le panneau **resserre** la cadence sans la remplacer : il occupe sa propre fenêtre, et le familier continue donc de s'animer à son rythme pendant le réglage. Ce resserrement n'a qu'une raison d'être — faire clignoter le curseur de saisie ; le mode mouvement réduit l'éteint et le supprime avec lui.
 
 Les signaux Git et les modifications de skins ne subissent pas cette latence : ils réveillent la boucle immédiatement via le proxy de la boucle d'événements.
+
+---
+
+## Transparence de la fenêtre du familier
+
+La fenêtre du familier est déclarée transparente, mais c'est la **surface de présentation** qui décide si le canal alpha est honoré — et sous Windows, elle ne l'honore pas.
+
+Une surface graphique attachée à un HWND classique n'offre aucun mode de composition alpha. Mesuré sur une GeForce RTX 3080, les trois backends répondent la même chose :
+
+```
+Vulkan  : modes = [Opaque]   DX12 : modes = [Opaque]   OpenGL : modes = [Opaque]
+```
+
+Aucune alternative n'est proposée. Tout pixel laissé transparent est donc aplati en noir, et le familier apparaît dans un carré noir de la taille exacte de sa fenêtre. Le diagnostic est reproductible :
+
+```bash
+cargo run -p gremlin-app --example probe_surface_alpha
+```
+
+La voie retenue est la **fenêtre en couches** (`WS_EX_LAYERED` + `UpdateLayeredWindow`), qui accepte un canal alpha et laisse le gestionnaire de fenêtres composer correctement. Elle convient d'autant mieux que le familier est déjà composé dans un tampon mémoire : c'est exactement ce que cette interface attend. Sous Windows, l'application ne crée donc **aucun contexte graphique** — ni pour le familier, ni pour le panneau.
+
+Sur macOS et sur les environnements Linux dotés d'un compositeur, la surface graphique propose un mode honorant l'alpha : le chemin GPU y reste en place, et la présentation en couches n'est pas utilisée. Le choix est automatique et sans configuration.
+
+Le format de pixel exigé par Windows — BGRA à alpha prémultiplié — est converti par une fonction pure, compilée et testée sur les trois systèmes : c'est là que se cachent les vraies erreurs, inversion de canaux ou halo clair sur les contours.
 
 ---
 
@@ -104,8 +173,9 @@ cargo run -p gremlin-app --example panel_proof_sheet
 ## Stack technique
 
 * **Langage :** Rust (édition 2021, version minimale 1.92)
-* **Gestionnaire de fenêtres :** `winit` (transparence native OS, borderless et click-through via `set_cursor_hittest`)
-* **Moteur de rendu 2D :** `pixels` / `wgpu` (framebuffer pixel-art accéléré par GPU) pour le familier
+* **Gestionnaire de fenêtres :** `winit` (borderless, click-through via `set_cursor_hittest`)
+* **Transparence du familier :** fenêtre en couches Win32 (`UpdateLayeredWindow`) sous Windows, surface graphique à composition alpha ailleurs
+* **Moteur de rendu 2D :** `pixels` / `wgpu` pour le familier sur les plateformes où la surface graphique honore l'alpha ; sous Windows, aucun contexte GPU n'est créé
 * **Présentation du panneau :** `softbuffer` (transfert mémoire sans GPU). Chaque instance de `pixels` construit son propre contexte wgpu : une seconde fenêtre en `pixels` aurait coûté un contexte graphique entier, contre l'objectif d'empreinte mémoire du projet.
 * **Accessibilité :** `accesskit` et `accesskit_winit`, derrière la feature `a11y`
 * **Typographie :** police bitmap dessinée à la main dans le dépôt, en couverture de niveaux de gris, sans dépendance de rendu de texte
@@ -149,7 +219,7 @@ Les sprites sont dessinés sur une toile complète de 64×64 pixels, déjà posi
 ### Prérequis
 
 * [Rust et Cargo](https://rustup.rs/) 1.92 ou plus récent
-* Sous Linux : `libxdo-dev`, `libayatana-appindicator3-dev`, `libgtk-3-dev`, `libasound2-dev`
+* Sous Linux : `libxdo-dev`, `libxss1`, `libayatana-appindicator3-dev`, `libgtk-3-dev`, `libasound2-dev`
 
 ### Compilation et lancement
 
@@ -208,7 +278,7 @@ cargo run -p gremlin-core --example headless_cli
 - [x] **Phase 5** : Intégration système, zone de notification et publication release (*System UX & Release*)
 - [x] **Phase 6** : Animations avancées, micro-particules et phylactères (*Dynamic FX & Layer Animation*)
 - [x] **Phase 6bis** : Refonte du panneau de paramètres et accessibilité système (*Accessible Panel*)
-- [ ] **Phase 7** : Surveillance des tests unitaires et outillage développeur (*Tooling & Process Watcher*)
+- [x] **Phase 7** : Surveillance des tests unitaires et outillage développeur (*Tooling & Focus Watcher*)
 - [ ] **Phase 8** : Interactions bureau, séries de productivité et bien-être (*Desk Companion & Productivity*)
 - [ ] **Phase 9** : Écosystème de mods, packaging `.gremlin` et validation CLI (*Modding Hub*)
 - [ ] **Phase 10** : Métrologie, signature multi-OS et distribution certifiée (*Release Engineering*)

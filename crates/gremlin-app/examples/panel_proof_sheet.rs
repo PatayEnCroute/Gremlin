@@ -80,6 +80,17 @@ const CASES: &[Case] = &[
         repo_count: 3,
         advance: 0,
     },
+    // Préférences de la phase 7 : bascules d'outillage, focus et rappels.
+    Case {
+        name: "panel_outillage_focus",
+        scale: 1.0,
+        text_size: TextSize::Normal,
+        theme: ThemePreference::Dark,
+        group: Some(PaletteGroup::Preferences),
+        query: "",
+        repo_count: 3,
+        advance: 1,
+    },
     // Quarante dépôts, sélection poussée hors de la fenêtre visible.
     Case {
         name: "panel_depots_defiles",
@@ -191,6 +202,8 @@ fn main() -> ExitCode {
             autostart_active: true,
             repos: &repos,
             last_save_error: None,
+            last_observation_error: None,
+            pending_tooling_enabled: None,
         });
         if let Some(group) = case.group {
             palette.enter_group(group);

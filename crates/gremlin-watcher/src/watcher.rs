@@ -9,11 +9,11 @@
 use crate::config::WatcherConfig;
 use crate::error::WatcherError;
 use crate::scanner::GitScanner;
-use crate::signals::{DevSignal, WatcherStatus};
+use crate::signals::{DevSignal, ToolingStateAck, WatcherStatus};
 use crate::worker::{
     NotifyMessage, WatchOrigin, WatcherControl, WatcherWorker, NOTIFY_CHANNEL_CAPACITY,
 };
-use crossbeam_channel::{RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use notify::{Config, Event, RecommendedWatcher, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,6 +24,10 @@ use tracing::{debug, warn};
 
 /// Délai maximal d'attente d'un accusé de réception du worker.
 const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Capacité du canal de contrôle du worker.
+const CONTROL_CHANNEL_CAPACITY: usize = 256;
+/// Délai maximal d'insertion dans le canal de contrôle borné.
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Gestionnaire de surveillance des dépôts Git et détection à chaud.
 pub struct RepoWatcher {
@@ -60,7 +64,7 @@ impl RepoWatcher {
         // événements excédentaires sont comptés puis compensés par une relecture
         // complète, au lieu de faire enfler la mémoire sans limite.
         let (notify_tx, notify_rx) = crossbeam_channel::bounded(NOTIFY_CHANNEL_CAPACITY);
-        let (control_tx, control_rx) = crossbeam_channel::unbounded();
+        let (control_tx, control_rx) = crossbeam_channel::bounded(CONTROL_CHANNEL_CAPACITY);
         let is_running = Arc::new(AtomicBool::new(true));
         let dropped_events = Arc::new(AtomicU64::new(0));
 
@@ -78,13 +82,15 @@ impl RepoWatcher {
             Config::default(),
         )?;
 
+        let mut normalized_config = config.clone();
+        let _ = normalized_config.normalize();
         let worker = WatcherWorker::new(
             watcher,
             signal_sender,
-            config.debounce_duration(),
+            &normalized_config,
             dropped_events,
             Arc::clone(&is_running),
-        );
+        )?;
 
         let worker_handle = std::thread::Builder::new()
             .name("gremlin-repo-watcher".into())
@@ -93,7 +99,7 @@ impl RepoWatcher {
 
         Ok(Self {
             control_tx,
-            config: config.clone(),
+            config: normalized_config,
             is_running,
             worker_handle: Some(worker_handle),
             scan_handle: None,
@@ -168,9 +174,7 @@ impl RepoWatcher {
     /// Voir [`Self::watch_repo`].
     pub fn watched_repos(&self) -> Result<Vec<PathBuf>, WatcherError> {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        self.control_tx
-            .send(WatcherControl::ListRepos(tx))
-            .map_err(|_| WatcherError::ChannelClosed)?;
+        self.send_control(WatcherControl::ListRepos(tx))?;
         rx.recv_timeout(CONTROL_ACK_TIMEOUT).map_err(map_recv_error)
     }
 
@@ -182,9 +186,30 @@ impl RepoWatcher {
     /// # Errors
     /// Renvoie `WatcherError::ChannelClosed` si le worker s'est arrêté.
     pub fn set_status_sender(&mut self, sender: Sender<WatcherStatus>) -> Result<(), WatcherError> {
+        self.send_control(WatcherControl::SetStatusSender(sender))
+    }
+
+    /// Demande sans bloquer l'activation ou la désactivation des rapports.
+    ///
+    /// Le récepteur retourné confirme l'état réel une fois les ancres
+    /// enregistrées ou retirées par le worker. Le même changement est aussi
+    /// publié via [`WatcherStatus::ToolingStateChanged`] pour l'observabilité.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le canal borné est saturé ou si le worker est arrêté.
+    pub fn request_tooling_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<Receiver<ToolingStateAck>, WatcherError> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.control_tx
-            .send(WatcherControl::SetStatusSender(sender))
-            .map_err(|_| WatcherError::ChannelClosed)
+            .try_send(WatcherControl::SetToolingEnabled(enabled, ack_tx))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => WatcherError::ChannelFull,
+                TrySendError::Disconnected(_) => WatcherError::ChannelClosed,
+            })?;
+        Ok(ack_rx)
     }
 
     /// Applique la configuration de découverte : racines surveillées puis scan de fond.
@@ -252,11 +277,10 @@ impl RepoWatcher {
             .name("gremlin-git-scan".into())
             .spawn(move || {
                 GitScanner::scan_roots_cancellable(&roots, max_depth, &cancelled, |repo| {
-                    let _ = control_tx.send(WatcherControl::WatchRepo(
-                        repo.to_path_buf(),
-                        WatchOrigin::Discovery,
-                        None,
-                    ));
+                    let _ = control_tx.send_timeout(
+                        WatcherControl::WatchRepo(repo.to_path_buf(), WatchOrigin::Discovery, None),
+                        CONTROL_SEND_TIMEOUT,
+                    );
                 });
             }) {
             Ok(handle) => self.scan_handle = Some(handle),
@@ -270,10 +294,17 @@ impl RepoWatcher {
         F: FnOnce(crate::worker::Ack) -> WatcherControl,
     {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-        self.control_tx
-            .send(build(Some(ack_tx)))
-            .map_err(|_| WatcherError::ChannelClosed)?;
+        self.send_control(build(Some(ack_tx)))?;
         rx_result(ack_rx.recv_timeout(CONTROL_ACK_TIMEOUT))
+    }
+
+    fn send_control(&self, control: WatcherControl) -> Result<(), WatcherError> {
+        self.control_tx
+            .send_timeout(control, CONTROL_SEND_TIMEOUT)
+            .map_err(|error| match error {
+                crossbeam_channel::SendTimeoutError::Timeout(_) => WatcherError::ChannelFull,
+                crossbeam_channel::SendTimeoutError::Disconnected(_) => WatcherError::ChannelClosed,
+            })
     }
 }
 
@@ -299,7 +330,7 @@ impl Drop for RepoWatcher {
     fn drop(&mut self) {
         self.scan_cancelled.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
-        let _ = self.control_tx.send(WatcherControl::Shutdown);
+        let _ = self.control_tx.try_send(WatcherControl::Shutdown);
 
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
