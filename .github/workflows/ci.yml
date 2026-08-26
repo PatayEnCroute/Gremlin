@@ -2,9 +2,10 @@ name: CI — Validation Multi-Plateformes
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "feat/**" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
