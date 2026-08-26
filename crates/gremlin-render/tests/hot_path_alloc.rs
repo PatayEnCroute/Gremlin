@@ -1,9 +1,9 @@
 //! Régression d'allocation du chemin chaud visuel.
 
 use gremlin_render::{
-    register_default_procedural_accessories, AccessoryCatalog, AccessoryCategory, BubbleRect,
-    LayerCompositor, ParticleEngine, ParticlePreset, PixelBuffer, SpeechBubbleRenderer,
-    SpeechBubbleView, SpriteAtlas, TransitionRenderer, WardrobeEquipment,
+    register_default_accessories, AccessoryCatalog, AccessoryCategory, BubbleRect, LayerCompositor,
+    ParticleEngine, ParticlePreset, PixelBuffer, SpeechBubbleRenderer, SpeechBubbleView,
+    SpriteAtlas, TransitionRenderer, WardrobeEquipment,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -68,7 +68,7 @@ fn measured_allocations(action: impl FnOnce()) -> usize {
 fn hot_path_visuel_nalloue_pas_apres_prechauffage() {
     let mut atlas = SpriteAtlas::new();
     let mut catalog = AccessoryCatalog::new();
-    register_default_procedural_accessories(&mut atlas, &mut catalog);
+    register_default_accessories(&mut atlas, &mut catalog);
     atlas.load_default_procedural_sprites();
 
     let mut equipment = WardrobeEquipment::new();

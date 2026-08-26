@@ -1,0 +1,40 @@
+{
+  "id": "dev_cap",
+  "name": "Casquette Dev",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Hat",
+  "description": "Une casquette technique compacte, taillée pour coder sans écraser les oreilles.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "dev_cap_default_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 16,
+    "y": 4
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "dev_cap_baby_0"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 6
+      }
+    },
+    "evolved": {
+      "frames": [
+        "dev_cap_evolved_0"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 2
+      }
+    }
+  },
+  "clip_to_body": false
+}

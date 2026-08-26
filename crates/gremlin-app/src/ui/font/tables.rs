@@ -30,6 +30,15 @@
 //! dans le module parent), ce qui donne aux densités élevées un texte un peu
 //! plus petit que la maquette ne le prévoit, sans rien casser. Le sélecteur de
 //! corps de `layout.rs` est indépendant de cet état et n'aura pas à changer.
+//!
+//! # Ajouter un glyphe
+//!
+//! Le dessiner **dans les deux corps** : un caractère présent dans un seul sort
+//! en glyphe de repli — un rectangle creux — partout où l'autre corps est servi,
+//! et cela ne se voit qu'en regardant la planche. Les deux tables sont bornées
+//! par `test_every_drawing_stays_inside_its_cell`, et la planche de police rend
+//! désormais les deux corps : y ajouter le nouveau caractère fait partie du
+//! travail, sans quoi il reste invisible au contrôle.
 
 use super::{small, Face, Glyph, SPACE_WIDTH};
 use crate::ui::layout::FontSize;
@@ -1300,6 +1309,20 @@ const MEDIUM_SYMBOLS: &[Drawing] = &[
         "..##..",
         "...#..",
     ]),
+    // Panneau d'avertissement : triangle plein dont le point d'exclamation est
+    // réservé en creux, comme sur un panneau routier. Un triangle en contour
+    // avec une marque intérieure serait illisible au corps compact, où le trait
+    // ne fait qu'un pixel : les deux corps adoptent donc le même parti.
+    ('⚠', 4, &[
+        "....#....",
+        "...#.#...",
+        "...#.#...",
+        "..##.##..",
+        "..##.##..",
+        ".#######.",
+        ".###.###.",
+        "#########",
+    ]),
 ];
 
 /// Dessin servi pour tout caractère inconnu.
@@ -1523,22 +1546,45 @@ mod tests {
     #[test]
     fn test_every_drawing_stays_inside_its_cell() {
         // Un dessin qui dépasse la cellule empiéterait sur la ligne voisine.
-        let height = FontSize::Medium.cell_height();
-        for (ch, top, rows) in MEDIUM_UPPERCASE
-            .iter()
-            .chain(MEDIUM_LOWERCASE)
-            .chain(MEDIUM_DIGITS)
-            .chain(MEDIUM_SYMBOLS)
-        {
-            let bottom = top + rows.len() as i32;
-            assert!(
-                *top >= 0 && bottom <= height,
-                "« {ch} » sort de la cellule : lignes {top}..{bottom} pour une hauteur de {height}"
-            );
-            assert!(
-                rows.iter().all(|row| row.chars().count() <= 9),
-                "« {ch} » est plus large que la cellule autorisée"
-            );
+        //
+        // Les deux corps sont contrôlés. Le corps compact ne l'était pas : un
+        // glyphe deux fois trop large y serait passé sans que rien ne le signale,
+        // et n'aurait été vu qu'en regardant la planche — si tant est qu'on ait
+        // pensé à l'y faire figurer.
+        for (face, groups, max_width) in [
+            (
+                FontSize::Medium,
+                [
+                    MEDIUM_UPPERCASE,
+                    MEDIUM_LOWERCASE,
+                    MEDIUM_DIGITS,
+                    MEDIUM_SYMBOLS,
+                ],
+                9,
+            ),
+            (
+                FontSize::Small,
+                [
+                    small::UPPERCASE,
+                    small::LOWERCASE,
+                    small::DIGITS,
+                    small::SYMBOLS,
+                ],
+                8,
+            ),
+        ] {
+            let height = face.cell_height();
+            for (ch, top, rows) in groups.iter().copied().flatten() {
+                let bottom = top + rows.len() as i32;
+                assert!(
+                    *top >= 0 && bottom <= height,
+                    "« {ch} » sort de la cellule {face:?} : lignes {top}..{bottom} pour une hauteur de {height}"
+                );
+                assert!(
+                    rows.iter().all(|row| row.chars().count() <= max_width),
+                    "« {ch} » est plus large que la cellule {face:?} autorisée ({max_width} px)"
+                );
+            }
         }
     }
 

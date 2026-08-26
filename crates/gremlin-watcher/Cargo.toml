@@ -10,9 +10,10 @@ repository.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true
 notify.workspace = true
+# Utilisé par la détection des rapports d'outillage (`tooling.rs`), jamais pour
+# découvrir des dépôts : la surveillance Git ne parcourt aucune arborescence.
 walkdir.workspace = true
 tracing.workspace = true
-directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 quick-xml.workspace = true

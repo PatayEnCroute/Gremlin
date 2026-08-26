@@ -12,14 +12,20 @@
 pub mod app;
 pub mod config;
 pub mod desktop;
+pub mod desktop_motion;
 mod dialogue;
 pub mod error;
 pub mod persistence;
+pub mod pet_gesture;
 pub mod renderer;
 pub mod ui;
 mod visual_feedback;
 
 pub use app::{AppOptions, CustomAppEvent, GremlinApp, NATIVE_HEIGHT, NATIVE_WIDTH};
 pub use config::AppConfig;
+pub use desktop_motion::{
+    DesktopMotion, MotionConfig, MotionPhase, MotionUpdate, PlacementIntent, ScreenAnchor,
+};
 pub use error::AppError;
 pub use persistence::{LoadOutcome, PersistenceManager, PetSaveData, SAVE_ENVELOPE_VERSION};
+pub use pet_gesture::{GestureConfig, GestureOutcome, PetGesture};

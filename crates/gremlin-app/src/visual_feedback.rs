@@ -1,7 +1,7 @@
 //! Adaptation centralisée des événements métier vers les effets visuels.
 
 use crate::dialogue::{DialogueEngine, DialogueId};
-use gremlin_core::{CoreEvent, PetMood};
+use gremlin_core::{ConsumableKind, CoreEvent, PetMood, PomodoroPhase, WellbeingReminderKind};
 use gremlin_render::{
     ParticleEngine, ParticlePreset, PixelBuffer, SpeechBubbleView, TransitionController,
 };
@@ -108,7 +108,17 @@ impl VisualFeedback {
                 | CoreEvent::Petted { .. }
                 | CoreEvent::Healed { .. }
                 | CoreEvent::Rested { .. }
-                | CoreEvent::Revived => {}
+                | CoreEvent::Revived
+                | CoreEvent::StreakChanged { .. }
+                | CoreEvent::StreakRewardUnlocked { .. }
+                | CoreEvent::ConsumableGranted { .. }
+                | CoreEvent::ConsumableUsed { .. }
+                | CoreEvent::PomodoroStarted { .. }
+                | CoreEvent::PomodoroPaused { .. }
+                | CoreEvent::PomodoroResumed { .. }
+                | CoreEvent::PomodoroPhaseCompleted { .. }
+                | CoreEvent::PomodoroStopped { .. }
+                | CoreEvent::WellbeingReminder { .. } => {}
             }
             if let Some(reaction) = reaction_for_event(event) {
                 select_reaction(&mut selected, reaction);
@@ -223,6 +233,10 @@ fn select_reaction(selected: &mut Option<Reaction>, candidate: Reaction) {
     }
 }
 
+// Correspondance exhaustive événement -> réaction : la longueur vient du
+// nombre d'événements du domaine, pas d'une logique enchevêtrée. La découper
+// éparpillerait la table de priorités, qui se lit d'un seul tenant.
+#[allow(clippy::too_many_lines)]
 fn reaction_for_event(event: &CoreEvent) -> Option<Reaction> {
     let reaction = match event {
         CoreEvent::CommitReceived { .. } => Reaction {
@@ -294,6 +308,70 @@ fn reaction_for_event(event: &CoreEvent) -> Option<Reaction> {
             dialogue: DialogueId::Died,
             particles: None,
         },
+        // --- Phase 8 ---
+        // Un déblocage de cosmétique se célèbre, mais reste sous l'évolution et
+        // le décès : le système de priorités existant s'en charge.
+        CoreEvent::StreakRewardUnlocked { .. } => Reaction {
+            priority: 75,
+            dialogue: DialogueId::StreakReward,
+            particles: Some(ParticlePreset::ConfettiBurst),
+        },
+        CoreEvent::ConsumableUsed { kind, .. } => Reaction {
+            priority: 60,
+            dialogue: match kind {
+                ConsumableKind::Coffee => DialogueId::Coffee,
+                ConsumableKind::DebugPotion => DialogueId::DebugPotion,
+                ConsumableKind::Snack => DialogueId::Snack,
+            },
+            particles: Some(match kind {
+                // Le café réveille : des étincelles, pas des cœurs.
+                ConsumableKind::Coffee => ParticlePreset::SparkBurst,
+                ConsumableKind::DebugPotion | ConsumableKind::Snack => {
+                    ParticlePreset::FloatingHearts
+                }
+            }),
+        },
+        CoreEvent::PomodoroStarted { phase, .. } | CoreEvent::PomodoroResumed { phase, .. } => {
+            Reaction {
+                priority: 20,
+                dialogue: if *phase == PomodoroPhase::Work {
+                    DialogueId::FocusStarted
+                } else {
+                    DialogueId::BreakDone
+                },
+                particles: None,
+            }
+        }
+        CoreEvent::PomodoroPhaseCompleted { phase, .. } => Reaction {
+            priority: 20,
+            dialogue: if *phase == PomodoroPhase::Work {
+                DialogueId::FocusDone
+            } else {
+                DialogueId::BreakDone
+            },
+            particles: None,
+        },
+        CoreEvent::WellbeingReminder { kind } => Reaction {
+            priority: 20,
+            dialogue: match kind {
+                WellbeingReminderKind::Stretch => DialogueId::Stretch,
+                WellbeingReminderKind::Hydration => DialogueId::Hydrate,
+            },
+            particles: None,
+        },
+        // Une série qui progresse se remarque une seule fois, à l'arrivée d'un
+        // nouveau jour : les valeurs répétées sont filtrées par le core.
+        CoreEvent::StreakChanged { current_days, .. } if *current_days > 0 => Reaction {
+            priority: 20,
+            dialogue: DialogueId::StreakKept,
+            particles: None,
+        },
+        // Aucun retour visuel : un octroi silencieux, une pause de minuteur, un
+        // arrêt volontaire ou une série retombée à zéro n'appellent pas de bulle.
+        CoreEvent::StreakChanged { .. }
+        | CoreEvent::ConsumableGranted { .. }
+        | CoreEvent::PomodoroPaused { .. }
+        | CoreEvent::PomodoroStopped { .. } => return None,
         CoreEvent::Revived => Reaction {
             priority: 80,
             dialogue: DialogueId::Revived,

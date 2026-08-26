@@ -180,6 +180,60 @@ fn print_events(events: &[CoreEvent]) {
             CoreEvent::Revived => {
                 println!("  ❤ [RENAISSANCE] Le Gremlin a été ressuscité !");
             }
+            CoreEvent::StreakChanged {
+                current_days,
+                longest_days,
+            } => {
+                println!("  [SÉRIE] {current_days} jour(s) d'affilée (record : {longest_days})");
+            }
+            CoreEvent::StreakRewardUnlocked {
+                reward,
+                required_days,
+            } => {
+                println!("  ★ [RÉCOMPENSE] {reward} débloquée à {required_days} jours !");
+            }
+            CoreEvent::ConsumableGranted {
+                kind, quantity, ..
+            } => {
+                println!("  [INVENTAIRE] +{quantity} {kind}");
+            }
+            CoreEvent::ConsumableUsed {
+                kind,
+                remaining,
+                applied,
+                ..
+            } => println!(
+                "  [INVENTAIRE] {kind} utilisé (+{:.1} énergie, +{:.1} satiété, +{:.1} bonheur) — reste {remaining}",
+                applied.energy, applied.satiety, applied.happiness
+            ),
+            CoreEvent::PomodoroStarted { phase, remaining } => println!(
+                "  [MINUTEUR] Démarrage : {phase} ({} min)",
+                remaining.as_secs() / 60
+            ),
+            CoreEvent::PomodoroPaused {
+                phase,
+                remaining,
+                reason,
+            } => println!(
+                "  [MINUTEUR] {phase} en pause ({reason}) — {} s restantes",
+                remaining.as_secs()
+            ),
+            CoreEvent::PomodoroResumed { phase, remaining } => println!(
+                "  [MINUTEUR] Reprise : {phase} — {} s restantes",
+                remaining.as_secs()
+            ),
+            CoreEvent::PomodoroPhaseCompleted {
+                phase,
+                completed_work_blocks,
+            } => {
+                println!("  [MINUTEUR] {phase} terminée ({completed_work_blocks} bloc(s))");
+            }
+            CoreEvent::PomodoroStopped { .. } => {
+                println!("  [MINUTEUR] Cycle arrêté.");
+            }
+            CoreEvent::WellbeingReminder { kind } => {
+                println!("  [BIEN-ÊTRE] Pensez à : {kind}");
+            }
             CoreEvent::StatsDecayed { .. } => {}
         }
     }

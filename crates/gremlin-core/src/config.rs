@@ -33,6 +33,30 @@ const MAX_REWARD_XP: u64 = 1_000_000;
 const MAX_SESSION_DURATION_SECS: u64 = 86_400;
 /// Palier de focus minimal configurable.
 const MIN_FOCUS_MILESTONE_SECS: u64 = 60;
+/// Palier de série maximal configurable, en jours (environ dix ans).
+const MAX_STREAK_MILESTONE_DAYS: u16 = 3_650;
+/// Nombre de jours actifs conservés par défaut.
+const DEFAULT_STREAK_RETENTION_DAYS: u16 = 400;
+/// Rétention minimale : en deçà, la règle de grâce du lendemain n'a plus de sens.
+const MIN_STREAK_RETENTION_DAYS: u16 = 7;
+/// Rétention maximale, alignée sur le palier de série maximal.
+const MAX_STREAK_RETENTION_DAYS: u16 = MAX_STREAK_MILESTONE_DAYS;
+/// Nombre maximal d'exemplaires détenus par type de consommable.
+const MAX_INVENTORY_CAPACITY: u8 = 99;
+/// Effet minimal d'un consommable : un objet sans effet ne serait pas utilisable.
+const MIN_CONSUMABLE_EFFECT: f32 = 1.0;
+/// Effet maximal d'un consommable, aligné sur l'amplitude d'une jauge.
+const MAX_CONSUMABLE_EFFECT: f32 = 100.0;
+/// Durée minimale d'une phase de minuteur, en secondes.
+const MIN_POMODORO_PHASE_SECS: u32 = 30;
+/// Durée maximale d'une phase de minuteur, en secondes (quatre heures).
+const MAX_POMODORO_PHASE_SECS: u32 = 4 * 3_600;
+/// Nombre maximal de blocs de travail avant pause longue.
+const MAX_POMODORO_BLOCKS_BEFORE_LONG_BREAK: u8 = 12;
+/// Pas live minimal avant de suspecter une suspension machine, en secondes.
+const MIN_POMODORO_LIVE_STEP_SECS: u32 = 5;
+/// Pas live maximal avant de suspecter une suspension machine, en secondes.
+const MAX_POMODORO_LIVE_STEP_SECS: u32 = 900;
 
 /// Ramène une valeur flottante dans `[min, max]` en neutralisant `NaN`.
 fn sanitize_f32(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
@@ -594,6 +618,297 @@ impl MoodConfig {
     }
 }
 
+/// Paliers de série de productivité et fenêtre de rétention des jours actifs.
+///
+/// Les trois paliers sont ordonnés : le plus petit débloque la récompense la
+/// moins rare. La normalisation garantit une suite strictement croissante, ce
+/// qui rend impossible qu'un même commit débloque deux paliers d'un coup ou
+/// qu'un palier reste inatteignable derrière un doublon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreakConfig {
+    /// Nombre de jours consécutifs requis par chacune des trois récompenses.
+    pub milestone_days: [u16; 3],
+    /// Nombre de jours actifs distincts conservés en mémoire et en sauvegarde.
+    pub retention_days: u16,
+}
+
+impl Default for StreakConfig {
+    fn default() -> Self {
+        Self {
+            milestone_days: [3, 7, 30],
+            retention_days: DEFAULT_STREAK_RETENTION_DAYS,
+        }
+    }
+}
+
+impl StreakConfig {
+    /// Corrige les paliers et la rétention.
+    ///
+    /// Les paliers sont bornés, triés puis rendus strictement croissants : deux
+    /// paliers égaux lus depuis le disque décaleraient sinon le second sans
+    /// jamais le rendre atteignable séparément.
+    pub fn normalize(&mut self) {
+        for milestone in &mut self.milestone_days {
+            *milestone = (*milestone).clamp(1, MAX_STREAK_MILESTONE_DAYS);
+        }
+        self.milestone_days.sort_unstable();
+        for index in 1..self.milestone_days.len() {
+            let previous = self.milestone_days[index - 1];
+            if self.milestone_days[index] <= previous {
+                self.milestone_days[index] = previous.saturating_add(1);
+            }
+        }
+        // Le décalage ci-dessus peut pousser le dernier palier au-delà de la
+        // borne ; on le ramène en descendant, ce qui préserve la stricte
+        // croissance et rend la normalisation idempotente.
+        for index in (0..self.milestone_days.len()).rev() {
+            if self.milestone_days[index] > MAX_STREAK_MILESTONE_DAYS {
+                self.milestone_days[index] = MAX_STREAK_MILESTONE_DAYS;
+            }
+            if index > 0 && self.milestone_days[index - 1] >= self.milestone_days[index] {
+                self.milestone_days[index - 1] =
+                    self.milestone_days[index].saturating_sub(1).max(1);
+            }
+        }
+        self.retention_days = self
+            .retention_days
+            .clamp(MIN_STREAK_RETENTION_DAYS, MAX_STREAK_RETENTION_DAYS);
+    }
+
+    /// Vérifie les paliers et la rétention sans les modifier.
+    ///
+    /// # Errors
+    /// Renvoie [`CoreError::ConfigurationError`] au premier paramètre invalide.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        let mut previous = 0_u16;
+        for milestone in self.milestone_days {
+            if milestone == 0 || milestone > MAX_STREAK_MILESTONE_DAYS || milestone <= previous {
+                return Err(CoreError::ConfigurationError(format!(
+                    "milestone_days = {:?} doit être strictement croissant dans [1, {MAX_STREAK_MILESTONE_DAYS}]",
+                    self.milestone_days
+                )));
+            }
+            previous = milestone;
+        }
+        if !(MIN_STREAK_RETENTION_DAYS..=MAX_STREAK_RETENTION_DAYS).contains(&self.retention_days) {
+            return Err(CoreError::ConfigurationError(format!(
+                "retention_days = {} hors des bornes [{MIN_STREAK_RETENTION_DAYS}, {MAX_STREAK_RETENTION_DAYS}]",
+                self.retention_days
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Capacités, stocks de départ et effets des consommables.
+///
+/// Les gains sont **nominaux** : les jauges restent plafonnées à
+/// [`MAX_STAT_VALUE`](crate::stats::MAX_STAT_VALUE) et l'effet réellement
+/// appliqué est rapporté par l'événement d'utilisation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InventoryConfig {
+    /// Nombre maximal d'exemplaires détenus par type d'objet.
+    pub capacity: u8,
+    /// Stock de café attribué à un familier neuf.
+    pub initial_coffee: u8,
+    /// Stock de potion de debug attribué à un familier neuf.
+    pub initial_debug_potion: u8,
+    /// Stock de collations attribué à un familier neuf.
+    pub initial_snack: u8,
+    /// Énergie nominale rendue par un café.
+    pub coffee_energy: f32,
+    /// Gain nominal appliqué aux trois jauges par une potion de debug.
+    pub debug_potion_amount: f32,
+    /// Satiété nominale rendue par une collation.
+    pub snack_satiety: f32,
+}
+
+impl Default for InventoryConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 9,
+            initial_coffee: 1,
+            initial_debug_potion: 1,
+            initial_snack: 2,
+            coffee_energy: 25.0,
+            debug_potion_amount: 15.0,
+            snack_satiety: 25.0,
+        }
+    }
+}
+
+impl InventoryConfig {
+    /// Corrige capacités, stocks initiaux et effets.
+    pub fn normalize(&mut self) {
+        let defaults = Self::default();
+        self.capacity = self.capacity.clamp(1, MAX_INVENTORY_CAPACITY);
+        self.initial_coffee = self.initial_coffee.min(self.capacity);
+        self.initial_debug_potion = self.initial_debug_potion.min(self.capacity);
+        self.initial_snack = self.initial_snack.min(self.capacity);
+        self.coffee_energy = sanitize_f32(
+            self.coffee_energy,
+            MIN_CONSUMABLE_EFFECT,
+            MAX_CONSUMABLE_EFFECT,
+            defaults.coffee_energy,
+        );
+        self.debug_potion_amount = sanitize_f32(
+            self.debug_potion_amount,
+            MIN_CONSUMABLE_EFFECT,
+            MAX_CONSUMABLE_EFFECT,
+            defaults.debug_potion_amount,
+        );
+        self.snack_satiety = sanitize_f32(
+            self.snack_satiety,
+            MIN_CONSUMABLE_EFFECT,
+            MAX_CONSUMABLE_EFFECT,
+            defaults.snack_satiety,
+        );
+    }
+
+    /// Vérifie capacités et effets sans les modifier.
+    ///
+    /// # Errors
+    /// Renvoie [`CoreError::ConfigurationError`] au premier paramètre invalide.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.capacity == 0 || self.capacity > MAX_INVENTORY_CAPACITY {
+            return Err(CoreError::ConfigurationError(format!(
+                "capacity = {} hors des bornes [1, {MAX_INVENTORY_CAPACITY}]",
+                self.capacity
+            )));
+        }
+        for (name, stock) in [
+            ("initial_coffee", self.initial_coffee),
+            ("initial_debug_potion", self.initial_debug_potion),
+            ("initial_snack", self.initial_snack),
+        ] {
+            if stock > self.capacity {
+                return Err(CoreError::ConfigurationError(format!(
+                    "{name} = {stock} dépasse la capacité {}",
+                    self.capacity
+                )));
+            }
+        }
+        check_f32(
+            "coffee_energy",
+            self.coffee_energy,
+            MIN_CONSUMABLE_EFFECT,
+            MAX_CONSUMABLE_EFFECT,
+        )?;
+        check_f32(
+            "debug_potion_amount",
+            self.debug_potion_amount,
+            MIN_CONSUMABLE_EFFECT,
+            MAX_CONSUMABLE_EFFECT,
+        )?;
+        check_f32(
+            "snack_satiety",
+            self.snack_satiety,
+            MIN_CONSUMABLE_EFFECT,
+            MAX_CONSUMABLE_EFFECT,
+        )
+    }
+}
+
+/// Durées du minuteur de concentration.
+///
+/// Les durées sont stockées en secondes entières : un flottant persisté
+/// finirait par produire un compte à rebours qui n'atteint jamais zéro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PomodoroConfig {
+    /// Durée d'un bloc de travail, en secondes.
+    pub work_secs: u32,
+    /// Durée d'une pause courte, en secondes.
+    pub short_break_secs: u32,
+    /// Durée d'une pause longue, en secondes.
+    pub long_break_secs: u32,
+    /// Nombre de blocs de travail avant qu'une pause longue soit proposée.
+    pub blocks_before_long_break: u8,
+    /// Pas live maximal accepté avant de considérer la machine suspendue.
+    pub max_live_step_secs: u32,
+}
+
+impl Default for PomodoroConfig {
+    fn default() -> Self {
+        Self {
+            work_secs: 25 * 60,
+            short_break_secs: 5 * 60,
+            long_break_secs: 15 * 60,
+            blocks_before_long_break: 4,
+            max_live_step_secs: 120,
+        }
+    }
+}
+
+impl PomodoroConfig {
+    /// Corrige les durées et le nombre de blocs.
+    ///
+    /// Une pause longue plus courte qu'une pause courte est une incohérence
+    /// visible par l'utilisateur : elle est relevée au niveau de la pause
+    /// courte plutôt que laissée telle quelle.
+    pub fn normalize(&mut self) {
+        self.work_secs = self
+            .work_secs
+            .clamp(MIN_POMODORO_PHASE_SECS, MAX_POMODORO_PHASE_SECS);
+        self.short_break_secs = self
+            .short_break_secs
+            .clamp(MIN_POMODORO_PHASE_SECS, MAX_POMODORO_PHASE_SECS);
+        self.long_break_secs = self
+            .long_break_secs
+            .clamp(MIN_POMODORO_PHASE_SECS, MAX_POMODORO_PHASE_SECS)
+            .max(self.short_break_secs);
+        self.blocks_before_long_break = self
+            .blocks_before_long_break
+            .clamp(1, MAX_POMODORO_BLOCKS_BEFORE_LONG_BREAK);
+        self.max_live_step_secs = self
+            .max_live_step_secs
+            .clamp(MIN_POMODORO_LIVE_STEP_SECS, MAX_POMODORO_LIVE_STEP_SECS);
+    }
+
+    /// Vérifie les durées sans les modifier.
+    ///
+    /// # Errors
+    /// Renvoie [`CoreError::ConfigurationError`] au premier paramètre invalide.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        for (name, value) in [
+            ("work_secs", self.work_secs),
+            ("short_break_secs", self.short_break_secs),
+            ("long_break_secs", self.long_break_secs),
+        ] {
+            if !(MIN_POMODORO_PHASE_SECS..=MAX_POMODORO_PHASE_SECS).contains(&value) {
+                return Err(CoreError::ConfigurationError(format!(
+                    "{name} = {value} hors des bornes [{MIN_POMODORO_PHASE_SECS}, {MAX_POMODORO_PHASE_SECS}]"
+                )));
+            }
+        }
+        if self.long_break_secs < self.short_break_secs {
+            return Err(CoreError::ConfigurationError(format!(
+                "long_break_secs = {} est plus court que short_break_secs = {}",
+                self.long_break_secs, self.short_break_secs
+            )));
+        }
+        if self.blocks_before_long_break == 0
+            || self.blocks_before_long_break > MAX_POMODORO_BLOCKS_BEFORE_LONG_BREAK
+        {
+            return Err(CoreError::ConfigurationError(format!(
+                "blocks_before_long_break = {} hors des bornes [1, {MAX_POMODORO_BLOCKS_BEFORE_LONG_BREAK}]",
+                self.blocks_before_long_break
+            )));
+        }
+        if !(MIN_POMODORO_LIVE_STEP_SECS..=MAX_POMODORO_LIVE_STEP_SECS)
+            .contains(&self.max_live_step_secs)
+        {
+            return Err(CoreError::ConfigurationError(format!(
+                "max_live_step_secs = {} hors des bornes [{MIN_POMODORO_LIVE_STEP_SECS}, {MAX_POMODORO_LIVE_STEP_SECS}]",
+                self.max_live_step_secs
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration globale du moteur de jeu Gremlin.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -608,6 +923,12 @@ pub struct CoreConfig {
     pub tooling: ToolingRewardsConfig,
     /// Seuils de l'estimation de focus.
     pub focus: FocusConfig,
+    /// Paliers et rétention des séries de jours de commits.
+    pub streak: StreakConfig,
+    /// Capacités et effets des consommables.
+    pub inventory: InventoryConfig,
+    /// Durées du minuteur de concentration.
+    pub pomodoro: PomodoroConfig,
     /// Intervalle maximal en secondes d'un pas de simulation pour le rattrapage hors-ligne.
     pub catchup_step_secs: u64,
 }
@@ -633,6 +954,9 @@ impl CoreConfig {
             mood: MoodConfig::default(),
             tooling: ToolingRewardsConfig::default(),
             focus: FocusConfig::default(),
+            streak: StreakConfig::default(),
+            inventory: InventoryConfig::default(),
+            pomodoro: PomodoroConfig::default(),
             catchup_step_secs: DEFAULT_CATCHUP_STEP_SECS,
         }
     }
@@ -658,6 +982,9 @@ impl CoreConfig {
         self.mood.normalize();
         self.tooling.normalize();
         self.focus.normalize();
+        self.streak.normalize();
+        self.inventory.normalize();
+        self.pomodoro.normalize();
         self.catchup_step_secs = self
             .catchup_step_secs
             .clamp(MIN_CATCHUP_STEP_SECS, MAX_CATCHUP_STEP_SECS);
@@ -673,6 +1000,9 @@ impl CoreConfig {
         self.mood.validate()?;
         self.tooling.validate()?;
         self.focus.validate()?;
+        self.streak.validate()?;
+        self.inventory.validate()?;
+        self.pomodoro.validate()?;
         if !(MIN_CATCHUP_STEP_SECS..=MAX_CATCHUP_STEP_SECS).contains(&self.catchup_step_secs) {
             return Err(CoreError::ConfigurationError(format!(
                 "catchup_step_secs = {} hors des bornes [{MIN_CATCHUP_STEP_SECS}, {MAX_CATCHUP_STEP_SECS}]",

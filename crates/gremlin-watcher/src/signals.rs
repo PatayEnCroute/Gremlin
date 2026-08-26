@@ -51,6 +51,38 @@ pub struct ToolingStateAck {
     pub error: Option<String>,
 }
 
+/// Horodatage brut d'une entrée de reflog, transporté sans interprétation.
+///
+/// Le watcher ne décide pas ce qu'est un « jour » : il transporte l'instant et
+/// le décalage tels que Git les a écrits. C'est l'orchestrateur qui les convertit
+/// en date civile, et le domaine qui en tire une série.
+///
+/// Le décalage est celui du **moment du commit**, pas celui de la machine
+/// aujourd'hui : un déplacement de fuseau ne réécrit donc jamais l'histoire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GitCommitStamp {
+    /// Secondes écoulées depuis l'époque Unix, toujours positives ou nulles.
+    pub unix_seconds: i64,
+    /// Décalage UTC enregistré, en minutes, dans `[-14 h, +14 h]`.
+    pub utc_offset_minutes: i16,
+}
+
+impl GitCommitStamp {
+    /// Numéro de jour local brut, servant uniquement à dédupliquer le transport.
+    ///
+    /// Ce calcul ne décide **ni** de la consécutivité **ni** des récompenses : il
+    /// évite seulement qu'une journée à fort volume de commits remplisse à elle
+    /// seule le lot transmis. La validation calendaire reste dans le domaine.
+    #[must_use]
+    pub const fn transport_day_key(self) -> i64 {
+        // `div_euclid` plutôt que `/` : une division entière tronque vers zéro et
+        // regrouperait le 31 décembre 1969 avec le 1er janvier 1970.
+        self.unix_seconds
+            .saturating_add(self.utc_offset_minutes as i64 * 60)
+            .div_euclid(86_400)
+    }
+}
+
 /// Signal de développement émis par le système de surveillance de fichiers et dépôts Git.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DevSignal {
@@ -66,6 +98,28 @@ pub enum DevSignal {
         message: Option<String>,
         /// Chemin absolu du dépôt.
         repo_path: PathBuf,
+        /// Horodatage du commit, présent seulement si le reflog fait autorité.
+        ///
+        /// Un commit détecté par le seul changement de SHA fait bien réagir le
+        /// familier, mais n'alimente pas la série : sans preuve temporelle, la
+        /// journée attribuée serait une supposition.
+        stamp: Option<GitCommitStamp>,
+    },
+    /// L'historique récent des jours de commits d'un dépôt a été relu.
+    ///
+    /// Émis une fois au rattachement du dépôt, y compris lorsque la liste est
+    /// vide mais la lecture réussie — l'orchestrateur distingue ainsi « aucun
+    /// commit » de « journal illisible ». Ces entrées ne rejouent **jamais**
+    /// l'XP : elles reconstituent seulement des journées de travail.
+    CommitHistorySeeded {
+        /// Nom ou identifiant du dépôt.
+        repo_name: String,
+        /// Chemin absolu du dépôt.
+        repo_path: PathBuf,
+        /// Horodatages retenus, au plus un par journée locale.
+        stamps: Vec<GitCommitStamp>,
+        /// Une borne de lecture a été atteinte : l'historique est incomplet.
+        truncated: bool,
     },
     /// Un changement de branche active a été détecté (ex: `git checkout`, `git switch`).
     BranchChanged {
@@ -138,6 +192,16 @@ pub enum WatcherStatus {
     },
     /// Un rapport a été refusé après la fin des tentatives bornées.
     ReportRejected { path: PathBuf, reason: String },
+    /// Le journal de références d'un dépôt n'a pas pu être relu.
+    ///
+    /// La série de productivité repart alors de l'état déjà persisté : une
+    /// lecture refusée ne doit jamais effacer un historique connu.
+    HistoryUnreadable {
+        /// Répertoire `.git` concerné.
+        path: PathBuf,
+        /// Description de la cause.
+        reason: String,
+    },
     /// La surveillance des rapports a effectivement changé d'état dans le worker.
     ToolingStateChanged {
         /// État désormais appliqué.

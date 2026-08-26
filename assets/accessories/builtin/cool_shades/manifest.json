@@ -1,0 +1,40 @@
+{
+  "id": "cool_shades",
+  "name": "Lunettes Pixel",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Glasses",
+  "description": "Des verres fumés anguleux, sobres et lisibles jusque dans les petites poses.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "cool_shades_default_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 16,
+    "y": 20
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "cool_shades_baby_0"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 22
+      }
+    },
+    "evolved": {
+      "frames": [
+        "cool_shades_evolved_0"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 18
+      }
+    }
+  },
+  "clip_to_body": false
+}

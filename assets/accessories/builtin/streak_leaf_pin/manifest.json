@@ -1,0 +1,24 @@
+{
+  "id": "streak_leaf_pin",
+  "name": "Feuille porte-bonheur",
+  "author": "Gremlin Studio",
+  "version": "1.0.0",
+  "category": "Hat",
+  "description": "Récompense des trois premiers jours de commits consécutifs.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "streak_leaf_pin_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 16,
+    "y": 4
+  },
+  "variants": {
+    "baby": {},
+    "evolved": {}
+  },
+  "clip_to_body": false
+}

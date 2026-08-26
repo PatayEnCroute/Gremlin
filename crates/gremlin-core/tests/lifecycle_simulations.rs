@@ -3,8 +3,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
 use gremlin_core::{
-    ActionKind, CoreConfig, CoreError, CoreEvent, EvolutionStage, PetMood, PetProgression,
-    PetState, PetStats, MAX_CATCHUP_DURATION_SECS,
+    ActionKind, CivilDate, ConsumableKind, CoreConfig, CoreError, CoreEvent, EvolutionStage,
+    PauseReason, PetMood, PetProgression, PetState, PetStats, PomodoroState, StreakReward,
+    MAX_CATCHUP_DURATION_SECS,
 };
 use std::time::Duration;
 
@@ -271,4 +272,264 @@ fn test_hostile_save_cannot_break_the_engine() {
     pet.tick(Duration::from_secs(3600));
     assert!(pet.stats().energy() <= energy_before);
     assert!(pet.to_json().is_ok());
+}
+
+// -----------------------------------------------------------------------------
+// Phase 8 : série, inventaire et concentration, sans jamais lire l'horloge
+// -----------------------------------------------------------------------------
+
+/// Date de test, construite ou test échoué : aucune date approximative.
+fn day(year: i32, month: u8, day: u8) -> CivilDate {
+    CivilDate::new(year, month, day).expect("date de test valide")
+}
+
+#[test]
+fn test_a_full_week_of_work_without_any_real_clock() {
+    let mut pet = PetState::new("Gizmo");
+    let start = day(2024, 5, 1);
+    let mut unlocked = Vec::new();
+    let mut granted = 0_usize;
+
+    // Sept jours de travail : un commit par jour, et une journée simulée entre
+    // deux. Aucune horloge n'est lue — les dates comme les durées sont injectées.
+    for offset in 0..7 {
+        let today = start.checked_add_days(offset).expect("jour de test");
+
+        let commit = pet
+            .handle_commit("gremlin", "main")
+            .expect("le familier accepte un commit");
+        assert!(commit
+            .iter()
+            .any(|event| matches!(event, CoreEvent::CommitReceived { .. })));
+
+        for event in pet.record_commit_activity(today, today) {
+            match event {
+                CoreEvent::StreakRewardUnlocked { reward, .. } => unlocked.push(reward),
+                CoreEvent::ConsumableGranted { .. } => granted += 1,
+                _ => {}
+            }
+        }
+
+        // Le jour civil et le temps simulé sont deux choses distinctes : le
+        // premier est injecté, le second s'écoule. Simuler vingt-quatre heures
+        // de négligence par jour tuerait le familier au troisième jour, ce qui
+        // n'apprendrait rien sur la règle de série — le scénario garde donc des
+        // sessions courtes et nourrit le familier au passage.
+        pet.tick(Duration::from_secs(15 * 60));
+        for kind in [ConsumableKind::Snack, ConsumableKind::Coffee] {
+            // Un objet sans effet ou hors stock est refusé : c'est attendu, et
+            // le refus ne consomme rien.
+            let _ = pet.use_consumable(kind);
+        }
+        assert!(pet.is_alive(), "le familier doit survivre à la semaine");
+    }
+
+    let last_day = start.checked_add_days(6).expect("dernier jour");
+    let streak = pet.productivity().streak();
+    assert_eq!(streak.current_streak(last_day), 7);
+    assert_eq!(streak.longest_days(), 7);
+    assert_eq!(streak.total_productive_days(), 7);
+    assert_eq!(
+        unlocked,
+        vec![StreakReward::LeafPin, StreakReward::FocusHeadphones],
+        "les paliers 3 et 7 débloquent une seule récompense chacun"
+    );
+    assert_eq!(granted, 7, "une récompense quotidienne par jour actif");
+    assert!(!streak.is_unlocked(StreakReward::AuroraAura));
+}
+
+#[test]
+fn test_the_grace_day_then_the_break_without_touching_the_records() {
+    let mut pet = PetState::new("Gizmo");
+    let start = day(2024, 5, 1);
+    for offset in 0..4 {
+        let today = start.checked_add_days(offset).expect("jour de test");
+        pet.record_commit_activity(today, today);
+    }
+
+    let last = start.checked_add_days(3).expect("dernier jour actif");
+    assert_eq!(pet.productivity().streak().current_streak(last), 4);
+
+    // Lendemain sans commit : la série reste affichée toute la journée.
+    let grace = start.checked_add_days(4).expect("lendemain");
+    assert_eq!(pet.productivity().streak().current_streak(grace), 4);
+    assert!(
+        pet.refresh_current_day(grace).is_empty(),
+        "rien à annoncer tant que la série ne bouge pas"
+    );
+
+    // Deuxième jour manqué : elle tombe, les records survivent.
+    let broken = start.checked_add_days(5).expect("surlendemain");
+    let events = pet.refresh_current_day(broken);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        CoreEvent::StreakChanged {
+            current_days: 0,
+            longest_days: 4,
+        }
+    )));
+    assert_eq!(pet.productivity().streak().longest_days(), 4);
+    assert_eq!(pet.productivity().streak().total_productive_days(), 4);
+}
+
+#[test]
+fn test_an_offline_catchup_never_advances_the_focus_timer() {
+    let mut pet = PetState::new("Gizmo");
+    pet.start_pomodoro().expect("minuteur démarrable");
+    let started = pet
+        .productivity()
+        .pomodoro()
+        .remaining()
+        .expect("session en cours");
+
+    // Un mois de rattrapage hors-ligne : les jauges plongent, le minuteur non.
+    pet.tick(Duration::from_secs(MAX_CATCHUP_DURATION_SECS));
+    assert_eq!(pet.productivity().pomodoro().remaining(), Some(started));
+    assert_eq!(pet.productivity().pomodoro().completed_work_blocks(), 0);
+}
+
+#[test]
+fn test_a_full_focus_cycle_grants_nothing_farmable() {
+    let mut config = CoreConfig::new();
+    config.pomodoro.work_secs = 60;
+    config.pomodoro.short_break_secs = 30;
+    config.normalize();
+
+    let mut pet = PetState::with_config("Gizmo", config);
+    let xp_before = pet.progression().total_xp();
+    let stock_before = pet.productivity().inventory().total();
+    pet.start_pomodoro().expect("minuteur démarrable");
+
+    let events = pet.advance_live_productivity(Duration::from_secs(60));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        CoreEvent::PomodoroPhaseCompleted {
+            completed_work_blocks: 1,
+            ..
+        }
+    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, CoreEvent::WellbeingReminder { .. })));
+
+    assert_eq!(pet.progression().total_xp(), xp_before, "XP farmable");
+    assert_eq!(
+        pet.productivity().inventory().total(),
+        stock_before,
+        "objet farmable"
+    );
+    assert_eq!(
+        pet.productivity().streak().total_productive_days(),
+        0,
+        "journée de série fabriquée par le minuteur"
+    );
+}
+
+#[test]
+fn test_a_phase_seven_save_loads_with_phase_eight_defaults() {
+    // Sauvegarde telle qu'écrite avant la phase 8 : aucun champ de productivité.
+    let legacy = r#"{
+        "version": 1,
+        "name": "Ancien Gremlin",
+        "stats": { "energy": 62.0, "satiety": 48.0, "happiness": 71.0 },
+        "mood": "Happy",
+        "progression": { "level": 4, "total_xp": 640, "total_commits": 12 },
+        "is_sleeping": false,
+        "coding_timer_secs": 0.0
+    }"#;
+
+    let pet = PetState::from_json(legacy).expect("sauvegarde de phase 7 lisible");
+    assert_eq!(pet.name(), "Ancien Gremlin");
+    assert_eq!(pet.progression().total_commits(), 12);
+
+    // La dotation de départ est attribuée exactement une fois, à la lecture du
+    // champ absent — pas à chaque chargement.
+    let inventory = pet.productivity().inventory();
+    assert_eq!(inventory.quantity(ConsumableKind::Coffee), 1);
+    assert_eq!(inventory.quantity(ConsumableKind::DebugPotion), 1);
+    assert_eq!(inventory.quantity(ConsumableKind::Snack), 2);
+
+    assert_eq!(pet.productivity().streak().longest_days(), 0);
+    assert_eq!(pet.productivity().pomodoro().state(), PomodoroState::Idle);
+
+    // Un aller-retour conserve l'inventaire au lieu de le redistribuer.
+    let json = pet.to_json().expect("sérialisation");
+    let reloaded = PetState::from_json(&json).expect("relecture");
+    assert_eq!(reloaded.productivity().inventory(), inventory);
+}
+
+#[test]
+fn test_a_running_timer_in_a_save_is_repaired_at_load() {
+    let mut pet = PetState::new("Gizmo");
+    pet.start_pomodoro().expect("minuteur démarrable");
+    pet.advance_live_productivity(Duration::from_secs(120));
+    let remaining = pet.productivity().pomodoro().remaining();
+
+    let json = pet.to_json().expect("sérialisation");
+    let reloaded = PetState::from_json(&json).expect("relecture");
+
+    // Le temps restant survit, la prétention d'avoir mesuré non.
+    assert_eq!(reloaded.productivity().pomodoro().remaining(), remaining);
+    assert!(!reloaded.productivity().pomodoro().is_running());
+    assert_eq!(
+        reloaded.productivity().pomodoro().pause_reason(),
+        Some(PauseReason::Restarted)
+    );
+}
+
+#[test]
+fn test_a_hostile_productivity_save_is_normalised_without_losing_the_records() {
+    // Jours dupliqués et hors calendrier, quantités absurdes, minuteur bloqué.
+    let hostile = r#"{
+        "version": 1,
+        "name": "Bricolé",
+        "productivity": {
+            "streak": {
+                "active_days": [19800, 19800, -12, 2147483647, 19801],
+                "longest_days": 65535,
+                "total_productive_days": 0,
+                "unlocked_rewards_mask": 255
+            },
+            "inventory": { "quantities": [255, 255, 255] },
+            "pomodoro": {
+                "state": { "Running": { "phase": "Work", "remaining_millis": 0,
+                                        "completed_work_blocks": 65535 } },
+                "reminder_index": 0
+            }
+        }
+    }"#;
+
+    let pet = PetState::from_json(hostile).expect("sauvegarde hostile lisible");
+    let productivity = pet.productivity();
+
+    // Deux jours réels retenus, les valeurs hors calendrier écartées.
+    assert_eq!(
+        productivity
+            .streak()
+            .current_streak(CivilDate::from_day_number(19_801).expect("jour de test")),
+        2
+    );
+    assert!(productivity.streak().longest_days() <= 36_500);
+    assert!(productivity.streak().total_productive_days() >= 2);
+
+    // Les stocks sont ramenés sous la capacité, le minuteur réarmé et suspendu.
+    let capacity = pet.config().inventory.capacity;
+    for kind in ConsumableKind::ALL {
+        assert_eq!(productivity.inventory().quantity(kind), capacity);
+    }
+    assert!(productivity
+        .pomodoro()
+        .remaining()
+        .is_some_and(|remaining| {
+            remaining == Duration::from_secs(u64::from(pet.config().pomodoro.work_secs))
+        }));
+    assert_eq!(
+        productivity.pomodoro().pause_reason(),
+        Some(PauseReason::Restarted)
+    );
+
+    // La normalisation est idempotente : un second aller-retour ne change rien.
+    let json = pet.to_json().expect("sérialisation");
+    let twice = PetState::from_json(&json).expect("relecture");
+    assert_eq!(twice.productivity(), productivity);
 }

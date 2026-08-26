@@ -1,0 +1,40 @@
+{
+  "id": "fire_aura",
+  "name": "Aura de Braises",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Aura",
+  "description": "Des rubans de flammes séparés qui entourent le Gremlin sans masquer sa silhouette.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "fire_aura_default_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 0,
+    "y": 0
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "fire_aura_baby_0"
+      ],
+      "anchor": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    "evolved": {
+      "frames": [
+        "fire_aura_evolved_0"
+      ],
+      "anchor": {
+        "x": 0,
+        "y": 0
+      }
+    }
+  },
+  "clip_to_body": false
+}

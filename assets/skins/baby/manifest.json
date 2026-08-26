@@ -2,6 +2,7 @@
   "name": "Baby Gremlin",
   "author": "Gremlin Studio",
   "version": "2.0.0",
+  "accessory_style": "baby",
   "frame_width": 64,
   "frame_height": 64,
   "anchors": {
@@ -10,8 +11,8 @@
       "y": 0
     },
     "outfit": {
-      "x": 0,
-      "y": 0
+      "x": 30,
+      "y": 42
     },
     "aura": {
       "x": 0,
@@ -36,6 +37,86 @@
     "effect_origin": {
       "x": 32,
       "y": 31
+    }
+  },
+  "anchor_offsets_per_mood": {
+    "happy": {
+      "head": {
+        "x": 1,
+        "y": 1
+      },
+      "body": {
+        "x": 1,
+        "y": 0
+      },
+      "held": {
+        "x": 0,
+        "y": -6
+      }
+    },
+    "sleep": {
+      "head": {
+        "x": 3,
+        "y": 6
+      },
+      "body": {
+        "x": 2,
+        "y": -4
+      },
+      "held": {
+        "x": 2,
+        "y": -2
+      }
+    },
+    "dead": {
+      "head": {
+        "x": 7,
+        "y": 18
+      },
+      "body": {
+        "x": 2,
+        "y": 0
+      },
+      "held": {
+        "x": 4,
+        "y": 5
+      }
+    },
+    "coding": {
+      "head": {
+        "x": -2,
+        "y": 0
+      },
+      "body": {
+        "x": -1,
+        "y": 0
+      },
+      "held": {
+        "x": -4,
+        "y": -4
+      }
+    },
+    "hungry": {
+      "head": {
+        "x": 0,
+        "y": 1
+      }
+    },
+    "sick": {
+      "head": {
+        "x": 0,
+        "y": 1
+      }
+    },
+    "dragged": {
+      "head": {
+        "x": 0,
+        "y": -2
+      },
+      "held": {
+        "x": -2,
+        "y": -4
+      }
     }
   },
   "animations": {
@@ -108,6 +189,14 @@
         "sick_1"
       ],
       "frame_duration_ms": 500,
+      "mode": "Loop"
+    },
+    "focus": {
+      "frames": [
+        "coding_0",
+        "coding_1"
+      ],
+      "frame_duration_ms": 140,
       "mode": "Loop"
     }
   }

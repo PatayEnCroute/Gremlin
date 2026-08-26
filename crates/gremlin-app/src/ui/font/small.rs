@@ -160,4 +160,17 @@ pub(super) const SYMBOLS: &[Drawing] = &[
     ('↓', 2, &["..#..", "..#..", "..#..", "..#..", "#.#.#", ".###.", "..#.."]),
     ('→', 4, &["..#..", "...#.", "#####", "...#.", "..#.."]),
     ('←', 4, &["..#..", ".#...", "#####", ".#...", "..#.."]),
+    // Panneau d'avertissement, même parti qu'au corps moyen : triangle plein,
+    // point d'exclamation réservé en creux. Sept lignes, de la hauteur de
+    // capitale, sans adoucissement — les diagonales de ce corps n'en portent que
+    // sur les lettres où deux traits se croisent.
+    ('⚠', 2, &[
+        "...#...",
+        "..#.#..",
+        "..#.#..",
+        ".##.##.",
+        ".#####.",
+        "###.###",
+        "#######",
+    ]),
 ];

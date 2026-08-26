@@ -1,0 +1,40 @@
+{
+  "id": "dev_keyboard",
+  "name": "Clavier Mécanique",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Held",
+  "description": "Un clavier compact en deux parties, éclairé par quelques touches d’accent.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "dev_keyboard_default_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 47,
+    "y": 26
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "dev_keyboard_baby_0"
+      ],
+      "anchor": {
+        "x": 47,
+        "y": 22
+      }
+    },
+    "evolved": {
+      "frames": [
+        "dev_keyboard_evolved_0"
+      ],
+      "anchor": {
+        "x": 47,
+        "y": 28
+      }
+    }
+  },
+  "clip_to_body": false
+}

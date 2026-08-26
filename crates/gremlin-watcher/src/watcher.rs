@@ -1,18 +1,19 @@
-//! Surveillance active des dépôts Git et détection à chaud via `notify`.
+//! Surveillance active des dépôts Git explicitement déclarés, via `notify`.
 //!
 //! `RepoWatcher` est une **façade sans état** : toute la connaissance des dépôts
 //! surveillés vit dans le worker d'arrière-plan (voir `crate::worker`). Les
 //! opérations d'enregistrement sont confirmées par accusé de réception, si bien
 //! qu'un échec réel (chemin inaccessible, quota du système atteint) remonte
 //! directement à l'appelant au lieu d'être noyé dans les journaux.
+//!
+//! Aucune découverte automatique : la liste des dépôts vient de
+//! [`WatcherConfig::tracked_repos`] et des appels explicites à
+//! [`RepoWatcher::watch_repo`].
 
 use crate::config::WatcherConfig;
 use crate::error::WatcherError;
-use crate::scanner::GitScanner;
 use crate::signals::{DevSignal, ToolingStateAck, WatcherStatus};
-use crate::worker::{
-    NotifyMessage, WatchOrigin, WatcherControl, WatcherWorker, NOTIFY_CHANNEL_CAPACITY,
-};
+use crate::worker::{NotifyMessage, WatcherControl, WatcherWorker, NOTIFY_CHANNEL_CAPACITY};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use notify::{Config, Event, RecommendedWatcher, Watcher};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Délai maximal d'attente d'un accusé de réception du worker.
 const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,14 +30,12 @@ const CONTROL_CHANNEL_CAPACITY: usize = 256;
 /// Délai maximal d'insertion dans le canal de contrôle borné.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Gestionnaire de surveillance des dépôts Git et détection à chaud.
+/// Gestionnaire de surveillance des dépôts Git explicitement déclarés.
 pub struct RepoWatcher {
     control_tx: Sender<WatcherControl>,
     config: WatcherConfig,
     is_running: Arc<AtomicBool>,
     worker_handle: Option<JoinHandle<()>>,
-    scan_handle: Option<JoinHandle<()>>,
-    scan_cancelled: Arc<AtomicBool>,
 }
 
 impl RepoWatcher {
@@ -50,8 +49,9 @@ impl RepoWatcher {
 
     /// Initialise un nouveau surveillant de dépôts Git avec une configuration personnalisée.
     ///
-    /// La surveillance ne démarre sur aucun chemin : utiliser [`Self::watch_repo`],
-    /// [`Self::watch_workspace_root`] ou [`Self::start_auto_discovery`].
+    /// La surveillance ne démarre sur aucun chemin : utiliser
+    /// [`Self::arm_tracked_repos`] pour monter les dépôts de la configuration, ou
+    /// [`Self::watch_repo`] pour en ajouter un à la volée.
     ///
     /// # Errors
     /// Renvoie `WatcherError::Notify` si le watcher système ne peut pas être initialisé,
@@ -102,8 +102,6 @@ impl RepoWatcher {
             config: normalized_config,
             is_running,
             worker_handle: Some(worker_handle),
-            scan_handle: None,
-            scan_cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -113,6 +111,12 @@ impl RepoWatcher {
         &self.config
     }
 
+    /// Dépôts déclarés dans la configuration, après normalisation.
+    #[must_use]
+    pub fn tracked_repos(&self) -> &[PathBuf] {
+        &self.config.tracked_repos
+    }
+
     /// Ajoute un dépôt Git existant à la liste des répertoires surveillés.
     ///
     /// L'appel est confirmé par le worker : un dépôt inexistant ou impossible à
@@ -120,52 +124,25 @@ impl RepoWatcher {
     ///
     /// # Errors
     /// Renvoie `WatcherError::ChannelClosed` si le worker s'est arrêté,
-    /// `WatcherError::Timeout` s'il ne répond pas, ou `WatcherError::Notify` si
-    /// l'enregistrement auprès du système échoue.
+    /// `WatcherError::Timeout` s'il ne répond pas,
+    /// `WatcherError::NotARepository` si le chemin n'est pas un dépôt Git, ou
+    /// `WatcherError::Notify` si l'enregistrement auprès du système échoue.
     pub fn watch_repo(&mut self, repo_path: &Path) -> Result<(), WatcherError> {
         let path = repo_path.to_path_buf();
-        self.send_and_wait(|ack| WatcherControl::WatchRepo(path, WatchOrigin::Explicit, ack))
+        self.send_and_wait(|ack| WatcherControl::WatchRepo(path, ack))
     }
 
-    /// Ajoute un répertoire racine de projets (ex: `~/Projects`) pour la détection à chaud.
+    /// Retire un dépôt de la surveillance active.
     ///
-    /// La racine n'est **pas** surveillée récursivement dans son intégralité : seuls
-    /// ses sous-dossiers proches, hors dossiers ignorés et hors dépôts déjà connus,
-    /// sont observés.
-    ///
-    /// # Errors
-    /// Voir [`Self::watch_repo`].
-    pub fn watch_workspace_root(&mut self, root_path: &Path) -> Result<(), WatcherError> {
-        let path = root_path.to_path_buf();
-        self.send_and_wait(|ack| WatcherControl::WatchRoot(path, ack))
-    }
-
-    /// Retire un dépôt de la surveillance active, quelle que soit son origine.
-    ///
-    /// Fonctionne aussi bien pour un dépôt ajouté explicitement que pour un dépôt
-    /// découvert automatiquement (scan ou détection à chaud). Un `RepoRemoved` est
-    /// émis si le dépôt était effectivement surveillé.
-    ///
-    /// Le dépôt est ensuite **exclu de la découverte automatique** : sans cela, le
-    /// premier événement venu le ré-enregistrerait aussitôt. Un nouvel appel à
-    /// [`Self::watch_repo`] lève l'exclusion.
+    /// Un `RepoRemoved` est émis si le dépôt était effectivement surveillé.
+    /// L'opération est idempotente : désinscrire un dépôt inconnu réussit sans
+    /// rien émettre.
     ///
     /// # Errors
     /// Voir [`Self::watch_repo`].
     pub fn unwatch_repo(&mut self, repo_path: &Path) -> Result<(), WatcherError> {
         let path = repo_path.to_path_buf();
         self.send_and_wait(|ack| WatcherControl::UnwatchRepo(path, ack))
-    }
-
-    /// Retire une racine de projets de la détection à chaud.
-    ///
-    /// Les dépôts déjà découverts sous cette racine restent surveillés.
-    ///
-    /// # Errors
-    /// Voir [`Self::watch_repo`].
-    pub fn unwatch_workspace_root(&mut self, root_path: &Path) -> Result<(), WatcherError> {
-        let path = root_path.to_path_buf();
-        self.send_and_wait(|ack| WatcherControl::UnwatchRoot(path, ack))
     }
 
     /// Liste les dépôts actuellement surveillés (chemins canoniques, triés).
@@ -212,80 +189,36 @@ impl RepoWatcher {
         Ok(ack_rx)
     }
 
-    /// Applique la configuration de découverte : racines surveillées puis scan de fond.
+    /// Monte les dépôts déclarés dans [`WatcherConfig::tracked_repos`].
     ///
-    /// Consomme `auto_discovery`, `custom_roots` et `max_scan_depth` de la
-    /// [`WatcherConfig`] fournie à la construction.
+    /// Aucun parcours du système de fichiers : chaque chemin est enregistré tel
+    /// qu'il a été déclaré. Un dépôt injoignable — disque débranché, dossier
+    /// déplacé, chemin devenu invalide — **n'interrompt pas** l'armement des
+    /// autres : son échec est renvoyé à l'appelant, qui peut en rendre compte
+    /// dans l'interface, et le dépôt reste déclaré.
+    ///
+    /// Renvoie la liste des dépôts qui n'ont pas pu être montés, avec leur cause.
     ///
     /// # Errors
-    /// Renvoie `WatcherError::ChannelClosed` ou `WatcherError::Timeout` si le worker
-    /// ne répond plus. Un échec de surveillance d'une racine isolée est journalisé
-    /// et remonté sur le canal de statut, sans interrompre les autres racines.
-    pub fn start_auto_discovery(&mut self) -> Result<(), WatcherError> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if self.config.auto_discovery {
-            roots.extend(GitScanner::discover_default_roots());
-        }
-        for custom in &self.config.custom_roots {
-            if !roots.contains(custom) {
-                roots.push(custom.clone());
-            }
-        }
+    /// Renvoie `WatcherError::ChannelClosed` ou `WatcherError::Timeout` si le
+    /// worker ne répond plus : dans ce cas plus rien ne peut être monté, et
+    /// poursuivre n'aurait aucun sens.
+    pub fn arm_tracked_repos(&mut self) -> Result<Vec<(PathBuf, WatcherError)>, WatcherError> {
+        let repos = self.config.tracked_repos.clone();
+        let mut failures = Vec::new();
 
-        for root in &roots {
-            match self.watch_workspace_root(root) {
+        for repo in repos {
+            match self.watch_repo(&repo) {
                 Ok(()) => {}
                 Err(e @ (WatcherError::ChannelClosed | WatcherError::Timeout)) => return Err(e),
                 Err(e) => {
-                    warn!(root = %root.display(), "Racine de projets ignorée : {e}");
+                    warn!(repo = %repo.display(), "Dépôt suivi non surveillable : {e}");
+                    failures.push((repo, e));
                 }
             }
         }
 
-        let max_depth = self.config.max_scan_depth;
-        self.start_background_scan(roots, max_depth);
-        Ok(())
-    }
-
-    /// Lance un scan asynchrone des racines et enregistre les dépôts découverts au fil de l'eau.
-    ///
-    /// Un seul scan peut être actif à la fois : un appel concurrent est ignoré.
-    /// Le scan est annulé et attendu lors de la destruction du `RepoWatcher`, ce qui
-    /// évite qu'un parcours profond ne survive à son propriétaire.
-    pub fn start_background_scan(&mut self, roots: Vec<PathBuf>, max_depth: usize) {
-        if self
-            .scan_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            debug!("Scan de dépôts déjà en cours — nouvelle demande ignorée");
-            return;
-        }
-        // Récupérer le thread précédent, déjà terminé.
-        if let Some(handle) = self.scan_handle.take() {
-            let _ = handle.join();
-        }
-        if roots.is_empty() {
-            return;
-        }
-
-        self.scan_cancelled.store(false, Ordering::Relaxed);
-        let cancelled = Arc::clone(&self.scan_cancelled);
-        let control_tx = self.control_tx.clone();
-
-        match std::thread::Builder::new()
-            .name("gremlin-git-scan".into())
-            .spawn(move || {
-                GitScanner::scan_roots_cancellable(&roots, max_depth, &cancelled, |repo| {
-                    let _ = control_tx.send_timeout(
-                        WatcherControl::WatchRepo(repo.to_path_buf(), WatchOrigin::Discovery, None),
-                        CONTROL_SEND_TIMEOUT,
-                    );
-                });
-            }) {
-            Ok(handle) => self.scan_handle = Some(handle),
-            Err(e) => warn!("Impossible de lancer le scan de dépôts : {e}"),
-        }
+        Ok(failures)
     }
 
     /// Envoie une commande et attend sa confirmation par le worker.
@@ -328,14 +261,10 @@ fn map_recv_error(error: RecvTimeoutError) -> WatcherError {
 
 impl Drop for RepoWatcher {
     fn drop(&mut self) {
-        self.scan_cancelled.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         let _ = self.control_tx.try_send(WatcherControl::Shutdown);
 
         if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.scan_handle.take() {
             let _ = handle.join();
         }
     }
@@ -345,6 +274,7 @@ impl Drop for RepoWatcher {
 mod tests {
     use super::RepoWatcher;
     use crate::config::WatcherConfig;
+    use crate::error::WatcherError;
     use crate::signals::DevSignal;
     use crate::test_support::{write_file, TempDirGuard};
     use crossbeam_channel::Receiver;
@@ -357,7 +287,6 @@ mod tests {
     fn config(debounce_ms: u64) -> WatcherConfig {
         WatcherConfig {
             debounce_duration_ms: debounce_ms,
-            auto_discovery: false,
             ..WatcherConfig::default()
         }
     }
@@ -468,6 +397,111 @@ mod tests {
             "l'enregistrement d'un dépôt inexistant doit échouer"
         );
         assert_eq!(watcher.watched_repos().ok(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_watch_repo_rejects_a_non_git_directory_with_a_clear_error() {
+        let guard = TempDirGuard::new("watcher_not_a_repo");
+        let ordinary = guard.child("dossier_ordinaire");
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut watcher = match RepoWatcher::new_with_config(tx, &config(100)) {
+            Ok(w) => w,
+            Err(e) => panic!("Échec création watcher : {e}"),
+        };
+
+        // Le motif du refus doit être exploitable par l'interface : un message
+        // `notify` opaque ne permettrait pas d'expliquer quoi que ce soit.
+        match watcher.watch_repo(&ordinary) {
+            Err(WatcherError::NotARepository(path)) => assert_eq!(path, ordinary),
+            other => panic!("erreur attendue NotARepository, obtenu : {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arming_skips_missing_repo_without_dropping_the_others() {
+        let guard = TempDirGuard::new("watcher_arm");
+        let first = guard.child("premier");
+        let missing = guard.path().join("disparu");
+        let third = guard.child("troisieme");
+        init_repo(&first, "main", &"a".repeat(40));
+        init_repo(&third, "main", &"b".repeat(40));
+
+        let armed = WatcherConfig {
+            tracked_repos: vec![first.clone(), missing.clone(), third.clone()],
+            ..config(100)
+        };
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut watcher = match RepoWatcher::new_with_config(tx, &armed) {
+            Ok(w) => w,
+            Err(e) => panic!("Échec création watcher : {e}"),
+        };
+
+        let failures = match watcher.arm_tracked_repos() {
+            Ok(failures) => failures,
+            Err(e) => panic!("l'armement ne doit pas échouer globalement : {e}"),
+        };
+
+        assert_eq!(failures.len(), 1, "un seul dépôt doit être en échec");
+        assert_eq!(failures[0].0, missing);
+
+        // Les deux dépôts valides sont bien montés malgré le voisin invalide.
+        match watcher.watched_repos() {
+            Ok(repos) => {
+                assert!(repos.contains(&first));
+                assert!(repos.contains(&third));
+                assert_eq!(repos.len(), 2);
+            }
+            Err(e) => panic!("interrogation du worker impossible : {e}"),
+        }
+    }
+
+    #[test]
+    fn test_no_repo_is_attached_without_an_explicit_request() {
+        // Anti-régression du retrait du scanner : un dépôt créé à côté d'un
+        // dépôt suivi ne doit jamais s'enregistrer de lui-même.
+        let guard = TempDirGuard::new("watcher_no_discovery");
+        let tracked = guard.child("suivi");
+        init_repo(&tracked, "main", &"1".repeat(40));
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut watcher = match RepoWatcher::new_with_config(tx, &config(50)) {
+            Ok(w) => w,
+            Err(e) => panic!("Échec création watcher : {e}"),
+        };
+        if let Err(e) = watcher.watch_repo(&tracked) {
+            panic!("l'enregistrement du dépôt doit réussir : {e}");
+        }
+        wait_for(
+            &rx,
+            |signal| matches!(signal, DevSignal::RepoDiscovered { path, .. } if *path == tracked),
+        );
+
+        // `git init` dans le voisinage immédiat, y compris à l'intérieur du dépôt suivi.
+        let sibling = guard.path().join("intrus");
+        let nested = tracked.join("sous_projet");
+        init_repo(&sibling, "main", &"2".repeat(40));
+        init_repo(&nested, "main", &"3".repeat(40));
+
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(DevSignal::RepoDiscovered { path, .. }) => {
+                    panic!(
+                        "dépôt enregistré sans demande explicite : {}",
+                        path.display()
+                    )
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        match watcher.watched_repos() {
+            Ok(repos) => assert_eq!(repos, vec![tracked]),
+            Err(e) => panic!("interrogation du worker impossible : {e}"),
+        }
     }
 
     #[test]

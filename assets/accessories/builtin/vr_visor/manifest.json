@@ -1,0 +1,43 @@
+{
+  "id": "vr_visor",
+  "name": "Visière Holo",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Glasses",
+  "description": "Une visière biseautée aux reflets contextuels et au balayage lumineux discret.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "vr_visor_default_0",
+    "vr_visor_default_1"
+  ],
+  "frame_duration_ms": 300,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 16,
+    "y": 20
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "vr_visor_baby_0",
+        "vr_visor_baby_1"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 22
+      }
+    },
+    "evolved": {
+      "frames": [
+        "vr_visor_evolved_0",
+        "vr_visor_evolved_1"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 18
+      }
+    }
+  },
+  "clip_to_body": false
+}

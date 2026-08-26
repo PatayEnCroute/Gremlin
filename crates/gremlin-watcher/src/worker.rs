@@ -1,8 +1,12 @@
 //! Worker d'arrière-plan de la surveillance des dépôts Git.
 //!
 //! Le worker est l'**unique détenteur** de l'état de surveillance : liste des dépôts
-//! actifs, racines de découverte et mémoire de debouncing. `RepoWatcher` n'est qu'une
-//! façade qui lui adresse des commandes, ce qui interdit toute divergence d'état.
+//! actifs et mémoire de debouncing. `RepoWatcher` n'est qu'une façade qui lui
+//! adresse des commandes, ce qui interdit toute divergence d'état.
+//!
+//! Tous les dépôts qu'il surveille lui ont été **explicitement** désignés : il ne
+//! parcourt aucune arborescence, n'observe aucune racine de projets et
+//! n'enregistre jamais un dépôt qu'on ne lui a pas demandé.
 //!
 //! Sa boucle sert systématiquement, dans cet ordre : les commandes de contrôle, un
 //! lot **borné** d'événements de fichiers, puis les dépôts stabilisés. Aucune rafale
@@ -12,13 +16,12 @@ use crate::config::WatcherConfig;
 use crate::debouncer::EventDebouncer;
 use crate::error::WatcherError;
 use crate::git_parser::GitRefParser;
-use crate::git_path::{analyze_git_path, normalize_path, GitPathKind, GIT_DIR_NAME};
-use crate::scanner::is_ignored_directory;
-use crate::signals::{DevSignal, ToolingStateAck, WatcherStatus};
+use crate::git_path::{analyze_git_path, is_git_repo, normalize_path, GitPathKind, GIT_DIR_NAME};
+use crate::signals::{DevSignal, GitCommitStamp, ToolingStateAck, WatcherStatus};
 use crate::tooling::{ToolingEvent, ToolingPipeline};
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, TrySendError};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,30 +47,22 @@ const LIVENESS_SWEEP_INTERVAL: Duration = Duration::from_millis(2000);
 /// Nombre maximal de relectures d'un dépôt dont les métadonnées sont illisibles.
 const MAX_READ_RETRIES: u8 = 5;
 
-/// Profondeur maximale de surveillance sous une racine, pour la détection à chaud.
-const MAX_ROOT_WATCH_DEPTH: usize = 2;
-
 /// Sous-dossiers de `.git` surveillés en plus du répertoire `.git` lui-même.
 const GIT_WATCHED_SUBDIRS: [&str; 2] = ["refs", "logs"];
 
 /// Réponse synchrone à une commande de contrôle.
 pub type Ack = Option<Sender<Result<(), WatcherError>>>;
 
-/// Origine d'une demande de surveillance de dépôt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WatchOrigin {
-    /// Demande explicite de l'appelant : lève une éventuelle exclusion.
-    Explicit,
-    /// Découverte automatique (scan ou détection à chaud) : respecte les exclusions.
-    Discovery,
-}
-
 /// Motif du retrait d'un dépôt de la surveillance.
+///
+/// N'influence plus aucune décision — la liste des dépôts suivis est tenue par
+/// l'appelant — mais distingue les deux situations dans le journal, où elles
+/// n'appellent pas le même diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetachReason {
-    /// Désinscription demandée par l'appelant : le dépôt ne sera plus re-découvert.
+    /// Désinscription demandée par l'appelant.
     UserRequest,
-    /// Le dépôt a disparu du disque : il pourra être re-découvert s'il réapparaît.
+    /// Le répertoire `.git` du dépôt a disparu du disque.
     Vanished,
 }
 
@@ -84,13 +79,9 @@ pub enum NotifyMessage {
 #[derive(Debug)]
 pub enum WatcherControl {
     /// Surveiller un dépôt Git existant.
-    WatchRepo(PathBuf, WatchOrigin, Ack),
+    WatchRepo(PathBuf, Ack),
     /// Cesser de surveiller un dépôt.
     UnwatchRepo(PathBuf, Ack),
-    /// Surveiller une racine de projets pour la découverte à chaud.
-    WatchRoot(PathBuf, Ack),
-    /// Cesser de surveiller une racine de projets.
-    UnwatchRoot(PathBuf, Ack),
     /// Installer le canal de remontée d'incidents.
     SetStatusSender(Sender<WatcherStatus>),
     /// Demander la liste des dépôts actuellement surveillés.
@@ -110,6 +101,12 @@ struct RepoEntry {
     watched: Vec<PathBuf>,
     /// `true` une fois l'état initial mémorisé (aucun signal métier avant cela).
     seeded: bool,
+    /// `true` tant que l'historique des jours de commits reste à relire.
+    ///
+    /// Le balayage est différé d'un tour de boucle plutôt qu'exécuté dans
+    /// `attach_repo` : une rafale de rattachements ne devient donc pas une
+    /// séquence de lectures ininterruptible qui affamerait un `Shutdown`.
+    history_pending: bool,
     /// Nombre de relectures consécutives infructueuses.
     read_retries: u8,
     /// Ancres de rapports enregistrées exclusivement pour ce dépôt.
@@ -135,10 +132,6 @@ pub struct WatcherWorker {
     /// Correspondance chemin livré par `notify` -> clé canonique, pour éviter de
     /// canoniser (appel système) à chaque événement.
     aliases: HashMap<PathBuf, PathBuf>,
-    roots: HashSet<PathBuf>,
-    discovery_dirs: HashSet<PathBuf>,
-    /// Dépôts explicitement désinscrits : la découverte automatique les ignore.
-    excluded: HashSet<PathBuf>,
     dropped_events: Arc<AtomicU64>,
     is_running: Arc<AtomicBool>,
     last_sweep: Instant,
@@ -161,9 +154,6 @@ impl WatcherWorker {
             debouncer: EventDebouncer::new(config.debounce_duration()),
             repos: HashMap::new(),
             aliases: HashMap::new(),
-            roots: HashSet::new(),
-            discovery_dirs: HashSet::new(),
-            excluded: HashSet::new(),
             dropped_events,
             is_running,
             last_sweep: Instant::now(),
@@ -186,27 +176,30 @@ impl WatcherWorker {
                 Flow::Continue => {}
             }
 
-            // 2. Lot borné d'événements de fichiers.
+            // 2. Historique d'un seul dépôt, pour rester interruptible.
+            self.scan_one_pending_history(&mut progressed);
+
+            // 3. Lot borné d'événements de fichiers.
             self.drain_events(notify_rx, &mut progressed);
 
-            // 3. Rapports stabilisés et résultats du parser dédié.
+            // 4. Rapports stabilisés et résultats du parser dédié.
             self.tooling.submit_ready();
             self.drain_tooling(&mut progressed);
 
-            // 4. Événements perdus : resynchronisation complète.
+            // 5. Événements perdus : resynchronisation complète.
             self.absorb_dropped_events();
 
-            // 5. Dépôts stabilisés.
+            // 6. Dépôts stabilisés.
             for repo in self.debouncer.poll_ready() {
                 self.emit_repo_signals(&repo);
             }
 
-            // 6. Contrôle périodique d'existence des dépôts.
+            // 7. Contrôle périodique d'existence des dépôts.
             if self.last_sweep.elapsed() >= LIVENESS_SWEEP_INTERVAL {
                 self.sweep_dead_repos();
             }
 
-            // 7. Rien à faire : sommeil borné jusqu'au prochain réveil utile.
+            // 8. Rien à faire : sommeil borné jusqu'au prochain réveil utile.
             if !progressed {
                 self.idle_wait(notify_rx, control_rx);
             }
@@ -305,20 +298,12 @@ impl WatcherWorker {
     /// Exécute une commande de contrôle et répond à l'appelant si un accusé est attendu.
     fn handle_control(&mut self, control: WatcherControl) -> Flow {
         match control {
-            WatcherControl::WatchRepo(path, origin, ack) => {
-                let result = self.attach_repo(&normalize_path(&path), origin);
+            WatcherControl::WatchRepo(path, ack) => {
+                let result = self.attach_repo(&normalize_path(&path));
                 reply(ack, result);
             }
             WatcherControl::UnwatchRepo(path, ack) => {
                 self.detach_repo(&normalize_path(&path), DetachReason::UserRequest);
-                reply(ack, Ok(()));
-            }
-            WatcherControl::WatchRoot(path, ack) => {
-                let result = self.attach_root(&normalize_path(&path));
-                reply(ack, result);
-            }
-            WatcherControl::UnwatchRoot(path, ack) => {
-                self.detach_root(&normalize_path(&path));
                 reply(ack, Ok(()));
             }
             WatcherControl::SetStatusSender(sender) => self.status_sender = Some(sender),
@@ -371,9 +356,7 @@ impl WatcherWorker {
                     .map(|entry| std::mem::take(&mut entry.tooling_watched))
                     .unwrap_or_default();
                 for path in watched {
-                    if !self.discovery_dirs.contains(&path) {
-                        let _ = self.watcher.unwatch(&path);
-                    }
+                    let _ = self.watcher.unwatch(&path);
                 }
                 self.tooling.remove_repo(&repo);
             }
@@ -397,21 +380,26 @@ impl WatcherWorker {
     /// Seules les métadonnées utiles sont surveillées (`.git`, `.git/refs`,
     /// `.git/logs`) : ni `.git/objects`, ni l'arborescence de travail. Le volume
     /// d'événements pendant un build ou un `git gc` s'en trouve réduit d'autant.
-    fn attach_repo(&mut self, repo_root: &Path, origin: WatchOrigin) -> Result<(), WatcherError> {
-        match origin {
-            // Une demande explicite prime sur une désinscription antérieure.
-            WatchOrigin::Explicit => {
-                let _ = self.excluded.remove(repo_root);
-            }
-            WatchOrigin::Discovery if self.excluded.contains(repo_root) => {
-                debug!(repo = %repo_root.display(), "Dépôt désinscrit — découverte ignorée");
-                return Ok(());
-            }
-            WatchOrigin::Discovery => {}
-        }
-
+    fn attach_repo(&mut self, repo_root: &Path) -> Result<(), WatcherError> {
         if self.repos.contains_key(repo_root) {
             return Ok(());
+        }
+
+        // Vérification explicite avant l'enregistrement : sans elle, un dossier
+        // qui n'est pas un dépôt ne se signale que par une erreur `notify` au
+        // message système opaque, impossible à traduire pour l'utilisateur.
+        //
+        // Le refus emprunte le canal de statut au même titre qu'un échec système :
+        // un consommateur qui l'a installé doit voir *toutes* les raisons pour
+        // lesquelles un chemin n'est pas surveillé, pas seulement certaines.
+        if !is_git_repo(repo_root) {
+            let error = WatcherError::NotARepository(repo_root.to_path_buf());
+            debug!(repo = %repo_root.display(), "Chemin refusé : ce n'est pas un dépôt Git");
+            self.report_status(WatcherStatus::WatchFailed {
+                path: repo_root.to_path_buf(),
+                reason: error.to_string(),
+            });
+            return Err(error);
         }
 
         let git_dir = repo_root.join(GIT_DIR_NAME);
@@ -429,6 +417,7 @@ impl WatcherWorker {
             watched: vec![git_dir.clone()],
             git_dir,
             seeded: false,
+            history_pending: true,
             read_retries: 0,
             tooling_watched: Vec::new(),
         };
@@ -481,6 +470,49 @@ impl WatcherWorker {
         }
     }
 
+    /// Relit l'historique de commits d'**un seul** dépôt en attente.
+    ///
+    /// La lecture reste sur le worker, jamais dans le callback `notify` ni dans
+    /// l'orchestrateur. Une seule par tour de boucle : les commandes de contrôle
+    /// repassent en premier avant la suivante.
+    fn scan_one_pending_history(&mut self, progressed: &mut bool) {
+        let Some((repo_root, git_dir)) = self
+            .repos
+            .iter()
+            .find(|(_, entry)| entry.history_pending)
+            .map(|(root, entry)| (root.clone(), entry.git_dir.clone()))
+        else {
+            return;
+        };
+        *progressed = true;
+        if let Some(entry) = self.repos.get_mut(&repo_root) {
+            entry.history_pending = false;
+        }
+
+        let repo_name = GitRefParser::extract_repo_name(&repo_root);
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            warn!(repo = %repo_name, "Journal de références illisible : série non reconstituée");
+            self.report_status(WatcherStatus::HistoryUnreadable {
+                path: git_dir,
+                reason: String::from("lecture du journal .git/logs/HEAD refusée"),
+            });
+            return;
+        };
+
+        debug!(
+            repo = %repo_name,
+            days = history.stamps.len(),
+            truncated = history.truncated,
+            "Historique de jours de commits relu"
+        );
+        self.emit(DevSignal::CommitHistorySeeded {
+            repo_name,
+            repo_path: repo_root,
+            stamps: history.stamps,
+            truncated: history.truncated,
+        });
+    }
+
     /// Mémorise silencieusement l'état initial d'un dépôt (aucun signal métier).
     fn seed_repo(&mut self, repo_root: &Path) {
         let Some(entry) = self.repos.get(repo_root) else {
@@ -502,9 +534,6 @@ impl WatcherWorker {
 
     /// Retire un dépôt de la surveillance et libère les watches associés.
     fn detach_repo(&mut self, repo_root: &Path, reason: DetachReason) {
-        if reason == DetachReason::UserRequest {
-            let _ = self.excluded.insert(repo_root.to_path_buf());
-        }
         let Some(entry) = self.repos.remove(repo_root) else {
             return;
         };
@@ -513,9 +542,7 @@ impl WatcherWorker {
             let _ = self.watcher.unwatch(&path);
         }
         for path in entry.tooling_watched {
-            if !self.discovery_dirs.contains(&path) {
-                let _ = self.watcher.unwatch(&path);
-            }
+            let _ = self.watcher.unwatch(&path);
         }
         self.tooling.remove_repo(repo_root);
         self.debouncer.remove_repo(repo_root);
@@ -554,110 +581,6 @@ impl WatcherWorker {
         for repo in dead {
             self.detach_repo(&repo, DetachReason::Vanished);
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Racines de découverte
-    // -------------------------------------------------------------------------
-
-    /// Surveille une racine de projets pour la détection à chaud de nouveaux dépôts.
-    fn attach_root(&mut self, root: &Path) -> Result<(), WatcherError> {
-        if !self.roots.insert(root.to_path_buf()) {
-            return Ok(());
-        }
-        self.watch_discovery_dir(root)?;
-        self.extend_discovery_tree(root, 0);
-        info!(root = %root.display(), "Racine de projets surveillée pour détection à chaud");
-        Ok(())
-    }
-
-    /// Cesse de surveiller une racine de projets et ses dossiers de découverte.
-    fn detach_root(&mut self, root: &Path) {
-        if !self.roots.remove(root) {
-            return;
-        }
-
-        let obsolete: Vec<PathBuf> = self
-            .discovery_dirs
-            .iter()
-            .filter(|dir| {
-                dir.starts_with(root) && !self.roots.iter().any(|other| dir.starts_with(other))
-            })
-            .cloned()
-            .collect();
-
-        for dir in obsolete {
-            let _ = self.watcher.unwatch(&dir);
-            let _ = self.discovery_dirs.remove(&dir);
-        }
-        info!(root = %root.display(), "Racine de projets retirée de la surveillance");
-    }
-
-    /// Surveille (sans récursion) un dossier candidat à l'accueil de nouveaux dépôts.
-    fn watch_discovery_dir(&mut self, dir: &Path) -> Result<(), WatcherError> {
-        if self.discovery_dirs.contains(dir) {
-            return Ok(());
-        }
-        if let Err(e) = self.watcher.watch(dir, RecursiveMode::NonRecursive) {
-            let reason = e.to_string();
-            warn!(dir = %dir.display(), "Échec de surveillance d'un dossier de découverte : {reason}");
-            self.report_status(WatcherStatus::WatchFailed {
-                path: dir.to_path_buf(),
-                reason,
-            });
-            return Err(WatcherError::Notify(e));
-        }
-        let _ = self.discovery_dirs.insert(dir.to_path_buf());
-        Ok(())
-    }
-
-    /// Étend la surveillance de découverte aux sous-dossiers pertinents.
-    ///
-    /// La récursion est volontairement bornée en profondeur, exclut les dossiers
-    /// notoirement volumineux (`node_modules`, `target`...) et ne descend jamais
-    /// dans un dépôt : une racine de workspace n'est donc **jamais** surveillée
-    /// récursivement dans son intégralité, et un dépôt n'est jamais surveillé deux
-    /// fois (une fois par la racine, une fois par son `.git`).
-    ///
-    /// Les dépôts rencontrés sont directement attachés : le dossier peut avoir reçu
-    /// son `.git` entre la détection de sa création et l'enregistrement du watch.
-    fn extend_discovery_tree(&mut self, dir: &Path, depth: usize) {
-        if dir.join(GIT_DIR_NAME).exists() {
-            let _ = self.attach_repo(dir, WatchOrigin::Discovery);
-            return;
-        }
-        if depth >= MAX_ROOT_WATCH_DEPTH {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let child = entry.path();
-            if is_ignored_directory(&child) {
-                continue;
-            }
-            if child.join(GIT_DIR_NAME).exists() {
-                let _ = self.attach_repo(&child, WatchOrigin::Discovery);
-                continue;
-            }
-            if self.watch_discovery_dir(&child).is_ok() {
-                self.extend_discovery_tree(&child, depth + 1);
-            }
-        }
-    }
-
-    /// Profondeur d'un dossier par rapport à la racine de découverte qui le contient.
-    fn discovery_depth(&self, path: &Path) -> Option<usize> {
-        self.roots
-            .iter()
-            .filter(|root| path.starts_with(root))
-            .map(|root| path.components().count() - root.components().count())
-            .min()
     }
 
     // -------------------------------------------------------------------------
@@ -709,15 +632,10 @@ impl WatcherWorker {
             return;
         }
 
-        if is_removal {
-            return;
-        }
-
-        // Dépôt inconnu : détection à chaud (`git init`, `git clone`).
-        let repo_root = normalize_path(&raw_root);
-        if repo_root.join(GIT_DIR_NAME).exists() {
-            let _ = self.attach_repo(&repo_root, WatchOrigin::Discovery);
-        }
+        // Dépôt inconnu : ignoré. Un `git init` ou un `git clone` sous un dépôt
+        // surveillé ne s'enregistre pas de lui-même — c'est à l'utilisateur de
+        // déclarer les espaces de travail qu'il confie à son Gremlin.
+        debug!(path = %raw_root.display(), "Chemin Git hors des dépôts suivis — ignoré");
     }
 
     fn handle_tooling_path(&mut self, path: &Path, is_removal: bool) {
@@ -783,7 +701,6 @@ impl WatcherWorker {
             if !candidate.starts_with(repo_root)
                 || already.contains(&candidate)
                 || added.contains(&candidate)
-                || self.discovery_dirs.contains(&candidate)
             {
                 continue;
             }
@@ -808,45 +725,14 @@ impl WatcherWorker {
     }
 
     /// Traite un chemin situé hors de tout répertoire `.git`.
+    ///
+    /// Seules les ancres de rapports produisent encore de tels chemins : aucune
+    /// racine de projets n'est surveillée. La suppression reste à traiter, car
+    /// effacer le répertoire d'un dépôt suivi n'émet pas toujours d'événement sur
+    /// son `.git` — le watch système part avec le répertoire.
     fn handle_workspace_path(&mut self, path: &Path, is_removal: bool) {
         if is_removal {
-            self.forget_discovery_dir(path);
             self.check_repos_under(path);
-            return;
-        }
-
-        if !path.is_dir() {
-            return;
-        }
-
-        // Un `git clone` crée d'abord le dossier, puis son `.git` : les deux cas
-        // sont couverts sans jamais lire un dépôt encore incomplet.
-        let candidate = normalize_path(path);
-        if candidate.join(GIT_DIR_NAME).exists() {
-            if !self.repos.contains_key(&candidate) {
-                let _ = self.attach_repo(&candidate, WatchOrigin::Discovery);
-            }
-            return;
-        }
-
-        if let Some(depth) = self.discovery_depth(&candidate) {
-            if depth <= MAX_ROOT_WATCH_DEPTH && self.watch_discovery_dir(&candidate).is_ok() {
-                self.extend_discovery_tree(&candidate, depth);
-            }
-        }
-    }
-
-    /// Oublie un dossier de découverte supprimé.
-    fn forget_discovery_dir(&mut self, path: &Path) {
-        let obsolete: Vec<PathBuf> = self
-            .discovery_dirs
-            .iter()
-            .filter(|dir| dir.starts_with(path))
-            .cloned()
-            .collect();
-        for dir in obsolete {
-            let _ = self.watcher.unwatch(&dir);
-            let _ = self.discovery_dirs.remove(&dir);
         }
     }
 
@@ -939,6 +825,7 @@ impl WatcherWorker {
             self.emit(DevSignal::CommitCreated {
                 repo_name,
                 branch,
+                stamp: authoritative_stamp(&snapshot),
                 commit_sha: snapshot.commit_sha,
                 message: snapshot.message,
                 repo_path: repo_root.to_path_buf(),
@@ -1047,4 +934,18 @@ fn is_real_commit(snapshot: &crate::git_parser::RepoSnapshot, branch_changed: bo
         // Sans reflog exploitable, un simple changement de branche n'est pas un commit.
         _ => !branch_changed,
     }
+}
+
+/// Horodatage à joindre à un commit live, uniquement si le reflog fait autorité.
+///
+/// Le chemin de repli — un SHA qui a changé sans entrée de reflog correspondante
+/// — fait toujours réagir le familier, mais ne date rien : attribuer une journée
+/// de série sans preuve temporelle reviendrait à la deviner.
+fn authoritative_stamp(snapshot: &crate::git_parser::RepoSnapshot) -> Option<GitCommitStamp> {
+    let entry = snapshot.last_reflog.as_ref()?;
+    let sha = snapshot.commit_sha.as_ref()?;
+    if &entry.new_sha != sha || !entry.is_commit_action() {
+        return None;
+    }
+    entry.stamp
 }

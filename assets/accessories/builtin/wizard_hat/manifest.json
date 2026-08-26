@@ -1,0 +1,46 @@
+{
+  "id": "wizard_hat",
+  "name": "Chapeau d’Archimage",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Hat",
+  "description": "Un couvre-chef d’atelier, cousu de runes et d’éclats discrets.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "wizard_hat_default_0",
+    "wizard_hat_default_1",
+    "wizard_hat_default_2"
+  ],
+  "frame_duration_ms": 250,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 16,
+    "y": 4
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "wizard_hat_baby_0",
+        "wizard_hat_baby_1",
+        "wizard_hat_baby_2"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 6
+      }
+    },
+    "evolved": {
+      "frames": [
+        "wizard_hat_evolved_0",
+        "wizard_hat_evolved_1",
+        "wizard_hat_evolved_2"
+      ],
+      "anchor": {
+        "x": 16,
+        "y": 2
+      }
+    }
+  },
+  "clip_to_body": false
+}

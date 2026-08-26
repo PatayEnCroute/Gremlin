@@ -257,23 +257,21 @@ fn animation_timing(anim_name: &str) -> (u64, PlayMode) {
     }
 }
 
-/// Points d'attache de référence documentés pour un pack de skin.
+/// Points d'attache de référence consommés par le compositeur.
 ///
-/// Ces ancrages sont une **métadonnée descriptive** destinée aux auteurs de skins et à
-/// l'outillage : le compositeur ne les ajoute pas comme translation, puisque tous les
-/// calques sont peints sur un canevas pleine taille déjà positionné (voir
-/// `gremlin_render::layer`).
+/// Chaque accessoire pleine taille déclare le point auquel il a été dessiné ; ces
+/// coordonnées donnent le point cible propre à la morphologie du skin.
 fn reference_anchors(skin_name: &str) -> BTreeMap<String, AnchorPoint> {
-    let (hat_y, glasses_y, held_y) = match skin_name {
-        "baby" => (6, 22, 24),
-        "evolved" => (2, 18, 30),
-        _ => (4, 20, 28),
+    let (hat_y, glasses_y, hand_y, outfit_x, face_y, effect_y) = match skin_name {
+        "baby" => (6, 22, 24, 30, 18, 31),
+        "evolved" => (2, 18, 30, 32, 16, 30),
+        _ => (4, 20, 28, 32, 17, 31),
     };
 
     [
         ("aura", AnchorPoint { x: 0, y: 0 }),
         ("base", AnchorPoint { x: 0, y: 0 }),
-        ("outfit", AnchorPoint { x: 0, y: 0 }),
+        ("outfit", AnchorPoint { x: outfit_x, y: 42 }),
         (
             "glasses",
             AnchorPoint {
@@ -282,7 +280,9 @@ fn reference_anchors(skin_name: &str) -> BTreeMap<String, AnchorPoint> {
             },
         ),
         ("hat", AnchorPoint { x: 16, y: hat_y }),
-        ("held", AnchorPoint { x: 32, y: held_y }),
+        ("held", AnchorPoint { x: 32, y: hand_y }),
+        ("head", AnchorPoint { x: 32, y: face_y }),
+        ("effect_origin", AnchorPoint { x: 32, y: effect_y }),
     ]
     .into_iter()
     .map(|(name, point)| (name.to_string(), point))
@@ -348,7 +348,11 @@ fn process_single_artwork(
 }
 
 /// Construit le `SkinManifest` d'un pack à partir des animations collectées.
-fn build_skin_manifest(skin_name: &str, anims: &AnimationFrames) -> SkinManifest {
+fn build_skin_manifest(
+    skin_name: &str,
+    anims: &AnimationFrames,
+    anchor_offsets_per_mood: BTreeMap<String, BTreeMap<String, AnchorPoint>>,
+) -> SkinManifest {
     let mut animations: BTreeMap<String, AnimationDef> = anims
         .iter()
         .map(|(anim_name, frames)| {
@@ -393,13 +397,24 @@ fn build_skin_manifest(skin_name: &str, anims: &AnimationFrames) -> SkinManifest
         other => other,
     };
 
+    // Le style d'accessoire suit la morphologie : chaque skin intégré tire les
+    // variantes dessinées pour lui, et toute autre valeur retombe sur le tracé
+    // classique lors du chargement.
+    let accessory_style = match skin_name {
+        "baby" => "baby",
+        "evolved" => "evolved",
+        _ => "default",
+    };
+
     SkinManifest {
         name: String::from(display_name),
         author: String::from("Gremlin Studio"),
-        version: String::from("1.0.0"),
+        version: String::from("2.0.0"),
+        accessory_style: String::from(accessory_style),
         frame_width: CANVAS_SIZE,
         frame_height: CANVAS_SIZE,
         anchors: reference_anchors(skin_name),
+        anchor_offsets_per_mood,
         animations,
     }
 }
@@ -443,13 +458,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Génération dynamique et agnostique des manifest.json pour chaque pack de skin
     for (skin_name, anims) in &skin_animations {
-        let manifest = build_skin_manifest(skin_name, anims);
+        let manifest_path = skins_out.join(skin_name).join("manifest.json");
+        let anchor_offsets_per_mood = match fs::read_to_string(&manifest_path) {
+            Ok(json) => SkinManifest::from_json(&json)?.anchor_offsets_per_mood,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let manifest = build_skin_manifest(skin_name, anims, anchor_offsets_per_mood);
 
         // Contrôle de non-régression : ce que l'on écrit doit être relisible par le parser.
         manifest.validate()?;
 
         let json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(skins_out.join(skin_name).join("manifest.json"), json)?;
+        fs::write(manifest_path, json)?;
         println!(
             "  -> Manifest généré pour [{skin_name}] avec {} animation(s)",
             anims.len()

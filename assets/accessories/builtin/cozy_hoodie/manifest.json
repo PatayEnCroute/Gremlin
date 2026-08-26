@@ -1,0 +1,40 @@
+{
+  "id": "cozy_hoodie",
+  "name": "Hoodie Nocturne",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Outfit",
+  "description": "Un hoodie ajusté dont la coupe suit réellement la silhouette du skin actif.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "cozy_hoodie_default_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 32,
+    "y": 42
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "cozy_hoodie_baby_0"
+      ],
+      "anchor": {
+        "x": 30,
+        "y": 42
+      }
+    },
+    "evolved": {
+      "frames": [
+        "cozy_hoodie_evolved_0"
+      ],
+      "anchor": {
+        "x": 32,
+        "y": 42
+      }
+    }
+  },
+  "clip_to_body": true
+}

@@ -14,13 +14,14 @@ pub mod text;
 pub mod theme;
 
 pub use command_palette::{
-    CommandPalette, PaletteAction, PaletteContext, PaletteExecutionResult, PaletteGroup,
-    PaletteItem, PaletteSection, PaletteView, RepoDisplayInfo,
+    repo_name_from_path, CommandPalette, PaletteAction, PaletteContext, PaletteExecutionResult,
+    PaletteGroup, PaletteItem, PaletteSection, PaletteView, PromptKind, RepoDisplayInfo,
+    RepoTrackingStatus, RowAction, RowActionIcon,
 };
 pub use layout::{FontSize, GlyphChoice, PanelDp, TextSize, UiMetrics};
 pub use preferences::UiPreferences;
 pub use preview::LivePetPreview;
-pub use renderer::{PanelInteraction, PanelScene, PanelStyle, RaycastRenderer};
+pub use renderer::{ConsumableDragView, PanelInteraction, PanelScene, PanelStyle, RaycastRenderer};
 pub use settings_window::SettingsWindow;
 pub use text::{truncate_chars, truncate_with_ellipsis};
 pub use theme::{contrast_ratio, RaycastLayout, SystemTheme, Theme, ThemePreference};

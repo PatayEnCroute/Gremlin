@@ -124,6 +124,21 @@ fn classify_components(rest: &[&OsStr]) -> GitPathKind {
     }
 }
 
+/// Indique si un chemin désigne la racine d'un dépôt Git.
+///
+/// Un `.git` **répertoire** est le cas courant ; un `.git` **fichier** désigne un
+/// arbre de travail lié (`git worktree add`) ou un sous-module, dont les
+/// métadonnées vivent ailleurs. Les deux formes sont acceptées : refuser la
+/// seconde exclurait des dépôts parfaitement légitimes.
+///
+/// C'est le seul point du module de surveillance qui interroge le disque hors
+/// d'un chemin déjà surveillé, et il ne le fait que sur un chemin unique, fourni
+/// explicitement par l'utilisateur : aucun parcours d'arborescence n'a lieu.
+#[must_use]
+pub fn is_git_repo(path: &Path) -> bool {
+    path.join(GIT_DIR_NAME).exists()
+}
+
 /// Normalise un chemin pour qu'il serve de clé stable.
 ///
 /// La canonisation aligne la casse et la forme des chemins fournis par l'appelant
@@ -156,8 +171,10 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        analyze_git_path, classify_git_path, find_repo_root, is_relevant_git_path, GitPathKind,
+        analyze_git_path, classify_git_path, find_repo_root, is_git_repo, is_relevant_git_path,
+        GitPathKind,
     };
+    use crate::test_support::{create_dir, write_file, TempDirGuard};
     use std::path::{Path, PathBuf};
 
     fn repo() -> PathBuf {
@@ -281,5 +298,41 @@ mod tests {
             "/dev/my_repo/.git/refs/heads/main"
         )));
         assert!(!is_relevant_git_path(Path::new("/dev/my_repo/.gitignore")));
+    }
+
+    #[test]
+    fn test_is_git_repo_accepts_a_git_directory() {
+        let guard = TempDirGuard::new("is_repo_dir");
+        let repo = guard.child("projet");
+        create_dir(&repo.join(".git"));
+
+        assert!(is_git_repo(&repo));
+    }
+
+    #[test]
+    fn test_is_git_repo_accepts_worktree_file() {
+        // `git worktree add` et les sous-modules écrivent un **fichier** `.git`
+        // pointant vers le vrai répertoire de métadonnées. Refuser cette forme
+        // exclurait des dépôts parfaitement légitimes.
+        let guard = TempDirGuard::new("is_repo_worktree");
+        let worktree = guard.child("arbre_lie");
+        write_file(
+            &worktree.join(".git"),
+            "gitdir: /dev/principal/.git/worktrees/arbre_lie\n",
+        );
+
+        assert!(is_git_repo(&worktree));
+    }
+
+    #[test]
+    fn test_is_git_repo_rejects_plain_and_missing_directories() {
+        let guard = TempDirGuard::new("is_repo_absent");
+        let ordinary = guard.child("dossier_ordinaire");
+
+        assert!(!is_git_repo(&ordinary));
+        assert!(!is_git_repo(&guard.path().join("nexiste_pas")));
+        // `.github` ne doit surtout pas être confondu avec `.git`.
+        create_dir(&ordinary.join(".github"));
+        assert!(!is_git_repo(&ordinary));
     }
 }

@@ -9,9 +9,13 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 directories.workspace = true
+# Seule l'empreinte d'écran est sérialisée : `gremlin-app` la persiste dans sa
+# configuration pour retrouver le moniteur du familier d'une session à l'autre.
+serde.workspace = true
 winit.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
+jiff.workspace = true
 image.workspace = true
 tray-icon.workspace = true
 muda.workspace = true
@@ -29,6 +33,20 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+] }
+
+# `NSScreen::visibleFrame` est la seule source macOS de la zone libre du Dock et
+# de la barre de menus. Les deux caisses sont déjà dans le graphe via `winit` et
+# `tray-icon` : la version est alignée sur la leur pour ne pas dupliquer l'arbre.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSScreen",
+    "NSGraphics",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSGeometry",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

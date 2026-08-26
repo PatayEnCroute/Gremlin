@@ -5,9 +5,9 @@
 //! ## Convention de composition
 //!
 //! Tous les sprites de calque (corps, tenue, accessoires, aura) sont peints sur un
-//! canevas pleine taille de [`CANVAS_SIZE`] x [`CANVAS_SIZE`] et sont déjà positionnés
-//! à leur emplacement nominal. Voir [`layer::LayerCompositor`] pour le détail et les
-//! conséquences sur le champ `anchors` des manifests.
+//! canevas pleine taille de [`CANVAS_SIZE`] x [`CANVAS_SIZE`]. Les accessoires déclarent
+//! leur point source ; le compositeur l'aligne sur les ancres du skin et de la pose
+//! actifs. Voir [`layer::LayerCompositor`] pour le détail.
 //!
 //! ## Entrées non fiables
 //!
@@ -21,21 +21,23 @@ pub mod accessory;
 pub mod animation;
 pub mod bubble;
 pub mod buffer;
+pub mod builtin_accessories;
 pub mod error;
 pub mod layer;
 pub mod limits;
 pub mod manifest;
 pub mod particles;
-pub mod procedural_accessories;
 pub mod sprite;
 pub mod transition;
 
 pub use accessory::{
-    AccessoryCatalog, AccessoryCategory, AccessoryItem, AccessoryManifest, WardrobeEquipment,
+    AccessoryCatalog, AccessoryCategory, AccessoryItem, AccessoryManifest, AccessorySource,
+    AccessoryVariant, WardrobeEquipment,
 };
 pub use animation::{AnimationController, AnimationFrame, PlayMode, SpriteAnimation};
 pub use bubble::{BubbleRect, SpeechBubbleRenderer, SpeechBubbleView};
 pub use buffer::PixelBuffer;
+pub use builtin_accessories::register_default_accessories;
 pub use error::RenderError;
 pub use layer::{ActiveLayer, LayerCompositor, LayerType};
 pub use limits::{
@@ -44,6 +46,5 @@ pub use limits::{
 };
 pub use manifest::{AnchorPoint, AnimationDef, SkinManifest};
 pub use particles::{ParticleEngine, ParticlePreset, ParticleShape, MAX_PARTICLES};
-pub use procedural_accessories::register_default_procedural_accessories;
-pub use sprite::{SpriteAtlas, SpriteFrame};
+pub use sprite::{SpriteAtlas, SpriteBounds, SpriteFrame};
 pub use transition::{TransitionController, TransitionRenderer};

@@ -14,6 +14,19 @@ use std::io::Cursor;
 use std::path::Path;
 use tracing::warn;
 
+/// Boîte englobante des pixels visibles d'un sprite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpriteBounds {
+    /// Abscisse du premier pixel opaque.
+    pub x: u32,
+    /// Ordonnée du premier pixel opaque.
+    pub y: u32,
+    /// Largeur de la zone occupée.
+    pub width: u32,
+    /// Hauteur de la zone occupée.
+    pub height: u32,
+}
+
 /// Une frame de sprite individuelle décodée en mémoire (RGBA 8 bits par canal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpriteFrame {
@@ -23,6 +36,8 @@ pub struct SpriteFrame {
     pub height: u32,
     /// Données brutes de pixels (4 octets par pixel : R, G, B, A).
     pub rgba: Vec<u8>,
+    /// Limites alpha calculées une fois au décodage.
+    opaque_bounds: Option<SpriteBounds>,
 }
 
 impl SpriteFrame {
@@ -39,10 +54,12 @@ impl SpriteFrame {
                 actual: rgba.len(),
             });
         }
+        let opaque_bounds = calculate_opaque_bounds(width, height, &rgba);
         Ok(Self {
             width,
             height,
             rgba,
+            opaque_bounds,
         })
     }
 
@@ -77,10 +94,13 @@ impl SpriteFrame {
     fn from_dynamic(img: &image::DynamicImage) -> Self {
         let rgba_img = img.to_rgba8();
         let (width, height) = rgba_img.dimensions();
+        let rgba = rgba_img.into_raw();
+        let opaque_bounds = calculate_opaque_bounds(width, height, &rgba);
         Self {
             width,
             height,
-            rgba: rgba_img.into_raw(),
+            rgba,
+            opaque_bounds,
         }
     }
 
@@ -124,12 +144,43 @@ impl SpriteFrame {
             cropped_rgba.extend_from_slice(slice);
         }
 
-        Ok(Self {
-            width,
-            height,
-            rgba: cropped_rgba,
-        })
+        Self::from_raw(width, height, cropped_rgba)
     }
+
+    /// Renvoie les limites alpha pré-calculées du sprite.
+    #[must_use]
+    pub const fn opaque_bounds(&self) -> Option<SpriteBounds> {
+        self.opaque_bounds
+    }
+}
+
+fn calculate_opaque_bounds(width: u32, height: u32, rgba: &[u8]) -> Option<SpriteBounds> {
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = ((y as usize) * (width as usize) + x as usize) * 4 + 3;
+            if rgba.get(index).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+
+    found.then_some(SpriteBounds {
+        x: min_x,
+        y: min_y,
+        width: max_x.saturating_sub(min_x).saturating_add(1),
+        height: max_y.saturating_sub(min_y).saturating_add(1),
+    })
 }
 
 /// Cache de textures et sprites indexés par clé d'identification.

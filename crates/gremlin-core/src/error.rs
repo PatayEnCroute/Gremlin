@@ -62,4 +62,48 @@ pub enum CoreError {
     /// Erreur de configuration métier.
     #[error("erreur de configuration : {0}")]
     ConfigurationError(String),
+
+    /// Le triplet fourni ne désigne aucun jour du calendrier grégorien supporté.
+    #[error("date civile invalide : {year:04}-{month:02}-{day:02}")]
+    InvalidCivilDate {
+        /// Année refusée.
+        year: i32,
+        /// Mois refusé.
+        month: u8,
+        /// Jour refusé.
+        day: u8,
+    },
+
+    /// Le numéro de jour lu sort de la fenêtre calendaire supportée.
+    #[error("numéro de jour civil hors fenêtre supportée : {day_number}")]
+    CivilDayOutOfRange {
+        /// Numéro de jour refusé, saturé aux bornes `i32` s'il débordait.
+        day_number: i32,
+    },
+
+    /// La date observée est postérieure au jour courant injecté.
+    #[error("observation datée du futur : {observed} après le jour courant {today}")]
+    FutureCivilDate {
+        /// Jour observé, refusé.
+        observed: crate::calendar::CivilDate,
+        /// Jour courant injecté par l'orchestrateur.
+        today: crate::calendar::CivilDate,
+    },
+
+    /// Le stock de ce consommable est vide.
+    #[error("aucun exemplaire de '{0}' en stock")]
+    ConsumableOutOfStock(crate::productivity::ConsumableKind),
+
+    /// L'objet n'aurait aucun effet sur les jauges actuelles.
+    #[error("'{0}' n'aurait aucun effet : les jauges concernées sont déjà pleines")]
+    ConsumableWithoutEffect(crate::productivity::ConsumableKind),
+
+    /// La transition demandée sur le minuteur de concentration est impossible.
+    #[error("transition de minuteur impossible : {attempted} depuis l'état {state}")]
+    InvalidPomodoroTransition {
+        /// Transition refusée.
+        attempted: &'static str,
+        /// État courant du minuteur au moment du refus.
+        state: &'static str,
+    },
 }

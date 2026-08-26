@@ -11,6 +11,7 @@
 pub(crate) mod activity;
 pub mod autostart;
 mod click_through;
+pub(crate) mod desktop_layout;
 pub mod layered;
 
 pub use autostart::{

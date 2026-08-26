@@ -4,6 +4,11 @@
 //! Cet exemple rend l'intégralité des glyphes, les capitales accentuées et des
 //! libellés réels du panneau, à chaque agrandissement, puis écrit une image PNG.
 //!
+//! **Les deux corps dessinés y figurent.** La planche ne montrait que le corps
+//! moyen 8×15 ; le corps compact 6×11 — celui des sous-titres, des libellés de
+//! section, des pastilles et du pied de page, soit la moitié du texte du
+//! panneau — n'était donc jamais regardé.
+//!
 //! ```bash
 //! cargo run -p gremlin-app --example font_proof_sheet
 //! ```
@@ -21,7 +26,7 @@ use std::process::ExitCode;
 const SHEET_WIDTH: u32 = 900;
 
 /// Hauteur de la planche, en pixels.
-const SHEET_HEIGHT: u32 = 720;
+const SHEET_HEIGHT: u32 = 900;
 
 /// Palette employée par la planche.
 const THEME: Theme = Theme::DARK;
@@ -42,7 +47,7 @@ const SPECIMENS: &[(&str, &str, u32)] = &[
         "., : ; ! ? ' \" ( ) [ ] { } - _ + = * / \\ | < >",
         1,
     ),
-    ("Signes", "% & $ # @ ^ ~ ` ° • › ‹ « » — … ↑ ↓ → ←", 1),
+    ("Signes", "% & $ # @ ^ ~ ` ° • › ‹ « » — … ↑ ↓ → ← ⚠", 1),
     ("Capitales accentuees", "É È Ê Ë À Â Ä Î Ï Ô Ö Ù Û Ü Ç", 1),
     (
         "Bas de casse accentue",
@@ -53,12 +58,74 @@ const SPECIMENS: &[(&str, &str, u32)] = &[
     ("Libelle x1", "Échelle de zoom : 3x — Dépôt Gremlin", 1),
     ("Libelle x2", "Échelle de zoom : 3x", 2),
     ("Libelle x3", "Réanimer", 3),
+    ("Signes x3", "⚠ ° • › « » — ↑ →", 3),
     (
         "Phrase longue",
         "Ajuste le zoom de 1x à 5x sans flou pixel-art, et gère « l'unicode ».",
         1,
     ),
 ];
+
+/// Lignes rendues au corps compact 6×11.
+const SMALL_SPECIMENS: &[(&str, &str, u32)] = &[
+    ("Capitales", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 1),
+    ("Bas de casse", "abcdefghijklmnopqrstuvwxyz", 1),
+    (
+        "Chiffres & signes",
+        "0123456789 % & $ # @ ° • › « » — … ↑ → ⚠",
+        1,
+    ),
+    ("Accentuees", "É È Ê À Â Î Ô Ù Ü Ç é è ê à â î ô ù ü ç", 1),
+    ("Sous-titre reel", "⚠ depot introuvable sur le disque", 1),
+    ("Sous-titre x3", "⚠ incident", 3),
+];
+
+/// Abscisse à laquelle commence le spécimen d'une ligne.
+const SPECIMEN_X: i32 = MARGIN + 170;
+
+/// Rend une série de spécimens dans un corps donné, et renvoie l'ordonnée suivante.
+///
+/// Le repère rouge posé après chaque spécimen marque la largeur renvoyée par
+/// [`font::measure`] : il doit affleurer la fin du texte. Un écart signale que la
+/// mesure et le rendu ont divergé, ce qui décale le curseur de saisie du panneau.
+fn draw_specimens(
+    buffer: &mut PixelBuffer,
+    specimens: &[(&str, &str, u32)],
+    face: FontSize,
+    start_y: i32,
+) -> i32 {
+    let label_choice = GlyphChoice {
+        face: FontSize::Medium,
+        upscale: 1,
+    };
+    let mut y = start_y;
+
+    for (label, specimen, upscale) in specimens {
+        let choice = GlyphChoice {
+            face,
+            upscale: *upscale,
+        };
+
+        // Intitulé de la ligne, en gris atténué.
+        font::draw(buffer, label, MARGIN, y, THEME.text_muted, label_choice);
+
+        let measured = font::measure(specimen, choice);
+        fill(
+            buffer,
+            SPECIMEN_X + measured,
+            y,
+            1,
+            face.cell_height() * (*upscale as i32),
+            THEME.accent,
+        );
+
+        font::draw(buffer, specimen, SPECIMEN_X, y, THEME.text_primary, choice);
+
+        y += (face.cell_height() + 7) * (*upscale as i32);
+    }
+
+    y
+}
 
 fn main() -> ExitCode {
     let mut buffer = PixelBuffer::new(SHEET_WIDTH, SHEET_HEIGHT);
@@ -77,45 +144,22 @@ fn main() -> ExitCode {
     };
 
     let mut y = MARGIN;
-    for (label, specimen, upscale) in SPECIMENS {
-        let choice = GlyphChoice {
-            face: FontSize::Medium,
-            upscale: *upscale,
-        };
+    y = draw_specimens(&mut buffer, SPECIMENS, FontSize::Medium, y);
 
-        // Intitulé de la ligne, en gris atténué.
-        font::draw(
-            &mut buffer,
-            label,
-            MARGIN,
-            y,
-            THEME.text_muted,
-            label_choice,
-        );
-
-        // Repère de la largeur mesurée : il doit affleurer la fin du texte.
-        let specimen_x = MARGIN + 170;
-        let measured = font::measure(specimen, choice);
-        fill(
-            &mut buffer,
-            specimen_x + measured,
-            y,
-            1,
-            FontSize::Medium.cell_height() * (*upscale as i32),
-            THEME.accent,
-        );
-
-        font::draw(
-            &mut buffer,
-            specimen,
-            specimen_x,
-            y,
-            THEME.text_primary,
-            choice,
-        );
-
-        y += (FontSize::Medium.cell_height() + 7) * (*upscale as i32);
-    }
+    // Corps compact 6×11 : celui des sous-titres, pastilles, libellés de
+    // section et du pied de page. Sans cette section, la moitié du texte
+    // réellement affiché par le panneau échappait à toute relecture visuelle.
+    y += 10;
+    font::draw(
+        &mut buffer,
+        "— Corps compact 6x11 —",
+        MARGIN,
+        y,
+        THEME.accent_green,
+        label_choice,
+    );
+    y += FontSize::Medium.cell_height() + 8;
+    y = draw_specimens(&mut buffer, SMALL_SPECIMENS, FontSize::Small, y);
 
     // Bloc de retour à la ligne automatique, encadré à sa largeur exacte.
     y += 12;

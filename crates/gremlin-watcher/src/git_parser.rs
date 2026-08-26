@@ -5,6 +5,7 @@
 //! taille et toute référence extraite de `HEAD` est validée avant d'être jointe au
 //! répertoire `.git` (protection contre les traversées de chemin).
 
+use crate::signals::GitCommitStamp;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +15,29 @@ const MAX_SMALL_FILE_BYTES: u64 = 4 * 1024;
 
 /// Taille maximale lue en fin de journal de références (`logs/HEAD`).
 const MAX_REFLOG_TAIL_BYTES: u64 = 8 * 1024;
+
+/// Taille maximale lue en fin de journal pour reconstituer l'historique des jours.
+///
+/// Un mébioctet couvre plusieurs milliers d'entrées, largement au-delà de la
+/// fenêtre de rétention du domaine, sans jamais charger un journal entier.
+const MAX_HISTORY_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// Nombre maximal de lignes analysées lors d'un balayage d'historique.
+const MAX_HISTORY_LINES: usize = 20_000;
+
+/// Nombre maximal de journées locales distinctes émises par dépôt.
+const MAX_HISTORY_DAYS: usize = 400;
+
+/// Amplitude maximale d'un décalage UTC réel, en heures.
+///
+/// Les fuseaux vont de −12 h à +14 h ; au-delà, l'en-tête est corrompu.
+const MAX_UTC_OFFSET_HOURS: i16 = 14;
+
+/// Longueur exacte d'un décalage Git au format `±HHMM`.
+const UTC_OFFSET_LEN: usize = 5;
+
+/// Nombre de minutes dans une heure, nommé pour éviter la constante nue.
+const MINUTES_PER_HOUR: i16 = 60;
 
 /// Taille maximale lue dans `packed-refs`.
 const MAX_PACKED_REFS_BYTES: u64 = 4 * 1024 * 1024;
@@ -35,6 +59,11 @@ pub struct ReflogEntry {
     pub action: String,
     /// Message ou détail de l'action.
     pub message: Option<String>,
+    /// Horodatage de l'entrée, absent si l'en-tête ne le porte pas valablement.
+    ///
+    /// Un en-tête malformé reste exploitable pour la branche et le SHA — c'est
+    /// le comportement historique — mais ne fabrique aucune journée de série.
+    pub stamp: Option<GitCommitStamp>,
 }
 
 impl ReflogEntry {
@@ -45,19 +74,38 @@ impl ReflogEntry {
     /// n'ait été créé par l'utilisateur.
     #[must_use]
     pub fn is_commit_action(&self) -> bool {
-        let action = self.action.trim();
-        let verb = action.split_once(' ').map_or(action, |(head, _)| head);
-
-        match verb {
-            // "commit", "commit (amend)", "commit (initial)", "merge feature-x"...
-            "commit" | "merge" | "cherry-pick" | "revert" | "am" | "applypatch" => true,
-            // Seuls les rejeux de rebase produisent réellement des commits.
-            "rebase" => ["(pick)", "(squash)", "(fixup)", "(amend)", "(continue)"]
-                .iter()
-                .any(|marker| action.contains(marker)),
-            _ => false,
-        }
+        is_commit_action_str(&self.action)
     }
+}
+
+/// Indique qu'une action de reflog correspond à la création locale d'un commit.
+///
+/// Extraite de [`ReflogEntry::is_commit_action`] pour que le balayage
+/// d'historique applique **exactement** le même critère sans allouer une entrée
+/// complète par ligne.
+#[must_use]
+fn is_commit_action_str(action: &str) -> bool {
+    let action = action.trim();
+    let verb = action.split_once(' ').map_or(action, |(head, _)| head);
+
+    match verb {
+        // "commit", "commit (amend)", "commit (initial)", "merge feature-x"...
+        "commit" | "merge" | "cherry-pick" | "revert" | "am" | "applypatch" => true,
+        // Seuls les rejeux de rebase produisent réellement des commits.
+        "rebase" => ["(pick)", "(squash)", "(fixup)", "(amend)", "(continue)"]
+            .iter()
+            .any(|marker| action.contains(marker)),
+        _ => false,
+    }
+}
+
+/// Historique récent des journées de commits d'un dépôt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitDayHistory {
+    /// Horodatages retenus, triés, au plus un par journée locale.
+    pub stamps: Vec<GitCommitStamp>,
+    /// Une borne de lecture a été atteinte : l'historique est incomplet.
+    pub truncated: bool,
 }
 
 /// Instantané cohérent des métadonnées d'un dépôt, obtenu en une seule passe d'I/O.
@@ -164,6 +212,61 @@ impl GitRefParser {
         parse_last_reflog_line(&read_tail(&log_path, MAX_REFLOG_TAIL_BYTES)?)
     }
 
+    /// Reconstitue les journées de commits récentes depuis `.git/logs/HEAD`.
+    ///
+    /// La lecture part de la **fin** du journal, ce qui privilégie les jours
+    /// récents, et s'arrête à la première borne atteinte : octets lus, lignes
+    /// analysées ou journées distinctes retenues. Une seule entrée est conservée
+    /// par journée locale, sans quoi une journée à fort volume remplirait à elle
+    /// seule le lot transmis.
+    ///
+    /// Renvoie `Some` avec une liste vide lorsque le dépôt n'a pas encore de
+    /// journal — c'est une observation valide — et `None` lorsque la lecture est
+    /// refusée : l'appelant doit pouvoir distinguer les deux.
+    #[must_use]
+    pub fn read_commit_day_history(git_dir: &Path) -> Option<CommitDayHistory> {
+        let log_path = git_dir.join("logs").join("HEAD");
+        let (text, mut truncated) = match read_tail_bounded(&log_path, MAX_HISTORY_TAIL_BYTES) {
+            TailRead::Missing => return Some(CommitDayHistory::default()),
+            TailRead::Failed => return None,
+            TailRead::Read { text, truncated } => (text, truncated),
+        };
+
+        // Les clés de journée restent triées : la recherche binaire suffit à
+        // dédupliquer 400 entrées sans table de hachage ni allocation par ligne.
+        let mut day_keys: Vec<i64> = Vec::new();
+        let mut stamps: Vec<GitCommitStamp> = Vec::new();
+        let mut scanned = 0_usize;
+
+        for line in text.rsplit('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if scanned >= MAX_HISTORY_LINES {
+                truncated = true;
+                break;
+            }
+            scanned += 1;
+
+            let Some(stamp) = scan_commit_stamp(line) else {
+                continue;
+            };
+            let key = stamp.transport_day_key();
+            let Err(position) = day_keys.binary_search(&key) else {
+                continue;
+            };
+            if day_keys.len() >= MAX_HISTORY_DAYS {
+                truncated = true;
+                break;
+            }
+            day_keys.insert(position, key);
+            stamps.push(stamp);
+        }
+
+        stamps.sort_unstable();
+        Some(CommitDayHistory { stamps, truncated })
+    }
+
     /// Tente de lire le dernier message de commit (via reflog ou `COMMIT_EDITMSG`).
     #[must_use]
     pub fn read_last_commit_message(git_dir: &Path) -> Option<String> {
@@ -250,13 +353,24 @@ fn safe_ref_join(base_dir: &Path, ref_path: &str) -> Option<PathBuf> {
 
 /// Analyse la dernière ligne non vide d'un extrait de reflog.
 fn parse_last_reflog_line(content: &str) -> Option<ReflogEntry> {
-    let last_line = content.lines().rev().find(|l| !l.trim().is_empty())?;
+    content
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(parse_reflog_line)
+}
 
-    // Format Git reflog :
-    // <old-sha> <new-sha> <name> <<email>> <timestamp> <tz>\t<action>: <message>
-    let (header, action_part) = last_line
+/// Analyse une ligne de reflog isolée.
+///
+/// Format Git :
+/// `<old-sha> <new-sha> <name> <<email>> <timestamp> <tz>\t<action>: <message>`
+///
+/// L'identité peut contenir des espaces : l'horodatage est donc lu **depuis la
+/// fin** de l'en-tête, jamais par position depuis le début.
+fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
+    let (header, action_part) = line
         .split_once('\t')
-        .map_or((last_line, None), |(h, a)| (h, Some(a)));
+        .map_or((line, None), |(h, a)| (h, Some(a)));
 
     let mut parts = header.split_whitespace();
     let old_sha = parts.next()?.to_string();
@@ -277,7 +391,54 @@ fn parse_last_reflog_line(content: &str) -> Option<ReflogEntry> {
         new_sha,
         action,
         message,
+        stamp: parse_commit_stamp(header),
     })
+}
+
+/// Extrait l'horodatage des deux derniers champs de l'en-tête d'un reflog.
+///
+/// Renvoie `None` dès qu'un champ manque, déborde ou sort de ses bornes : mieux
+/// vaut une série muette qu'une journée inventée.
+fn parse_commit_stamp(header: &str) -> Option<GitCommitStamp> {
+    // Lecture depuis la fin : l'identité Git contient des espaces, la position
+    // des champs depuis le début n'est donc pas fiable.
+    let mut fields = header.split_whitespace();
+    let offset_token = fields.next_back()?;
+    let seconds_token = fields.next_back()?;
+
+    let unix_seconds: i64 = seconds_token.parse().ok()?;
+    if unix_seconds < 0 {
+        return None;
+    }
+
+    Some(GitCommitStamp {
+        unix_seconds,
+        utc_offset_minutes: parse_utc_offset(offset_token)?,
+    })
+}
+
+/// Convertit un décalage Git `±HHMM` en minutes signées.
+fn parse_utc_offset(token: &str) -> Option<i16> {
+    if token.len() != UTC_OFFSET_LEN {
+        return None;
+    }
+    let sign: i16 = match token.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+
+    let digits = token.get(1..)?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i16 = digits.get(0..2)?.parse().ok()?;
+    let minutes: i16 = digits.get(2..4)?.parse().ok()?;
+
+    if hours > MAX_UTC_OFFSET_HOURS || minutes >= MINUTES_PER_HOUR {
+        return None;
+    }
+    Some(sign * (hours * MINUTES_PER_HOUR + minutes))
 }
 
 /// Lit la première ligne utile de `COMMIT_EDITMSG`.
@@ -298,6 +459,86 @@ fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
     let mut buffer = Vec::new();
     let _ = file.take(max_bytes).read_to_end(&mut buffer).ok()?;
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Extrait l'horodatage d'une ligne de reflog **sans allouer**.
+///
+/// Applique les mêmes critères que le chemin complet — SHA complets, action
+/// reconnue, horodatage valide — mais ne recopie ni l'action ni le message :
+/// le balayage d'historique n'en a aucun usage et ils proviennent du disque.
+fn scan_commit_stamp(line: &str) -> Option<GitCommitStamp> {
+    // Une entrée sans partie action ne prouve pas la création d'un commit.
+    let (header, action_part) = line.split_once('\t')?;
+
+    let mut fields = header.split_whitespace();
+    let old_sha = fields.next()?;
+    let new_sha = fields.next()?;
+    if !is_full_sha(old_sha) || !is_full_sha(new_sha) {
+        return None;
+    }
+
+    let action = action_part
+        .split_once(": ")
+        .map_or(action_part, |(verb, _)| verb);
+    if !is_commit_action_str(action) {
+        return None;
+    }
+
+    parse_commit_stamp(header)
+}
+
+/// Résultat d'une lecture de fin de fichier bornée.
+enum TailRead {
+    /// Le fichier n'existe pas : observation valide d'un dépôt sans journal.
+    Missing,
+    /// La lecture a été refusée ou a échoué.
+    Failed,
+    /// Extrait lu, avec l'indication d'une troncature en tête.
+    Read {
+        /// Contenu lu, première ligne partielle déjà écartée.
+        text: String,
+        /// Le fichier dépassait la borne : le début n'a pas été lu.
+        truncated: bool,
+    },
+}
+
+/// Lit au plus `max_bytes` octets à la fin d'un fichier en distinguant les échecs.
+fn read_tail_bounded(path: &Path, max_bytes: u64) -> TailRead {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return TailRead::Missing,
+        Err(_) => return TailRead::Failed,
+    };
+
+    let Ok(metadata) = file.metadata() else {
+        return TailRead::Failed;
+    };
+    let start = metadata.len().saturating_sub(max_bytes);
+
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return TailRead::Failed;
+    }
+
+    let mut buffer = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut buffer).is_err() {
+        return TailRead::Failed;
+    }
+    let text = String::from_utf8_lossy(&buffer).into_owned();
+
+    if start == 0 {
+        return TailRead::Read {
+            text,
+            truncated: false,
+        };
+    }
+
+    // La première ligne lue commence au milieu d'une entrée : elle est écartée.
+    TailRead::Read {
+        text: text
+            .split_once('\n')
+            .map_or(String::new(), |(_, rest)| rest.to_string()),
+        truncated: true,
+    }
 }
 
 /// Lit au plus `max_bytes` octets à la **fin** d'un fichier.
@@ -330,7 +571,8 @@ fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitRefParser, ReflogEntry, RepoSnapshot};
+    use super::{GitRefParser, ReflogEntry, RepoSnapshot, MAX_HISTORY_DAYS};
+    use crate::signals::GitCommitStamp;
     use crate::test_support::{write_file, TempDirGuard};
 
     fn reflog(action: &str) -> ReflogEntry {
@@ -339,7 +581,13 @@ mod tests {
             new_sha: "2".repeat(40),
             action: action.to_string(),
             message: None,
+            stamp: None,
         }
+    }
+
+    /// Construit une ligne de reflog complète et bien formée.
+    fn reflog_line(old: &str, new: &str, unix: i64, tz: &str, action: &str) -> String {
+        format!("{old} {new} Dev Le Gremlin <dev@gremlin.rs> {unix} {tz}\t{action}\n")
     }
 
     #[test]
@@ -555,6 +803,321 @@ mod tests {
             GitRefParser::read_snapshot(&git_dir),
             RepoSnapshot::default()
         );
+    }
+
+    #[test]
+    fn test_stamp_is_read_from_the_end_of_a_header_with_spaces() {
+        let guard = TempDirGuard::new("git_stamp");
+        let git_dir = guard.child(".git");
+        // L'identité Git contient des espaces : lire les champs par position
+        // depuis le début décalerait l'horodatage.
+        write_file(
+            &git_dir.join("logs").join("HEAD"),
+            &reflog_line(
+                &"1".repeat(40),
+                &"2".repeat(40),
+                1_700_000_100,
+                "+0130",
+                "commit: message",
+            ),
+        );
+
+        let Some(entry) = GitRefParser::read_last_reflog_entry(&git_dir) else {
+            panic!("le reflog doit être analysable");
+        };
+        assert_eq!(
+            entry.stamp,
+            Some(GitCommitStamp {
+                unix_seconds: 1_700_000_100,
+                utc_offset_minutes: 90,
+            })
+        );
+    }
+
+    #[test]
+    fn test_negative_offsets_are_signed_correctly() {
+        assert_eq!(
+            super::parse_commit_stamp("a b Dev <d@x> 1700000000 -0500"),
+            Some(GitCommitStamp {
+                unix_seconds: 1_700_000_000,
+                utc_offset_minutes: -300,
+            })
+        );
+    }
+
+    #[test]
+    fn test_hostile_headers_produce_no_stamp() {
+        // Chaque cas ferait naître une journée inventée s'il était accepté.
+        let hostile = [
+            "a b Dev <d@x> 1700000000",                 // décalage manquant
+            "a b Dev <d@x> +0100",                      // horodatage manquant
+            "a b Dev <d@x> -1 +0100",                   // horodatage négatif
+            "a b Dev <d@x> 99999999999999999999 +0100", // débordement
+            "a b Dev <d@x> 1700000000 +0160",           // minutes >= 60
+            "a b Dev <d@x> 1700000000 +2400",           // heures hors bornes
+            "a b Dev <d@x> 1700000000 0100",            // signe absent
+            "a b Dev <d@x> 1700000000 +010",            // longueur incorrecte
+            "a b Dev <d@x> 1700000000 +01:0",           // caractère non numérique
+            "",                                         // en-tête vide
+        ];
+        for header in hostile {
+            assert_eq!(
+                super::parse_commit_stamp(header),
+                None,
+                "en-tête accepté à tort : {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_header_still_yields_branch_and_sha_without_a_stamp() {
+        let guard = TempDirGuard::new("git_stamp_partial");
+        let git_dir = guard.child(".git");
+        write_file(
+            &git_dir.join("logs").join("HEAD"),
+            &format!(
+                "{a} {b}\tcommit: sans en-tête d'identité\n",
+                a = "1".repeat(40),
+                b = "2".repeat(40)
+            ),
+        );
+
+        let Some(entry) = GitRefParser::read_last_reflog_entry(&git_dir) else {
+            panic!("l'entrée doit rester exploitable");
+        };
+        assert_eq!(entry.new_sha, "2".repeat(40));
+        assert!(entry.is_commit_action());
+        assert_eq!(
+            entry.stamp, None,
+            "journée inventée depuis un en-tête cassé"
+        );
+    }
+
+    #[test]
+    fn test_history_keeps_one_stamp_per_local_day() {
+        let guard = TempDirGuard::new("git_history_days");
+        let git_dir = guard.child(".git");
+
+        // Trois commits le même jour local, puis un le lendemain.
+        let day_start = 1_700_000_000_i64 - (1_700_000_000 % 86_400);
+        let mut content = String::new();
+        for offset in [0_i64, 3_600, 7_200] {
+            content.push_str(&reflog_line(
+                &"1".repeat(40),
+                &"2".repeat(40),
+                day_start + offset,
+                "+0000",
+                "commit: même jour",
+            ));
+        }
+        content.push_str(&reflog_line(
+            &"2".repeat(40),
+            &"3".repeat(40),
+            day_start + 86_400,
+            "+0000",
+            "commit: lendemain",
+        ));
+        write_file(&git_dir.join("logs").join("HEAD"), &content);
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("l'historique doit être lisible");
+        };
+        assert_eq!(history.stamps.len(), 2, "doublons de journée non réduits");
+        assert!(!history.truncated);
+        assert!(
+            history.stamps.windows(2).all(|w| w[0] <= w[1]),
+            "les horodatages doivent être triés"
+        );
+    }
+
+    #[test]
+    fn test_history_ignores_actions_that_create_no_local_commit() {
+        let guard = TempDirGuard::new("git_history_actions");
+        let git_dir = guard.child(".git");
+
+        let mut content = String::new();
+        for (index, action) in [
+            "clone: from github",
+            "checkout: moving from main to dev",
+            "pull: Fast-forward",
+            "reset: moving to HEAD~1",
+            "rebase (finish): returning to refs/heads/main",
+            "branch: Created from HEAD",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            content.push_str(&reflog_line(
+                &"1".repeat(40),
+                &"2".repeat(40),
+                1_700_000_000 + (index as i64) * 86_400,
+                "+0000",
+                action,
+            ));
+        }
+        write_file(&git_dir.join("logs").join("HEAD"), &content);
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("l'historique doit être lisible");
+        };
+        assert!(
+            history.stamps.is_empty(),
+            "une action sans commit local a été comptée : {:?}",
+            history.stamps
+        );
+    }
+
+    #[test]
+    fn test_history_accepts_the_three_commit_flavours() {
+        let guard = TempDirGuard::new("git_history_commit_kinds");
+        let git_dir = guard.child(".git");
+
+        let mut content = String::new();
+        for (index, action) in [
+            "commit (initial): premier",
+            "commit: suivant",
+            "commit (amend): correction",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            content.push_str(&reflog_line(
+                &"1".repeat(40),
+                &"2".repeat(40),
+                1_700_000_000 + (index as i64) * 86_400,
+                "+0000",
+                action,
+            ));
+        }
+        write_file(&git_dir.join("logs").join("HEAD"), &content);
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("l'historique doit être lisible");
+        };
+        assert_eq!(history.stamps.len(), 3);
+    }
+
+    #[test]
+    fn test_history_rejects_truncated_shas() {
+        let guard = TempDirGuard::new("git_history_short_sha");
+        let git_dir = guard.child(".git");
+        write_file(
+            &git_dir.join("logs").join("HEAD"),
+            &reflog_line("abc", &"2".repeat(40), 1_700_000_000, "+0000", "commit: x"),
+        );
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("l'historique doit être lisible");
+        };
+        assert!(history.stamps.is_empty());
+    }
+
+    #[test]
+    fn test_history_is_bounded_and_reports_truncation() {
+        let guard = TempDirGuard::new("git_history_bounds");
+        let git_dir = guard.child(".git");
+
+        // Un journal bien au-delà des bornes de jours et d'octets.
+        let mut content = String::new();
+        for day in 0..(MAX_HISTORY_DAYS + 200) {
+            content.push_str(&reflog_line(
+                &"1".repeat(40),
+                &"2".repeat(40),
+                1_000_000_000 + (day as i64) * 86_400,
+                "+0000",
+                "commit: entrée",
+            ));
+        }
+        write_file(&git_dir.join("logs").join("HEAD"), &content);
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("l'historique doit être lisible");
+        };
+        assert_eq!(history.stamps.len(), MAX_HISTORY_DAYS);
+        assert!(history.truncated, "borne atteinte mais non signalée");
+
+        // La lecture part de la fin : ce sont les jours récents qui survivent.
+        let Some(newest) = history.stamps.last() else {
+            panic!("l'historique ne doit pas être vide");
+        };
+        assert_eq!(
+            newest.unix_seconds,
+            1_000_000_000 + ((MAX_HISTORY_DAYS + 199) as i64) * 86_400
+        );
+    }
+
+    #[test]
+    fn test_history_discards_a_partial_first_line() {
+        let guard = TempDirGuard::new("git_history_partial");
+        let git_dir = guard.child(".git");
+
+        // Remplissage dépassant la borne d'octets, avec un horodatage marqueur
+        // dans les toutes premières lignes : elles ne doivent pas ressortir.
+        let mut content = reflog_line(
+            &"9".repeat(40),
+            &"9".repeat(40),
+            1_000_000_000,
+            "+0000",
+            "commit: la plus ancienne",
+        );
+        for day in 0..30_000_i32 {
+            content.push_str(&reflog_line(
+                &"1".repeat(40),
+                &"2".repeat(40),
+                1_500_000_000 + i64::from(day) * 86_400,
+                "+0000",
+                "commit: remplissage",
+            ));
+        }
+        write_file(&git_dir.join("logs").join("HEAD"), &content);
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("l'historique doit être lisible");
+        };
+        assert!(history.truncated);
+        assert!(
+            history
+                .stamps
+                .iter()
+                .all(|stamp| stamp.unix_seconds != 1_000_000_000),
+            "une ligne hors de la fenêtre de lecture est ressortie"
+        );
+    }
+
+    #[test]
+    fn test_history_tolerates_invalid_utf8() {
+        let guard = TempDirGuard::new("git_history_utf8");
+        let git_dir = guard.child(".git");
+
+        // Un nom d'auteur en octets invalides ne doit ni faire échouer la lecture
+        // ni empêcher l'extraction de l'horodatage, qui reste ASCII.
+        let mut bytes = format!("{a} {b} ", a = "1".repeat(40), b = "2".repeat(40)).into_bytes();
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+        bytes.extend_from_slice(b" <d@x> 1700000000 +0000\tcommit: ok\n");
+        std::fs::create_dir_all(git_dir.join("logs")).unwrap_or_else(|e| {
+            panic!("création du dossier de test impossible : {e}");
+        });
+        std::fs::write(git_dir.join("logs").join("HEAD"), &bytes).unwrap_or_else(|e| {
+            panic!("écriture du fichier de test impossible : {e}");
+        });
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("l'historique doit rester lisible");
+        };
+        assert_eq!(history.stamps.len(), 1);
+    }
+
+    #[test]
+    fn test_history_of_a_repository_without_journal_is_empty_not_failed() {
+        let guard = TempDirGuard::new("git_history_absent");
+        let git_dir = guard.child(".git");
+        write_file(&git_dir.join("HEAD"), "ref: refs/heads/main\n");
+
+        let Some(history) = GitRefParser::read_commit_day_history(&git_dir) else {
+            panic!("un dépôt sans commit est une observation valide, pas un échec");
+        };
+        assert!(history.stamps.is_empty());
+        assert!(!history.truncated);
     }
 
     #[test]

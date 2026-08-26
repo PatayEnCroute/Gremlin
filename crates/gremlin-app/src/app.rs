@@ -19,31 +19,40 @@
 
 use crate::config::AppConfig;
 use crate::desktop;
+use crate::desktop_motion::{DesktopMotion, PlacementIntent};
 use crate::error::AppError;
 use crate::persistence::PersistenceManager;
+use crate::pet_gesture::{GestureConfig, GestureOutcome, PetGesture};
 use crate::renderer::AppRenderer;
 use crate::ui::{
-    CommandPalette, PaletteContext, PaletteExecutionResult, PanelInteraction, PanelScene,
-    PanelStyle, RaycastRenderer, RepoDisplayInfo, SettingsWindow, SystemTheme, TextSize, Theme,
+    CommandPalette, ConsumableDragView, PaletteAction, PaletteContext, PaletteExecutionResult,
+    PaletteGroup, PanelInteraction, PanelScene, PanelStyle, RaycastRenderer, RepoDisplayInfo,
+    RepoTrackingStatus, SettingsWindow, SystemTheme, TextSize, Theme,
 };
 use crate::visual_feedback::{VisualAnchors, VisualCue, VisualFeedback};
 use crossbeam_channel::{Receiver, Sender};
 use gremlin_core::{
-    ActivityState, BuildSummary, BuildTool, CoreEvent, PetMood, PetState, RepositoryId,
-    TestFramework, TestSummary,
+    ActivityState, BuildSummary, BuildTool, CivilDate, ConsumableKind, CoreEvent, PauseReason,
+    PetMood, PetState, RepositoryId, StreakReward, TestFramework, TestSummary,
 };
 use gremlin_render::{
-    register_default_procedural_accessories, AccessoryCatalog, AccessoryItem, AccessoryManifest,
+    register_default_accessories, AccessoryCatalog, AccessoryItem, AccessoryManifest,
     AnimationController, LayerCompositor, PixelBuffer, PlayMode, SkinManifest,
     SpeechBubbleRenderer, SpriteAnimation, SpriteAtlas, SpriteFrame, TransitionRenderer,
 };
+use gremlin_system::desktop_layout::{
+    DesktopLayoutProvider, DesktopLayoutState, DisplayArea, DisplayFingerprint, MonitorProbe,
+    PhysicalRect, SystemDesktopLayout,
+};
 use gremlin_system::{
-    ActivityEvent, ActivityMonitor, AppPaths, AutostartManager, LayeredSurface, PlatformImpl,
-    PlatformWindowExt, SystemTrayManager, TrayMenuAction, WindowConfig,
+    ActivityEvent, ActivityMonitor, AppPaths, AutostartManager, LayeredSurface, LocalCalendar,
+    PlatformImpl, PlatformWindowExt, SystemLocalCalendar, SystemTrayManager, TrayMenuAction,
+    WindowConfig,
 };
 use gremlin_watcher::{
-    AssetSignal, AssetWatcher, DevSignal, ParsedBuildReport, ParsedTestReport, RepoWatcher,
-    ReportBuildTool, ReportFramework, ToolingStateAck, WatcherStatus,
+    is_git_repo, normalize_path, AssetSignal, AssetWatcher, DevSignal, GitCommitStamp,
+    ParsedBuildReport, ParsedTestReport, RepoWatcher, ReportBuildTool, ReportFramework,
+    ToolingStateAck, WatcherError, WatcherStatus, MAX_TRACKED_REPOS,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -103,6 +112,49 @@ fn is_safe_sprite_key(key: &str) -> bool {
     path.file_name().and_then(std::ffi::OsStr::to_str) == Some(key) && path.extension().is_none()
 }
 
+fn load_accessory_mod_frame(
+    dir: &Path,
+    accessory_id: &str,
+    key: &str,
+    expected_width: u32,
+    expected_height: u32,
+) -> Option<SpriteFrame> {
+    if !is_safe_sprite_key(key) {
+        warn!(
+            accessory = accessory_id,
+            frame = key,
+            "Clé de frame d'accessoire non sûre : entrée ignorée"
+        );
+        return None;
+    }
+    let path = dir.join(format!("{key}.png"));
+    let frame = match SpriteFrame::from_png_file(&path) {
+        Ok(frame) => frame,
+        Err(error) => {
+            warn!(
+                accessory = accessory_id,
+                frame = key,
+                path = %path.display(),
+                "Frame d'accessoire absente ou corrompue : {error}"
+            );
+            return None;
+        }
+    };
+    if frame.width != expected_width || frame.height != expected_height {
+        warn!(
+            accessory = accessory_id,
+            frame = key,
+            width = frame.width,
+            height = frame.height,
+            expected_width,
+            expected_height,
+            "Dimensions de frame d'accessoire incompatibles"
+        );
+        return None;
+    }
+    Some(frame)
+}
+
 /// Événements personnalisés injectés dans la boucle d'événements winit.
 ///
 /// Le variant d'accessibilité transporte un `TreeUpdate` et une requête
@@ -129,6 +181,28 @@ impl From<accesskit_winit::Event> for CustomAppEvent {
 ///
 /// Source de vérité unique : les correspondances humeur → animation étaient
 /// auparavant dupliquées à trois endroits, avec des divergences.
+/// Récompense de série correspondant à cet accessoire, si elle reste verrouillée.
+///
+/// Renvoie `None` pour tout accessoire ordinaire : la table de récompenses est
+/// fermée, et un mod communautaire n'est jamais soumis à un palier.
+fn locked_reward_for(accessory_id: &str, pet_state: &PetState) -> Option<StreakReward> {
+    let reward = StreakReward::ALL
+        .into_iter()
+        .find(|reward| reward.accessory_id() == accessory_id)?;
+    (!pet_state.productivity().streak().is_unlocked(reward)).then_some(reward)
+}
+
+/// Nombre de jours requis par cette récompense dans la configuration courante.
+fn required_days_for(reward: StreakReward, pet_state: &PetState) -> u16 {
+    pet_state
+        .config()
+        .streak
+        .milestone_days
+        .get(reward.index())
+        .copied()
+        .unwrap_or_default()
+}
+
 const fn animation_key_for_mood(mood: PetMood) -> &'static str {
     match mood {
         PetMood::Dead => "dead",
@@ -171,6 +245,13 @@ pub struct AppOptions {
     pub paths: Option<AppPaths>,
     /// Proxy de réveil de la boucle d'événements.
     pub wake_proxy: Option<EventLoopProxy<CustomAppEvent>>,
+    /// Source du jour civil courant ; l'horloge système si absente.
+    ///
+    /// Point d'injection indispensable : un test de série ne peut ni dormir
+    /// jusqu'à minuit, ni modifier l'heure de la machine.
+    pub calendar: Option<Box<dyn LocalCalendar>>,
+    /// Source de la topologie des écrans ; la plateforme courante si absente.
+    pub desktop_layout: Option<Box<dyn DesktopLayoutProvider>>,
 }
 
 impl Default for AppOptions {
@@ -180,6 +261,8 @@ impl Default for AppOptions {
             enable_system_integration: true,
             paths: None,
             wake_proxy: None,
+            calendar: None,
+            desktop_layout: None,
         }
     }
 }
@@ -197,6 +280,8 @@ impl AppOptions {
             enable_system_integration: false,
             paths: Some(paths),
             wake_proxy: None,
+            calendar: None,
+            desktop_layout: None,
         }
     }
 }
@@ -269,7 +354,6 @@ impl Visuals {
 struct UiState {
     is_palette_open: bool,
     cursor_blink_state: bool,
-    is_dragging: bool,
     needs_redraw: bool,
     /// Le panneau doit être recomposé et re-présenté.
     ///
@@ -279,6 +363,11 @@ struct UiState {
     panel_needs_redraw: bool,
     /// Ligne du panneau survolée par la souris, en indice d'item filtré.
     hovered_item: Option<usize>,
+    /// Le curseur est sur le bouton d'action de la ligne survolée.
+    ///
+    /// Distinct de `hovered_item` : c'est ce qui départage « activer la ligne »
+    /// de « déclencher son bouton », pour le dessin comme pour le clic.
+    hovered_row_action: bool,
     /// Le panneau a déjà reçu le focus depuis sa dernière ouverture.
     ///
     /// Garde-fou : sans lui, un gestionnaire de fenêtres qui refuse le focus à
@@ -292,6 +381,42 @@ struct UiState {
     last_observation_error: Option<String>,
     /// État demandé au worker, en attente de confirmation asynchrone.
     pending_tooling_enabled: Option<bool>,
+    /// Dernière position du curseur dans le panneau, en pixels physiques.
+    last_panel_cursor: Option<(i32, i32)>,
+    /// Glisser d'un consommable depuis sa ligne vers l'aperçu du familier.
+    ///
+    /// Interne au panneau : `winit` ne fournit pas de glisser-déposer de données
+    /// applicatives entre deux fenêtres, et l'implémenter demanderait trois
+    /// piles natives distinctes et une capture globale de pointeur.
+    consumable_drag: Option<ConsumableDrag>,
+}
+
+/// Glisser d'un consommable en cours dans le panneau.
+#[derive(Debug, Clone, Copy)]
+struct ConsumableDrag {
+    /// Objet saisi.
+    kind: ConsumableKind,
+    /// Position du curseur à l'appui, en pixels physiques du panneau.
+    origin: (i32, i32),
+    /// Position courante du curseur.
+    cursor: (i32, i32),
+    /// Le seuil de déplacement a été franchi : le geste est un glisser.
+    ///
+    /// En deçà, le relâchement vaut un simple clic sur la ligne.
+    active: bool,
+}
+
+impl ConsumableDrag {
+    /// Prend acte du curseur et arme le glisser au-delà du seuil.
+    fn note_cursor(&mut self, cursor: (i32, i32), threshold_px: i32) {
+        self.cursor = cursor;
+        let dx = i64::from(cursor.0 - self.origin.0);
+        let dy = i64::from(cursor.1 - self.origin.1);
+        let threshold = i64::from(threshold_px);
+        if dx * dx + dy * dy > threshold * threshold {
+            self.active = true;
+        }
+    }
 }
 
 impl Default for UiState {
@@ -299,16 +424,18 @@ impl Default for UiState {
         Self {
             is_palette_open: false,
             cursor_blink_state: true,
-            is_dragging: false,
             needs_redraw: true,
             panel_needs_redraw: false,
             hovered_item: None,
+            hovered_row_action: false,
             panel_had_focus: false,
             exit_requested: false,
             modifiers: ModifiersState::empty(),
             last_save_error: None,
             last_observation_error: None,
             pending_tooling_enabled: None,
+            last_panel_cursor: None,
+            consumable_drag: None,
         }
     }
 }
@@ -349,9 +476,27 @@ struct WatcherBridge {
     dev_sender: Sender<DevSignal>,
     #[cfg_attr(not(test), allow(dead_code))]
     asset_sender: Sender<AssetSignal>,
+    /// Émetteur d'incidents, conservé pour les mêmes raisons.
+    ///
+    /// En mode headless aucun surveillant ne le détient : sans cette copie, le
+    /// canal serait clos et aucun incident ne pourrait être éprouvé.
+    #[cfg_attr(not(test), allow(dead_code))]
+    status_sender: Sender<WatcherStatus>,
     repository_ids: HashMap<PathBuf, RepositoryId>,
     next_repository_id: u64,
     tooling_ack: Option<Receiver<ToolingStateAck>>,
+    /// Réponse en attente du sélecteur de dossier natif.
+    ///
+    /// La boîte de dialogue est modale : elle vit sur son propre fil et répond
+    /// par ce canal, sinon le familier se figerait le temps du choix.
+    ///
+    /// Ce fil est le seul de l'application à ne pas être joint à l'arrêt, et
+    /// c'est délibéré : sa condition de sortie est un geste humain, pas un
+    /// signal qu'on puisse émettre. L'attendre ferait dépendre la fermeture de
+    /// Gremlin de la fermeture d'une boîte de dialogue. Il ne détient aucun état
+    /// applicatif — seulement l'émetteur de ce canal, dont la fermeture est sans
+    /// conséquence — et disparaît avec le processus.
+    folder_pick: Option<Receiver<std::io::Result<Option<PathBuf>>>>,
 }
 
 fn convert_test_summary(report: ParsedTestReport) -> TestSummary {
@@ -482,6 +627,183 @@ impl ActivityBridge {
     }
 }
 
+/// Intervalle minimal entre deux interrogations du calendrier local.
+///
+/// Le changement de jour est vérifié lors du réveil de simulation existant :
+/// aucune cadence supplémentaire n'est introduite, seule la fréquence des
+/// appels au calendrier est bornée.
+/// Cadence de rafraîchissement du compte à rebours de concentration.
+///
+/// Une seconde : le panneau n'affiche pas les dixièmes, et un rafraîchissement
+/// par image ferait vivre l'application pour rien.
+const POMODORO_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Opacité minimale d'un pixel pour qu'il appartienne à la hitbox du familier.
+///
+/// Le contour anticrénelé du sprite est presque transparent : l'inclure ferait
+/// caresser le familier depuis un pixel que l'utilisateur ne voit pas.
+const PET_HITBOX_MIN_ALPHA: u8 = 24;
+
+const MIN_DAY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Intervalle maximal entre deux interrogations du calendrier local.
+const MAX_DAY_CHECK_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// Intervalle de reprise après un échec du calendrier.
+///
+/// Espacé : une date locale indisponible ne doit pas se traduire par une
+/// tentative à chaque réveil de la boucle.
+const CALENDAR_RETRY_INTERVAL: Duration = Duration::from_secs(900);
+
+/// Résultat d'une vérification du jour courant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DayRefresh {
+    /// Jour civil courant, absent si le calendrier est indisponible.
+    today: Option<CivilDate>,
+    /// Le jour visible a changé depuis la dernière vérification.
+    changed: bool,
+}
+
+/// Pont vers le calendrier local : la seule source du jour civil du domaine.
+struct ProductivityBridge {
+    /// Source injectable de la date locale.
+    calendar: Box<dyn LocalCalendar>,
+    /// Dernier jour civil obtenu.
+    today: Option<CivilDate>,
+    /// Prochaine interrogation autorisée du calendrier.
+    next_check: Instant,
+    /// Dernier échec de résolution de la date, affichable dans le panneau.
+    last_error: Option<String>,
+}
+
+impl ProductivityBridge {
+    fn new(calendar: Box<dyn LocalCalendar>, now: Instant) -> Self {
+        Self {
+            calendar,
+            today: None,
+            next_check: now,
+            last_error: None,
+        }
+    }
+
+    /// Jour civil courant connu.
+    const fn today(&self) -> Option<CivilDate> {
+        self.today
+    }
+
+    /// Interroge le calendrier si l'échéance est atteinte.
+    ///
+    /// Un échec conserve le dernier jour connu : perdre la date ferait
+    /// disparaître la série de l'affichage sans qu'aucun jour n'ait été manqué.
+    fn refresh(&mut self, now: Instant, force: bool) -> DayRefresh {
+        if !force && self.today.is_some() && now < self.next_check {
+            return DayRefresh {
+                today: self.today,
+                changed: false,
+            };
+        }
+
+        match self.calendar.today() {
+            Ok(parts) => match CivilDate::new(parts.year, parts.month, parts.day) {
+                Ok(date) => {
+                    let changed = self.today != Some(date);
+                    self.today = Some(date);
+                    self.last_error = None;
+                    self.next_check = now + self.next_interval();
+                    DayRefresh {
+                        today: self.today,
+                        changed,
+                    }
+                }
+                Err(error) => self.record_failure(now, &error.to_string()),
+            },
+            Err(error) => self.record_failure(now, &error.to_string()),
+        }
+    }
+
+    /// Délai avant la prochaine interrogation, borné des deux côtés.
+    fn next_interval(&self) -> Duration {
+        self.calendar
+            .seconds_until_next_midnight()
+            .map_or(MAX_DAY_CHECK_INTERVAL, |seconds| {
+                // Une seconde de marge : sans elle, la vérification tomberait sur
+                // la dernière seconde de la journée et lirait encore la veille.
+                Duration::from_secs(seconds.saturating_add(1))
+                    .clamp(MIN_DAY_CHECK_INTERVAL, MAX_DAY_CHECK_INTERVAL)
+            })
+    }
+
+    /// Enregistre un échec sans effacer le dernier jour connu.
+    fn record_failure(&mut self, now: Instant, reason: &str) -> DayRefresh {
+        warn!("Date locale indisponible : {reason}");
+        self.last_error = Some(format!("Date locale indisponible : {reason}"));
+        self.next_check = now + CALENDAR_RETRY_INTERVAL;
+        DayRefresh {
+            today: self.today,
+            changed: false,
+        }
+    }
+}
+
+/// Gestes directs, mouvement et topologie du bureau.
+///
+/// Regroupés plutôt que dispersés dans `GremlinApp` : ces champs ne se lisent
+/// qu'ensemble, et `UiState::is_dragging` est ici remplacé par une vue dérivée
+/// du geste — deux booléens concurrents finissaient par diverger.
+struct DesktopState {
+    /// Source de la topologie, injectable en test.
+    layout_provider: Box<dyn DesktopLayoutProvider>,
+    /// Dernière topologie normalisée.
+    layout: DesktopLayoutState,
+    /// Machine de classification des gestes de souris.
+    gesture: PetGesture,
+    /// Seuils de classification.
+    gesture_config: GestureConfig,
+    /// Moteur de chute et de magnétisme.
+    motion: DesktopMotion,
+    /// Dernière position physique connue du curseur dans la fenêtre.
+    last_cursor: Option<(f64, f64)>,
+    /// Écran occupé au dernier relevé.
+    active_display: Option<DisplayFingerprint>,
+    /// Le placement a changé et reste à persister.
+    placement_dirty: bool,
+    /// Dernier incident de placement, affichable dans le panneau.
+    last_error: Option<String>,
+}
+
+impl DesktopState {
+    fn new(layout_provider: Box<dyn DesktopLayoutProvider>) -> Self {
+        Self {
+            layout_provider,
+            // Aucun écran n'est connu avant le premier relevé : annoncer une
+            // indisponibilité plutôt qu'une topologie inventée.
+            layout: DesktopLayoutState::Unavailable {
+                reason: String::from("topologie des écrans non encore relevée"),
+            },
+            gesture: PetGesture::default(),
+            gesture_config: GestureConfig::default(),
+            motion: DesktopMotion::default(),
+            last_cursor: None,
+            active_display: None,
+            placement_dirty: false,
+            last_error: None,
+        }
+    }
+
+    /// Indique que le placement natif est exploitable sur cette plateforme.
+    fn placement_available(&self) -> bool {
+        self.layout.is_available()
+    }
+
+    /// Raison affichable de l'indisponibilité du placement, s'il l'est.
+    fn unavailable_reason(&self) -> Option<&str> {
+        match &self.layout {
+            DesktopLayoutState::Unavailable { reason } => Some(reason.as_str()),
+            DesktopLayoutState::Available(_) => None,
+        }
+    }
+}
+
 /// État global de l'application orchestrant la logique, les graphismes, l'UI et l'OS.
 pub struct GremlinApp {
     config: AppConfig,
@@ -518,8 +840,21 @@ pub struct GremlinApp {
     platform: PlatformImpl,
     tray_manager: Option<SystemTrayManager>,
     autostart_manager: Option<AutostartManager>,
+    /// Dépôts déclarés par l'utilisateur, dans l'ordre de la configuration.
+    ///
+    /// Dérivée de `config.watcher.tracked_repos` et **non** des signaux du
+    /// watcher : un dépôt introuvable n'émet aucun signal, et n'apparaîtrait
+    /// donc sur aucune ligne — l'utilisateur ne pourrait plus le retirer.
     monitored_repos: Vec<RepoDisplayInfo>,
+    /// Répertoire de lancement, s'il se trouve être un dépôt Git.
+    ///
+    /// Résolu une seule fois : il ne change pas pendant la vie du processus.
+    current_dir_repo: Option<PathBuf>,
     command_palette: CommandPalette,
+    /// Gestes directs, chute et topologie des écrans.
+    desktop: DesktopState,
+    /// Pont vers le calendrier local, source du jour civil du domaine.
+    productivity: ProductivityBridge,
 }
 
 impl GremlinApp {
@@ -598,21 +933,21 @@ impl GremlinApp {
         // ratés et les pertes d'événements, jusqu'ici invisibles hors journaux.
         let (status_sender, status_receiver) = crossbeam_channel::bounded(SIGNAL_CHANNEL_CAPACITY);
 
-        let (repo_watcher, asset_watcher) = if options.enable_watchers {
+        let (repo_watcher, asset_watcher, arming_failures) = if options.enable_watchers {
             Self::spawn_watchers(
                 &config,
                 &paths,
                 watcher_dev_sender,
                 watcher_asset_sender,
-                status_sender,
+                status_sender.clone(),
             )
         } else {
-            (None, None)
+            (None, None, Vec::new())
         };
 
         let mut sprite_atlas = SpriteAtlas::new();
         let mut accessory_catalog = AccessoryCatalog::new();
-        register_default_procedural_accessories(&mut sprite_atlas, &mut accessory_catalog);
+        register_default_accessories(&mut sprite_atlas, &mut accessory_catalog);
 
         let (autostart_manager, tray_manager) = if options.enable_system_integration {
             Self::spawn_system_integration(&config, &pet_state)
@@ -629,7 +964,38 @@ impl GremlinApp {
             options.enable_system_integration,
         );
 
-        let monitored_repos = Vec::new();
+        // Les dépôts affichés viennent de la configuration : un chemin devenu
+        // introuvable reste listé, avec sa cause, donc reste retirable.
+        let watcher_available = repo_watcher.is_some();
+        let monitored_repos: Vec<RepoDisplayInfo> = config
+            .watcher
+            .tracked_repos
+            .iter()
+            .map(|path| {
+                let issue = if watcher_available {
+                    arming_failures
+                        .iter()
+                        .find(|(failed, _)| failed == path)
+                        .map(|(_, error)| error.to_string())
+                } else {
+                    Some(String::from(
+                        "surveillance indisponible : dépôt non surveillé",
+                    ))
+                };
+                let status = if issue.is_none() {
+                    RepoTrackingStatus::Active
+                } else {
+                    RepoTrackingStatus::Unavailable
+                };
+                RepoDisplayInfo::declared(path.clone(), status, issue)
+            })
+            .collect();
+
+        let current_dir_repo = std::env::current_dir()
+            .ok()
+            .map(|dir| normalize_path(&dir))
+            .filter(|dir| is_git_repo(dir));
+
         let command_palette = CommandPalette::new(&PaletteContext {
             catalog: &accessory_catalog,
             wardrobe: &config.wardrobe,
@@ -637,9 +1003,16 @@ impl GremlinApp {
             config: &config,
             autostart_active,
             repos: &monitored_repos,
+            current_dir_repo: current_dir_repo.as_deref(),
+            folder_picker_available: desktop::folder_picker_available(),
             last_save_error: None,
             last_observation_error: activity_error.as_deref(),
             pending_tooling_enabled: None,
+            // La topologie n'est relevée qu'à la création de la fenêtre : à la
+            // construction, le placement natif est encore inconnu.
+            today: None,
+            desktop_placement_available: false,
+            desktop_unavailable_reason: None,
         });
 
         let now = Instant::now();
@@ -662,9 +1035,11 @@ impl GremlinApp {
                 status_receiver,
                 dev_sender,
                 asset_sender,
+                status_sender,
                 repository_ids: HashMap::new(),
                 next_repository_id: 1,
                 tooling_ack: None,
+                folder_pick: None,
             },
             activity,
             wake_bridge,
@@ -677,25 +1052,58 @@ impl GremlinApp {
             tray_manager,
             autostart_manager,
             monitored_repos,
+            current_dir_repo,
             command_palette,
+            desktop: DesktopState::new(
+                options
+                    .desktop_layout
+                    .unwrap_or_else(|| Box::new(SystemDesktopLayout::new())),
+            ),
+            productivity: ProductivityBridge::new(
+                options
+                    .calendar
+                    .unwrap_or_else(|| Box::new(SystemLocalCalendar::new())),
+                now,
+            ),
         };
 
         let active_skin = app.config.active_skin.clone();
         app.load_skin(&active_skin);
         app.scan_custom_accessories_and_skins();
+        app.strip_locked_rewards();
+
+        // Le jour courant est établi avant toute réaction : sans lui, un seed
+        // d'historique arrivant dans la seconde suivante serait ignoré.
+        let refreshed = app.productivity.refresh(now, true);
+        if let Some(today) = refreshed.today {
+            let events = app.pet_state.refresh_current_day(today);
+            app.apply_core_events(&events);
+        }
+        if app.productivity.last_error.is_some() {
+            app.ui.last_observation_error = app.productivity.last_error.clone();
+        }
+
         app.sync_animation_with_mood();
 
         Ok(app)
     }
 
     /// Démarre les surveillants Git et d'assets, en tolérant leur indisponibilité.
+    ///
+    /// Renvoie, en troisième position, les dépôts déclarés que la surveillance
+    /// n'a pas pu monter : l'interface doit les montrer comme indisponibles
+    /// plutôt que de les présenter comme suivis.
     fn spawn_watchers(
         config: &AppConfig,
         paths: &AppPaths,
         dev_sender: Sender<DevSignal>,
         asset_sender: Sender<AssetSignal>,
         status_sender: Sender<WatcherStatus>,
-    ) -> (Option<RepoWatcher>, Option<AssetWatcher>) {
+    ) -> (
+        Option<RepoWatcher>,
+        Option<AssetWatcher>,
+        Vec<(PathBuf, WatcherError)>,
+    ) {
         let mut repo_watcher = match RepoWatcher::new_with_config(dev_sender, &config.watcher) {
             Ok(w) => Some(w),
             Err(e) => {
@@ -704,16 +1112,20 @@ impl GremlinApp {
             }
         };
 
+        let mut arming_failures = Vec::new();
         if let Some(ref mut watcher) = repo_watcher {
+            // Le canal de statut est installé **avant** l'armement : sans lui,
+            // les échecs d'enregistrement des dépôts déclarés ne seraient
+            // visibles que dans les journaux.
             if let Err(e) = watcher.set_status_sender(status_sender) {
                 warn!("Rapports de fiabilité de la surveillance indisponibles : {e}");
             }
 
-            // La découverte consomme directement `auto_discovery`, `custom_roots`
-            // et `max_scan_depth` de la configuration : l'orchestrateur n'a plus
-            // à réimplémenter cette logique.
-            if let Err(e) = watcher.start_auto_discovery() {
-                warn!("Découverte automatique des dépôts indisponible : {e}");
+            // Aucune découverte : seuls les dépôts explicitement déclarés sont
+            // montés, chacun indépendamment des autres.
+            match watcher.arm_tracked_repos() {
+                Ok(failures) => arming_failures = failures,
+                Err(e) => warn!("Montage des dépôts suivis impossible : {e}"),
             }
         }
 
@@ -733,7 +1145,7 @@ impl GremlinApp {
             }
         }
 
-        (repo_watcher, asset_watcher)
+        (repo_watcher, asset_watcher, arming_failures)
     }
 
     /// Initialise l'autostart et l'icône de la zone de notification.
@@ -940,42 +1352,37 @@ impl GremlinApp {
         let expected_height = manifest.frame_height;
         let accessory_id = manifest.id.clone();
         manifest.frames.retain(|key| {
-            if !is_safe_sprite_key(key) {
-                warn!(
-                    accessory = %accessory_id,
-                    frame = %key,
-                    "Clé de frame d'accessoire non sûre : entrée ignorée"
-                );
+            let Some(frame) =
+                load_accessory_mod_frame(dir, &accessory_id, key, expected_width, expected_height)
+            else {
                 return false;
-            }
-            let path = dir.join(format!("{key}.png"));
-            let frame = match SpriteFrame::from_png_file(&path) {
-                Ok(frame) => frame,
-                Err(e) => {
-                    warn!(
-                        accessory = %accessory_id,
-                        frame = %key,
-                        path = %path.display(),
-                        "Frame d'accessoire absente ou corrompue : {e}"
-                    );
-                    return false;
-                }
             };
-            if frame.width != expected_width || frame.height != expected_height {
-                warn!(
-                    accessory = %accessory_id,
-                    frame = %key,
-                    width = frame.width,
-                    height = frame.height,
-                    expected_width,
-                    expected_height,
-                    "Dimensions de frame d'accessoire incompatibles"
-                );
-                return false;
-            }
             self.visuals.sprite_atlas.insert(key.clone(), frame);
             true
         });
+
+        for (style, variant) in &mut manifest.variants {
+            variant.frames.retain(|key| {
+                let Some(frame) = load_accessory_mod_frame(
+                    dir,
+                    &accessory_id,
+                    key,
+                    expected_width,
+                    expected_height,
+                ) else {
+                    return false;
+                };
+                self.visuals.sprite_atlas.insert(key.clone(), frame);
+                true
+            });
+            if variant.frames.is_empty() {
+                warn!(
+                    accessory = %accessory_id,
+                    style,
+                    "Variante sans frame valide : repli sur les frames communes"
+                );
+            }
+        }
 
         if manifest.frames.is_empty() {
             warn!(id = %manifest.id, "Accessoire ignoré : aucune frame valide");
@@ -1002,21 +1409,85 @@ impl GremlinApp {
             config: &self.config,
             autostart_active,
             repos: &self.monitored_repos,
+            current_dir_repo: self.current_dir_repo.as_deref(),
+            folder_picker_available: desktop::folder_picker_available(),
             last_save_error: self.ui.last_save_error.as_deref(),
             last_observation_error: self.ui.last_observation_error.as_deref(),
             pending_tooling_enabled: self.ui.pending_tooling_enabled,
+            today: self.productivity.today(),
+            desktop_placement_available: self.desktop.placement_available(),
+            desktop_unavailable_reason: self.desktop.unavailable_reason(),
         });
     }
 
     /// Aligne l'animation courante sur l'état émotionnel ou physique du familier.
     pub fn sync_animation_with_mood(&mut self) {
-        let target = if self.ui.is_dragging {
-            "dragged"
-        } else {
-            animation_key_for_mood(self.pet_state.mood())
-        };
+        self.visuals
+            .animation_controller
+            .play(self.current_animation_key(), false);
+    }
 
-        self.visuals.animation_controller.play(target, false);
+    /// Animation à jouer, par ordre de priorité décroissante.
+    ///
+    /// L'ordre est exhaustif et volontairement explicite : un état temporaire —
+    /// glisser, chute, bloc de concentration — doit primer sur l'humeur
+    /// ordinaire, mais jamais sur un décès ni sur une jauge critique.
+    fn current_animation_key(&self) -> &'static str {
+        let mood = self.pet_state.mood();
+
+        // 1. Décès et sommeil volontaire : rien ne passe devant.
+        if matches!(mood, PetMood::Dead | PetMood::Sleeping) {
+            return animation_key_for_mood(mood);
+        }
+        // 2. Manipulation directe.
+        if self.is_dragging() {
+            return "dragged";
+        }
+        // 3. État vital critique.
+        if matches!(mood, PetMood::Sick | PetMood::Hungry | PetMood::Angry) {
+            return animation_key_for_mood(mood);
+        }
+        // 4. Bloc de concentration réellement en cours — pas la simple
+        //    activation de la fonctionnalité.
+        if self.config.pomodoro_enabled
+            && self
+                .pet_state
+                .productivity()
+                .pomodoro()
+                .is_work_in_progress()
+        {
+            return self.focus_animation_key();
+        }
+        // 5. Humeur métier ordinaire.
+        animation_key_for_mood(mood)
+    }
+
+    /// Clé d'animation de la posture studieuse, avec repli sur les skins anciens.
+    ///
+    /// Un pack livré avant la phase 8 ne déclare pas `focus` : il retombe sur
+    /// `coding`, puis sur `idle`. Aucun skin existant n'est invalidé.
+    fn focus_animation_key(&self) -> &'static str {
+        let has = |key: &str| {
+            self.visuals
+                .active_manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.animations.contains_key(key))
+        };
+        if has("focus") {
+            "focus"
+        } else if has("coding") {
+            "coding"
+        } else {
+            "idle"
+        }
+    }
+
+    /// Indique que le familier est manipulé ou en cours de chute.
+    ///
+    /// Vue dérivée : un second booléen d'interface finirait par diverger de la
+    /// machine de geste.
+    fn is_dragging(&self) -> bool {
+        self.desktop.gesture.is_armed() || self.desktop.motion.is_active()
     }
 
     /// Route un lot complet d'événements métier vers les retours visuels.
@@ -1056,6 +1527,7 @@ impl GremlinApp {
     pub fn toggle_palette(&mut self) {
         self.ui.is_palette_open = !self.ui.is_palette_open;
         self.ui.hovered_item = None;
+        self.ui.hovered_row_action = false;
 
         if self.ui.is_palette_open {
             self.rebuild_palette_items();
@@ -1201,6 +1673,9 @@ impl GremlinApp {
     fn persist_state(&mut self, reason: &str) {
         match PersistenceManager::save(&self.paths, &self.pet_state, &self.config) {
             Ok(()) => {
+                // Le placement voulu voyage avec la configuration : une
+                // sauvegarde réussie l'a donc déjà écrit.
+                self.desktop.placement_dirty = false;
                 if self.ui.last_save_error.take().is_some() {
                     self.rebuild_palette_items();
                     self.ui.needs_redraw = true;
@@ -1220,6 +1695,7 @@ impl GremlinApp {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Demande de fermeture reçue : sauvegarde puis arrêt");
+                self.cancel_pet_gesture();
                 self.persist_state("fermeture de la fenêtre");
                 event_loop.exit();
             }
@@ -1243,23 +1719,42 @@ impl GremlinApp {
                     self.toggle_palette();
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.desktop.last_cursor = Some((position.x, position.y));
+                let threshold = self.movement_threshold_px();
+                self.desktop
+                    .gesture
+                    .note_cursor((position.x, position.y), threshold);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // Le curseur sorti, la hitbox n'a plus de sens : le geste
+                // reste armé — le glisser natif capture le pointeur — mais la
+                // dernière position connue est oubliée.
+                self.desktop.last_cursor = None;
+            }
+            WindowEvent::Moved(position) => {
+                let threshold = self.movement_threshold_px();
+                self.desktop
+                    .gesture
+                    .note_window_moved((position.x, position.y), threshold);
+            }
+            WindowEvent::Focused(false) => {
+                // Perte de focus pendant un geste : aucune action métier, et
+                // l'animation revient à l'humeur courante.
+                self.cancel_pet_gesture();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.refresh_desktop_layout(event_loop);
+            }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Right, ElementState::Pressed) => self.toggle_palette(),
                 (MouseButton::Left, ElementState::Pressed) => {
-                    self.ui.is_dragging = true;
-                    self.visuals.animation_controller.play("dragged", false);
-                    self.visuals.feedback.handle_cue(VisualCue::DragStarted);
-                    self.request_redraw();
-                    if let Some(window) = &self.window {
-                        let _ = window.drag_window();
-                    }
+                    self.begin_pet_gesture(Instant::now());
                 }
                 (MouseButton::Left, ElementState::Released) => {
-                    if self.ui.is_dragging {
-                        self.ui.is_dragging = false;
-                        self.sync_animation_with_mood();
-                        self.request_redraw();
-                    }
+                    self.refresh_desktop_layout(event_loop);
+                    let events = self.finish_pet_gesture(Instant::now());
+                    self.apply_core_events(&events);
                 }
                 _ => {}
             },
@@ -1305,16 +1800,26 @@ impl GremlinApp {
                 self.handle_palette_key(&key_event);
                 self.ui.panel_needs_redraw = true;
             }
-            WindowEvent::CursorMoved { position, .. } => self.handle_panel_hover(position),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.handle_panel_drag_move(position);
+                self.handle_panel_hover(position);
+            }
             WindowEvent::CursorLeft { .. } => {
+                // Sortir de la fenêtre annule le glisser : aucun stock n'est
+                // décrémenté et aucun faux succès n'est affiché.
+                self.cancel_consumable_drag();
                 if self.ui.hovered_item.take().is_some() {
+                    self.ui.hovered_row_action = false;
                     self.ui.panel_needs_redraw = true;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_panel_scroll(delta),
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left && state == ElementState::Pressed {
-                    self.handle_panel_click();
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => self.handle_panel_press(),
+                        ElementState::Released => self.handle_panel_release(),
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1379,6 +1884,9 @@ impl GremlinApp {
                 let Some(index) = crate::ui::a11y::row_index(request.target_node) else {
                     return;
                 };
+                // Le bouton d'une ligne et la ligne elle-même visent la même
+                // entrée : seule l'action déclenchée diffère.
+                let on_row_action = crate::ui::a11y::is_row_action(request.target_node);
 
                 match request.action {
                     Action::Focus | Action::ScrollIntoView => {
@@ -1386,7 +1894,12 @@ impl GremlinApp {
                     }
                     Action::Click => {
                         self.command_palette.select_index(index);
-                        let result = self.command_palette.execute_selected(&self.config.wardrobe);
+                        let result = if on_row_action {
+                            self.command_palette
+                                .execute_row_action(&self.config.wardrobe)
+                        } else {
+                            self.command_palette.execute_selected(&self.config.wardrobe)
+                        };
                         self.handle_execution_result(result);
                         self.rebuild_palette_items();
                     }
@@ -1426,12 +1939,110 @@ impl GremlinApp {
         let visible = metrics.visible_rows();
         // La position arrive en pixels physiques, exactement l'unité du tampon :
         // aucune conversion d'échelle n'est nécessaire.
+        let (x, y) = (position.x as i32, position.y as i32);
         let hovered = metrics
-            .row_at(position.x as i32, position.y as i32, visible)
+            .row_at(x, y, visible)
             .and_then(|row| self.command_palette.item_at_visible_row(row, visible));
 
-        if hovered != self.ui.hovered_item {
+        // Le bouton n'est « survolé » que si la ligne en porte un : sinon la
+        // même bande de pixels allumerait un état pour un bouton absent.
+        let on_action = hovered.is_some()
+            && metrics.row_action_at(x, y, visible).is_some()
+            && hovered
+                .and_then(|index| self.command_palette.filtered_item(index))
+                .is_some_and(|item| item.row_action.is_some());
+
+        if hovered != self.ui.hovered_item || on_action != self.ui.hovered_row_action {
             self.ui.hovered_item = hovered;
+            self.ui.hovered_row_action = on_action;
+            self.ui.panel_needs_redraw = true;
+        }
+    }
+
+    /// Traite l'appui du bouton gauche dans le panneau.
+    ///
+    /// Une ligne d'inventaire **arme** un glisser au lieu d'agir tout de suite :
+    /// c'est au relâchement que le geste est classé, exactement comme sur la
+    /// fenêtre du familier.
+    fn handle_panel_press(&mut self) {
+        let candidate = self
+            .ui
+            .hovered_item
+            .filter(|_| !self.ui.hovered_row_action)
+            .and_then(|index| self.command_palette.filtered_item(index))
+            .and_then(|item| match item.action {
+                PaletteAction::UseConsumable(kind) => Some(kind),
+                _ => None,
+            });
+
+        let Some(kind) = candidate else {
+            self.handle_panel_click();
+            return;
+        };
+
+        let cursor = self.ui.last_panel_cursor.unwrap_or((0, 0));
+        self.ui.consumable_drag = Some(ConsumableDrag {
+            kind,
+            origin: cursor,
+            cursor,
+            active: false,
+        });
+    }
+
+    /// Traite le relâchement du bouton gauche dans le panneau.
+    fn handle_panel_release(&mut self) {
+        let Some(drag) = self.ui.consumable_drag.take() else {
+            return;
+        };
+        self.ui.panel_needs_redraw = true;
+
+        if !drag.active {
+            // Geste immobile : un clic ordinaire sur la ligne.
+            self.handle_panel_click();
+            return;
+        }
+
+        let over_target = self.settings.as_ref().is_some_and(|panel| {
+            panel
+                .metrics()
+                .is_over_preview(drag.cursor.0, drag.cursor.1)
+        });
+        if over_target {
+            // Même chemin que le clavier et AccessKit : le stock ne peut pas
+            // être décrémenté deux fois pour un seul geste.
+            self.handle_execution_result(PaletteExecutionResult::UseConsumable(drag.kind));
+            self.rebuild_palette_items();
+        } else {
+            debug!("Glisser relâché hors de l'aperçu : aucun objet consommé");
+        }
+    }
+
+    /// Suit le curseur pendant un glisser de consommable.
+    fn handle_panel_drag_move(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        let cursor = (position.x as i32, position.y as i32);
+        self.ui.last_panel_cursor = Some(cursor);
+
+        let Some(panel) = &self.settings else {
+            return;
+        };
+        // Même règle que sur la fenêtre du familier : six points de conception,
+        // projetés cette fois par les métriques du panneau.
+        let threshold = panel
+            .metrics()
+            .px(i32::try_from(self.desktop.gesture_config.movement_threshold_points).unwrap_or(6));
+        let Some(drag) = &mut self.ui.consumable_drag else {
+            return;
+        };
+        let was_active = drag.active;
+        drag.note_cursor(cursor, threshold);
+        if drag.active || was_active {
+            self.ui.panel_needs_redraw = true;
+        }
+    }
+
+    /// Annule un glisser en cours sans rien consommer.
+    fn cancel_consumable_drag(&mut self) {
+        if self.ui.consumable_drag.take().is_some() {
             self.ui.panel_needs_redraw = true;
         }
     }
@@ -1440,7 +2051,12 @@ impl GremlinApp {
     fn handle_panel_click(&mut self) {
         if let Some(index) = self.ui.hovered_item {
             self.command_palette.select_index(index);
-            let result = self.command_palette.execute_selected(&self.config.wardrobe);
+            let result = if self.ui.hovered_row_action {
+                self.command_palette
+                    .execute_row_action(&self.config.wardrobe)
+            } else {
+                self.command_palette.execute_selected(&self.config.wardrobe)
+            };
             self.handle_execution_result(result);
             self.rebuild_palette_items();
             self.ui.panel_needs_redraw = true;
@@ -1486,7 +2102,50 @@ impl GremlinApp {
         }
 
         self.ui.hovered_item = None;
+        self.ui.hovered_row_action = false;
         self.ui.panel_needs_redraw = true;
+    }
+
+    /// Retire de l'équipement actif les récompenses non acquises.
+    ///
+    /// Appelée après chargement : une sauvegarde éditée à la main peut désigner
+    /// un cosmétique jamais mérité. Les accessoires ordinaires et les mods ne
+    /// sont pas concernés — seuls les identifiants de la table de récompenses.
+    fn strip_locked_rewards(&mut self) {
+        let locked: Vec<gremlin_render::AccessoryCategory> = self
+            .config
+            .wardrobe
+            .equipped_slots()
+            .filter(|(_, id)| locked_reward_for(id, &self.pet_state).is_some())
+            .map(|(category, _)| category)
+            .collect();
+
+        for category in locked {
+            warn!(category = ?category, "Cosmétique verrouillé retiré de l'équipement");
+            self.config.wardrobe.unequip(category);
+        }
+    }
+
+    /// Consommable désigné par un raccourci numérique, s'il s'applique.
+    ///
+    /// Trois conditions cumulatives : la recherche est vide, la vue courante est
+    /// le groupe productivité, et la touche est `1`, `2` ou `3`. Le rang suit
+    /// l'ordre canonique de l'inventaire, celui-là même que le panneau affiche.
+    fn consumable_shortcut(&self, text: &str) -> Option<ConsumableKind> {
+        if !self.command_palette.query().is_empty() {
+            return None;
+        }
+        if self.command_palette.view() != crate::ui::PaletteView::Group(PaletteGroup::Productivity)
+        {
+            return None;
+        }
+        let index = match text {
+            "1" => 0,
+            "2" => 1,
+            "3" => 2,
+            _ => return None,
+        };
+        ConsumableKind::ALL.get(index).copied()
     }
 
     /// Traite les événements clavier du panneau de paramètres.
@@ -1544,15 +2203,37 @@ impl GremlinApp {
                 self.handle_execution_result(result);
                 self.rebuild_palette_items();
             }
+            // Équivalent clavier du bouton de la ligne : le retrait ne peut pas
+            // n'exister qu'à la souris.
+            Key::Named(NamedKey::Delete) => {
+                let result = self
+                    .command_palette
+                    .execute_row_action(&self.config.wardrobe);
+                if result == PaletteExecutionResult::None {
+                    return;
+                }
+                self.handle_execution_result(result);
+                self.rebuild_palette_items();
+            }
             Key::Character(text) => {
-                for ch in text.chars().filter(|c| !c.is_control()) {
-                    self.command_palette.insert_char(ch);
+                // Les chiffres ne deviennent des raccourcis que dans le groupe
+                // productivité et hors saisie : ailleurs, ils restent du texte de
+                // recherche, sinon un dépôt nommé « projet2 » deviendrait
+                // introuvable.
+                if let Some(kind) = self.consumable_shortcut(text) {
+                    self.handle_execution_result(PaletteExecutionResult::UseConsumable(kind));
+                    self.rebuild_palette_items();
+                } else {
+                    for ch in text.chars().filter(|c| !c.is_control()) {
+                        self.command_palette.insert_char(ch);
+                    }
                 }
             }
             _ => return,
         }
 
         self.ui.hovered_item = None;
+        self.ui.hovered_row_action = false;
         self.ui.panel_needs_redraw = true;
     }
 
@@ -1590,6 +2271,7 @@ impl GremlinApp {
     /// temps que le panneau : une première pression rend la liste, une seconde
     /// remonte, une troisième ferme.
     fn handle_palette_escape(&mut self) {
+        self.cancel_consumable_drag();
         if !self.command_palette.query().is_empty() {
             self.command_palette.clear_query();
             return;
@@ -1601,9 +2283,24 @@ impl GremlinApp {
     }
 
     /// Exécute le résultat d'une commande sélectionnée dans la palette ou le systray.
+    #[allow(clippy::too_many_lines)]
     pub fn handle_execution_result(&mut self, result: PaletteExecutionResult) {
         match result {
             PaletteExecutionResult::EquipAccessory { category, id } => {
+                if let Some(reward) = locked_reward_for(&id, &self.pet_state) {
+                    // Une récompense non méritée est refusée et **dite** : la
+                    // griser sans explication laisserait croire à un bug.
+                    let message = format!(
+                        "« {} » se débloque après {} jours de commits consécutifs.",
+                        reward.label(),
+                        required_days_for(reward, &self.pet_state)
+                    );
+                    debug!(id = %id, "Cosmétique verrouillé refusé");
+                    self.ui.last_observation_error = Some(message);
+                    self.rebuild_palette_items();
+                    self.ui.panel_needs_redraw = true;
+                    return;
+                }
                 info!(category = ?category, id = %id, "Accessoire équipé");
                 self.config.wardrobe.equip(category, id);
             }
@@ -1611,9 +2308,42 @@ impl GremlinApp {
                 info!(category = ?category, "Accessoire retiré");
                 self.config.wardrobe.unequip(category);
             }
-            PaletteExecutionResult::FeedPet => self.apply_care("nourrir", PetState::feed),
+            PaletteExecutionResult::UseConsumable(kind) => self.use_consumable(kind),
+            PaletteExecutionResult::TogglePomodoro => self.toggle_pomodoro(),
+            PaletteExecutionResult::StartPomodoro => {
+                self.apply_timer_command("démarrer le minuteur", PetState::start_pomodoro);
+            }
+            PaletteExecutionResult::PausePomodoro => {
+                self.apply_timer_command("mettre le minuteur en pause", |state| {
+                    state.pause_pomodoro(PauseReason::User)
+                });
+            }
+            PaletteExecutionResult::ResumePomodoro => {
+                self.apply_timer_command("reprendre le minuteur", PetState::resume_pomodoro);
+            }
+            PaletteExecutionResult::StopPomodoro => {
+                let events = self.pet_state.stop_pomodoro();
+                self.apply_core_events(&events);
+                self.rebuild_palette_items();
+                self.ui.panel_needs_redraw = true;
+            }
+            PaletteExecutionResult::SkipPomodoroBreak => {
+                self.apply_timer_command("passer la pause", PetState::skip_pomodoro_break);
+            }
+            PaletteExecutionResult::ToggleDesktopMotion => {
+                self.config.desktop_motion_enabled = !self.config.desktop_motion_enabled;
+                if !self.config.desktop_motion_enabled {
+                    self.desktop.motion.cancel();
+                }
+                self.rebuild_palette_items();
+                self.ui.panel_needs_redraw = true;
+            }
+            PaletteExecutionResult::ToggleDesktopMagnetism => {
+                self.config.desktop_magnetism_enabled = !self.config.desktop_magnetism_enabled;
+                self.rebuild_palette_items();
+                self.ui.panel_needs_redraw = true;
+            }
             PaletteExecutionResult::PetGremlin => self.apply_care("caresser", PetState::pet),
-            PaletteExecutionResult::HealPet => self.apply_care("soigner", PetState::heal),
             PaletteExecutionResult::RevivePet => match self.pet_state.revive() {
                 Ok(events) => {
                     info!("Gremlin a été réanimé");
@@ -1688,7 +2418,144 @@ impl GremlinApp {
                 self.ui.panel_needs_redraw = true;
                 self.persist_state("changement de fermeture automatique");
             }
+            PaletteExecutionResult::AddTrackedRepo(path) => {
+                if let Err(error) = self.add_tracked_repo(&path) {
+                    warn!("Ajout de dépôt refusé : {error}");
+                    self.ui.last_observation_error = Some(error.to_string());
+                    self.rebuild_palette_items();
+                    self.ui.panel_needs_redraw = true;
+                }
+            }
+            PaletteExecutionResult::RemoveTrackedRepo(path) => self.remove_tracked_repo(&path),
+            PaletteExecutionResult::OpenRepoFolder(path) => Self::open_folder(&path),
+            PaletteExecutionResult::BrowseForTrackedRepo => self.browse_for_tracked_repo(),
             PaletteExecutionResult::None => {}
+        }
+    }
+
+    /// Confie un dépôt Git à la surveillance et le persiste.
+    ///
+    /// L'opération est idempotente : ajouter un dépôt déjà suivi réussit sans
+    /// rien changer.
+    ///
+    /// # Errors
+    /// Renvoie `AppError::Watcher` si le chemin n'est pas un dépôt Git ou si la
+    /// surveillance refuse de l'enregistrer, et `AppError::Io` si le plafond de
+    /// dépôts suivis est atteint. Dans tous ces cas, **rien** n'est écrit dans
+    /// la configuration : l'interface ne doit jamais afficher un dépôt qui n'est
+    /// pas réellement surveillé.
+    pub fn add_tracked_repo(&mut self, path: &Path) -> Result<(), AppError> {
+        let path = normalize_path(path);
+
+        if !path.is_absolute() {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "un dépôt suivi doit être désigné par un chemin absolu",
+            )));
+        }
+        if self.monitored_repos.iter().any(|repo| repo.path == path) {
+            debug!(repo = %path.display(), "Dépôt déjà suivi — ajout sans effet");
+            return Ok(());
+        }
+        if self.monitored_repos.len() >= MAX_TRACKED_REPOS {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::QuotaExceeded,
+                format!("au plus {MAX_TRACKED_REPOS} dépôts peuvent être suivis"),
+            )));
+        }
+        if !is_git_repo(&path) {
+            return Err(AppError::Watcher(WatcherError::NotARepository(path)));
+        }
+
+        // L'enregistrement précède l'écriture en configuration : un dépôt que la
+        // surveillance refuse ne doit pas apparaître comme suivi. Sans watcher
+        // du tout, la déclaration est en revanche conservée pour le prochain
+        // démarrage — et la ligne le dit, plutôt que de se prétendre active.
+        let (status, issue) = match self.watchers.repo_watcher.as_mut() {
+            Some(watcher) => {
+                watcher.watch_repo(&path)?;
+                (RepoTrackingStatus::Active, None)
+            }
+            None => (
+                RepoTrackingStatus::Unavailable,
+                Some(String::from(
+                    "surveillance indisponible ; dépôt enregistré pour le prochain démarrage",
+                )),
+            ),
+        };
+
+        info!(repo = %path.display(), "Dépôt confié à la surveillance");
+        self.config.watcher.tracked_repos.push(path.clone());
+        let _ = self.config.watcher.normalize();
+        self.monitored_repos
+            .push(RepoDisplayInfo::declared(path, status, issue));
+        self.sort_monitored_repos();
+        self.persist_state("ajout d'un dépôt suivi");
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+        Ok(())
+    }
+
+    /// Retire un dépôt de la surveillance et de la configuration.
+    ///
+    /// Le geste de l'utilisateur aboutit toujours : si la désinscription auprès
+    /// du worker échoue, le dépôt est tout de même retiré de la configuration —
+    /// laisser une entrée que l'interface vient d'effacer serait pire, et elle
+    /// reviendrait au prochain démarrage.
+    pub fn remove_tracked_repo(&mut self, path: &Path) {
+        let path = normalize_path(path);
+        if !self.monitored_repos.iter().any(|repo| repo.path == path) {
+            return;
+        }
+
+        if let Some(watcher) = self.watchers.repo_watcher.as_mut() {
+            if let Err(error) = watcher.unwatch_repo(&path) {
+                warn!(repo = %path.display(), "Désinscription incomplète : {error}");
+                self.ui.last_observation_error = Some(error.to_string());
+            }
+        }
+
+        info!(repo = %path.display(), "Dépôt retiré de la surveillance");
+        self.config
+            .watcher
+            .tracked_repos
+            .retain(|repo| *repo != path);
+        self.monitored_repos.retain(|repo| repo.path != path);
+        self.watchers.remove_repository(&path);
+        self.persist_state("retrait d'un dépôt suivi");
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+    }
+
+    /// Aligne l'ordre d'affichage sur celui de la configuration normalisée.
+    fn sort_monitored_repos(&mut self) {
+        self.monitored_repos.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+    }
+
+    /// Ouvre le sélecteur de dossier du système, hors de la boucle d'événements.
+    fn browse_for_tracked_repo(&mut self) {
+        if self.watchers.folder_pick.is_some() {
+            debug!("Sélecteur de dossier déjà ouvert — demande ignorée");
+            return;
+        }
+
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        match std::thread::Builder::new()
+            .name("gremlin-folder-dialog".into())
+            .spawn(move || {
+                let _ = sender.send(desktop::pick_repository_folder());
+            }) {
+            Ok(_handle) => self.watchers.folder_pick = Some(receiver),
+            Err(error) => {
+                warn!("Sélecteur de dossier indisponible : {error}");
+                self.ui.last_observation_error = Some(error.to_string());
+                self.rebuild_palette_items();
+                self.ui.panel_needs_redraw = true;
+            }
         }
     }
 
@@ -1755,6 +2622,65 @@ impl GremlinApp {
         }
     }
 
+    /// Consomme un objet de l'inventaire depuis l'interface.
+    ///
+    /// Un refus est **montré** et non seulement journalisé : l'utilisateur a
+    /// cliqué, il doit savoir pourquoi rien ne s'est produit. Le stock reste
+    /// intact — la transaction du domaine valide avant de muter.
+    fn use_consumable(&mut self, kind: ConsumableKind) {
+        match self.pet_state.use_consumable(kind) {
+            Ok(events) => {
+                info!(consumable = kind.id(), "Objet consommé");
+                self.apply_core_events(&events);
+                self.ui.last_observation_error = None;
+            }
+            Err(error) => {
+                debug!(consumable = kind.id(), "Objet refusé : {error}");
+                self.ui.last_observation_error = Some(error.to_string());
+            }
+        }
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+    }
+
+    /// Active ou désactive le minuteur de concentration.
+    ///
+    /// La désactivation suspend un cycle en cours plutôt que de l'effacer : le
+    /// temps déjà mesuré reste acquis si l'utilisateur se ravise.
+    fn toggle_pomodoro(&mut self) {
+        self.config.pomodoro_enabled = !self.config.pomodoro_enabled;
+        if !self.config.pomodoro_enabled {
+            // Un minuteur à l'arrêt refuse la pause : c'est attendu.
+            if let Ok(events) = self.pet_state.pause_pomodoro(PauseReason::FeatureDisabled) {
+                self.apply_core_events(&events);
+            }
+        }
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+        self.request_redraw();
+    }
+
+    /// Applique une commande du minuteur et montre son éventuel refus.
+    fn apply_timer_command(
+        &mut self,
+        label: &str,
+        command: fn(&mut PetState) -> Result<Vec<CoreEvent>, gremlin_core::CoreError>,
+    ) {
+        match command(&mut self.pet_state) {
+            Ok(events) => {
+                info!("Commande de minuteur « {label} » appliquée");
+                self.apply_core_events(&events);
+                self.ui.last_observation_error = None;
+            }
+            Err(error) => {
+                debug!("Commande de minuteur « {label} » refusée : {error}");
+                self.ui.last_observation_error = Some(error.to_string());
+            }
+        }
+        self.rebuild_palette_items();
+        self.ui.panel_needs_redraw = true;
+    }
+
     /// Bascule le lancement automatique au démarrage de session.
     fn toggle_autostart(&mut self) {
         let Some(autostart) = &self.autostart_manager else {
@@ -1795,9 +2721,45 @@ impl GremlinApp {
     pub fn pump_events(&mut self) -> Vec<CoreEvent> {
         self.drain_tray_actions();
         self.drain_tooling_ack();
+        self.drain_folder_pick();
         self.drain_watcher_status();
         self.drain_asset_signals();
         self.drain_dev_signals()
+    }
+
+    /// Récupère la réponse du sélecteur de dossier, sans jamais attendre.
+    fn drain_folder_pick(&mut self) {
+        let Some(receiver) = self.watchers.folder_pick.as_ref() else {
+            return;
+        };
+        let outcome = match receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.watchers.folder_pick = None;
+                return;
+            }
+        };
+        self.watchers.folder_pick = None;
+
+        match outcome {
+            // Annulation : rien à signaler, l'utilisateur a changé d'avis.
+            Ok(None) => {}
+            Ok(Some(path)) => {
+                if let Err(error) = self.add_tracked_repo(&path) {
+                    warn!("Dossier sélectionné refusé : {error}");
+                    self.ui.last_observation_error = Some(error.to_string());
+                    self.rebuild_palette_items();
+                    self.ui.panel_needs_redraw = true;
+                }
+            }
+            Err(error) => {
+                warn!("Sélecteur de dossier en échec : {error}");
+                self.ui.last_observation_error = Some(error.to_string());
+                self.rebuild_palette_items();
+                self.ui.panel_needs_redraw = true;
+            }
+        }
     }
 
     fn drain_tooling_ack(&mut self) {
@@ -1857,6 +2819,16 @@ impl GremlinApp {
                     );
                     self.ui.last_observation_error =
                         Some(format!("{dropped} événement(s) perdu(s) : {reason}"));
+                    palette_changed = true;
+                }
+                WatcherStatus::HistoryUnreadable { path, reason } => {
+                    // La série repart de l'état déjà persisté : une lecture
+                    // refusée ne doit jamais effacer un historique connu.
+                    warn!(path = %path.display(), "Historique de commits illisible : {reason}");
+                    self.ui.last_observation_error = Some(format!(
+                        "Historique de {} illisible : {reason}",
+                        path.display()
+                    ));
                     palette_changed = true;
                 }
                 WatcherStatus::ReportRejected { path, reason } => {
@@ -1955,6 +2927,7 @@ impl GremlinApp {
                     commit_sha,
                     message,
                     repo_path,
+                    stamp,
                 } => {
                     info!(
                         repo = %repo_name,
@@ -1967,13 +2940,19 @@ impl GremlinApp {
                         Ok(events) => core_events.extend(events),
                         Err(e) => warn!("Commit ignoré : {e}"),
                     }
+                    // Série et XP suivent deux chemins distincts : un commit
+                    // détecté sans horodatage fiable fait réagir le familier mais
+                    // n'invente aucune journée de travail.
+                    core_events.extend(self.record_commit_day(stamp));
                     let _repository_id = self.watchers.repository_id(&repo_path);
                     self.activity.development_seen = true;
 
+                    // Rapprochement par chemin : deux dépôts homonymes sous deux
+                    // racines différentes sont deux lignes distinctes.
                     if let Some(r) = self
                         .monitored_repos
                         .iter_mut()
-                        .find(|r| r.name == repo_name)
+                        .find(|r| r.path == repo_path)
                     {
                         r.branch = Some(branch);
                         r.last_commit_msg = message;
@@ -1985,7 +2964,7 @@ impl GremlinApp {
                     repo_name,
                     old_branch,
                     new_branch,
-                    ..
+                    repo_path,
                 } => {
                     info!(repo = %repo_name, from = %old_branch, to = %new_branch, "Bascule de branche");
                     match self.pet_state.pet(Some(2.0)) {
@@ -1996,32 +2975,54 @@ impl GremlinApp {
                     if let Some(r) = self
                         .monitored_repos
                         .iter_mut()
-                        .find(|r| r.name == repo_name)
+                        .find(|r| r.path == repo_path)
                     {
                         r.branch = Some(new_branch);
                     }
 
                     self.ui.needs_redraw = true;
                 }
-                DevSignal::RepoDiscovered { repo_name, path } => {
+                DevSignal::RepoDiscovered { path, .. } => {
                     let _repository_id = self.watchers.repository_id(&path);
-                    if !self.monitored_repos.iter().any(|r| r.name == repo_name) {
-                        // La branche reste inconnue jusqu'au premier signal qui
-                        // la renseigne : aucune valeur n'est inventée ici.
-                        self.monitored_repos.push(RepoDisplayInfo {
-                            name: repo_name,
-                            branch: None,
-                            last_commit_msg: None,
-                        });
+                    // Confirmation de la surveillance d'un dépôt déclaré. La
+                    // branche reste inconnue jusqu'au premier signal qui la
+                    // renseigne : aucune valeur n'est inventée ici.
+                    if let Some(repo) = self.monitored_repos.iter_mut().find(|r| r.path == path) {
+                        if repo.status != RepoTrackingStatus::Active || repo.issue.is_some() {
+                            repo.status = RepoTrackingStatus::Active;
+                            repo.issue = None;
+                            self.rebuild_palette_items();
+                            self.ui.needs_redraw = true;
+                        }
+                    }
+                }
+                DevSignal::RepoRemoved { path, .. } => {
+                    self.watchers.remove_repository(&path);
+                    // Le dépôt reste **déclaré** : sa disparition du disque n'est
+                    // pas une décision de l'utilisateur. Effacer ici l'entrée de
+                    // configuration ferait perdre la liste de dépôts au premier
+                    // disque externe débranché.
+                    if let Some(repo) = self.monitored_repos.iter_mut().find(|r| r.path == path) {
+                        repo.status = RepoTrackingStatus::Unavailable;
+                        repo.issue = Some(String::from("dépôt introuvable sur le disque"));
+                        repo.branch = None;
                         self.rebuild_palette_items();
                         self.ui.needs_redraw = true;
                     }
                 }
-                DevSignal::RepoRemoved { repo_name, path } => {
-                    self.watchers.remove_repository(&path);
-                    self.monitored_repos.retain(|r| r.name != repo_name);
-                    self.rebuild_palette_items();
-                    self.ui.needs_redraw = true;
+                DevSignal::CommitHistorySeeded {
+                    repo_name,
+                    stamps,
+                    truncated,
+                    ..
+                } => {
+                    debug!(
+                        repo = %repo_name,
+                        days = stamps.len(),
+                        truncated,
+                        "Historique de jours de commits reçu"
+                    );
+                    core_events.extend(self.reconcile_commit_history(&stamps));
                 }
                 signal @ (DevSignal::TestCompleted { .. } | DevSignal::BuildCompleted { .. }) => {
                     self.handle_tooling_signal(signal, &mut core_events);
@@ -2066,6 +3067,7 @@ impl GremlinApp {
                 )
             }
             DevSignal::CommitCreated { .. }
+            | DevSignal::CommitHistorySeeded { .. }
             | DevSignal::BranchChanged { .. }
             | DevSignal::RepoDiscovered { .. }
             | DevSignal::RepoRemoved { .. } => return,
@@ -2098,6 +3100,18 @@ impl GremlinApp {
         }
 
         let mut events = self.pet_state.tick(elapsed);
+
+        // Le jour civil est revérifié ici plutôt que sur une horloge dédiée :
+        // le réveil de simulation existe déjà, et une seconde cadence ferait
+        // vivre l'application au repos.
+        self.refresh_current_day(now, &mut events);
+
+        // Le minuteur n'avance que sur du temps réellement vécu par le
+        // processus : `tick` peut rattraper une absence, pas lui.
+        if self.config.pomodoro_enabled {
+            events.extend(self.pet_state.advance_live_productivity(elapsed));
+        }
+
         if self.config.focus_tracking_enabled {
             let development_seen = std::mem::take(&mut self.activity.development_seen);
             let mut focus_events =
@@ -2178,9 +3192,23 @@ impl GremlinApp {
             .current_frame_key()
             .unwrap_or("idle_0");
 
+        let consumable_drag = self
+            .ui
+            .consumable_drag
+            .filter(|drag| drag.active)
+            .map(|drag| ConsumableDragView {
+                cursor: drag.cursor,
+                over_target: self.settings.as_ref().is_some_and(|panel| {
+                    panel
+                        .metrics()
+                        .is_over_preview(drag.cursor.0, drag.cursor.1)
+                }),
+            });
         let interaction = PanelInteraction {
             cursor_visible: self.ui.cursor_blink_state,
             hovered_item: self.ui.hovered_item,
+            hovered_row_action: self.ui.hovered_row_action,
+            consumable_drag,
         };
         let scene = PanelScene {
             wardrobe: &self.config.wardrobe,
@@ -2217,6 +3245,11 @@ impl GremlinApp {
 
         self.visuals.scene_buffers.current.clear(0, 0, 0, 0);
         if let Some(frame_key) = self.visuals.animation_controller.current_frame_key() {
+            let accessory_elapsed = if self.config.ui.reduced_motion {
+                Duration::ZERO
+            } else {
+                self.visuals.scene_elapsed
+            };
             LayerCompositor::compose_layered_pet_animated(
                 &mut self.visuals.scene_buffers.current,
                 &self.config.wardrobe,
@@ -2225,7 +3258,7 @@ impl GremlinApp {
                 &self.visuals.accessory_catalog,
                 frame_key,
                 mood_key,
-                self.visuals.scene_elapsed,
+                accessory_elapsed,
             );
         }
 
@@ -2294,6 +3327,12 @@ impl GremlinApp {
         &self.pet_state
     }
 
+    /// Palette de commandes courante.
+    #[must_use]
+    pub const fn command_palette(&self) -> &CommandPalette {
+        &self.command_palette
+    }
+
     /// Catalogue d'accessoires chargé.
     #[must_use]
     pub const fn accessory_catalog(&self) -> &AccessoryCatalog {
@@ -2318,6 +3357,376 @@ impl GremlinApp {
         &self.monitored_repos
     }
 
+    // -------------------------------------------------------------------------
+    // Productivité : conversion des horodatages Git en jours civils
+    // -------------------------------------------------------------------------
+
+    /// Convertit un horodatage brut de reflog en jour civil du domaine.
+    ///
+    /// Le décalage utilisé est celui que Git a enregistré **au moment du
+    /// commit** : changer de fuseau ne réécrit donc jamais l'histoire.
+    fn civil_day_of(stamp: GitCommitStamp) -> Option<CivilDate> {
+        CivilDate::from_unix_seconds(stamp.unix_seconds, stamp.utc_offset_minutes).ok()
+    }
+
+    /// Enregistre le jour civil d'un commit observé en direct.
+    ///
+    /// Sans horodatage fiable — repli du watcher sur un simple changement de SHA
+    /// — aucune journée n'est attribuée : le familier a déjà réagi, la série
+    /// attend une preuve.
+    fn record_commit_day(&mut self, stamp: Option<GitCommitStamp>) -> Vec<CoreEvent> {
+        let Some(stamp) = stamp else {
+            return Vec::new();
+        };
+        let Some(commit_day) = Self::civil_day_of(stamp) else {
+            debug!("Horodatage de commit hors calendrier supporté : série inchangée");
+            return Vec::new();
+        };
+        let Some(today) = self.productivity.today() else {
+            debug!("Date locale indisponible : jour de commit non enregistré");
+            return Vec::new();
+        };
+        self.pet_state.record_commit_activity(commit_day, today)
+    }
+
+    /// Réconcilie un historique de jours de commits lu dans un reflog.
+    ///
+    /// Aucun XP n'est rejoué : la réconciliation reconstitue des journées de
+    /// travail, elle ne rejoue pas des commits.
+    fn reconcile_commit_history(&mut self, stamps: &[GitCommitStamp]) -> Vec<CoreEvent> {
+        let Some(today) = self.productivity.today() else {
+            debug!("Date locale indisponible : historique de commits non réconcilié");
+            return Vec::new();
+        };
+        let days = stamps.iter().copied().filter_map(Self::civil_day_of);
+        self.pet_state.reconcile_commit_history(days, today)
+    }
+
+    /// Vérifie le passage à un nouveau jour civil et rafraîchit la série.
+    ///
+    /// Appelée depuis le réveil de simulation existant : aucune cadence
+    /// supplémentaire, aucune lecture disque.
+    fn refresh_current_day(&mut self, now: Instant, events: &mut Vec<CoreEvent>) {
+        let refresh = self.productivity.refresh(now, false);
+        if let (true, Some(today)) = (refresh.changed, refresh.today) {
+            events.extend(self.pet_state.refresh_current_day(today));
+        }
+        if let Some(error) = self.productivity.last_error.take() {
+            self.ui.last_observation_error = Some(error);
+            self.rebuild_palette_items();
+            self.ui.panel_needs_redraw = true;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Bureau : topologie, gestes et mouvement
+    // -------------------------------------------------------------------------
+
+    /// Relève la topologie des écrans auprès du système de fenêtrage.
+    ///
+    /// Appelée sur des événements de fenêtre — démarrage, déplacement,
+    /// changement d'échelle, fin de glisser — jamais en boucle : aucun thread ne
+    /// sonde la topologie.
+    fn refresh_desktop_layout(&mut self, event_loop: &ActiveEventLoop) {
+        let primary = event_loop.primary_monitor();
+        let probes: Vec<MonitorProbe> = event_loop
+            .available_monitors()
+            .map(|monitor| {
+                let position = monitor.position();
+                let size = monitor.size();
+                MonitorProbe {
+                    name: monitor.name(),
+                    position: (position.x, position.y),
+                    size: (size.width, size.height),
+                    scale_factor: monitor.scale_factor(),
+                    is_primary: primary.as_ref() == Some(&monitor),
+                }
+            })
+            .collect();
+
+        self.desktop.layout = self.desktop.layout_provider.resolve(&probes);
+        if let Some(reason) = self.desktop.unavailable_reason() {
+            debug!("Placement natif indisponible : {reason}");
+        }
+    }
+
+    /// Rectangle physique de la fenêtre du familier.
+    fn window_rect(&self) -> Option<PhysicalRect> {
+        let window = self.window.as_ref()?;
+        // La position **externe** inclut les décorations : c'est celle que le
+        // gestionnaire de fenêtres compare à la zone de travail.
+        let position = window.outer_position().ok()?;
+        let size = window.outer_size();
+        let rect = PhysicalRect::new(position.x, position.y, size.width, size.height);
+        rect.is_valid().then_some(rect)
+    }
+
+    /// Écran recouvrant le plus la fenêtre du familier.
+    fn current_display(&self) -> Option<&DisplayArea> {
+        let rect = self.window_rect()?;
+        self.desktop.layout.display_for_window(rect)
+    }
+
+    /// Facteur d'échelle de l'écran courant, en millièmes.
+    fn display_scale_milli(&self) -> u32 {
+        self.current_display()
+            .map_or(1_000, |display| display.scale_factor_milli)
+    }
+
+    /// Seuil de déplacement courant, projeté en pixels physiques.
+    fn movement_threshold_px(&self) -> u32 {
+        self.desktop
+            .gesture_config
+            .threshold_px(self.display_scale_milli())
+    }
+
+    /// Indique que le curseur repose sur un pixel visible du familier.
+    ///
+    /// Le masque provient de la composition **corps + accessoires**, avant
+    /// particules et bulles : cliquer un cœur qui s'éloigne ne caresse pas le
+    /// familier, et un clic dans un coin transparent ne fait rien.
+    fn cursor_over_pet(&self) -> bool {
+        let Some((cursor_x, cursor_y)) = self.desktop.last_cursor else {
+            return false;
+        };
+        if !cursor_x.is_finite() || !cursor_y.is_finite() {
+            return false;
+        }
+
+        let scale = f64::from(self.presentation_scale().max(1));
+        let sprite_x = (cursor_x / scale).floor();
+        let sprite_y = (cursor_y / scale).floor();
+        if sprite_x < 0.0 || sprite_y < 0.0 {
+            return false;
+        }
+
+        let (x, y) = (sprite_x as u32, sprite_y as u32);
+        let scene = &self.visuals.scene_buffers.current;
+        if x >= scene.width() || y >= scene.height() {
+            return false;
+        }
+
+        let index = ((y as usize) * (scene.width() as usize) + (x as usize)) * 4;
+        scene
+            .as_bytes()
+            .get(index + 3)
+            .is_some_and(|alpha| *alpha >= PET_HITBOX_MIN_ALPHA)
+    }
+
+    /// Arme un geste sur appui du bouton gauche.
+    ///
+    /// Le glisser natif n'est tenté que si le geste est armé ; son échec est
+    /// remonté au panneau plutôt qu'avalé — c'est un chemin déclenché par
+    /// l'utilisateur.
+    fn begin_pet_gesture(&mut self, now: Instant) {
+        if !self.cursor_over_pet() {
+            return;
+        }
+        let Some(cursor) = self.desktop.last_cursor else {
+            return;
+        };
+        let origin = self.window_rect().map_or((0, 0), |rect| (rect.x, rect.y));
+
+        self.desktop.gesture.arm(now, cursor, origin);
+        if !self.desktop.gesture.is_armed() {
+            return;
+        }
+
+        self.desktop.motion.cancel();
+        self.visuals.animation_controller.play("dragged", false);
+        self.visuals.feedback.handle_cue(VisualCue::DragStarted);
+        self.request_redraw();
+
+        if let Some(window) = &self.window {
+            if let Err(error) = window.drag_window() {
+                warn!("Déplacement du familier refusé par le système : {error}");
+                self.desktop.gesture.cancel();
+                self.desktop.last_error = Some(format!("Déplacement impossible : {error}"));
+                self.ui.last_observation_error = self.desktop.last_error.clone();
+                self.sync_animation_with_mood();
+                self.rebuild_palette_items();
+                self.ui.panel_needs_redraw = true;
+            }
+        }
+    }
+
+    /// Classe le geste au relâchement et déclenche l'action correspondante.
+    fn finish_pet_gesture(&mut self, now: Instant) -> Vec<CoreEvent> {
+        if !self.desktop.gesture.is_armed() {
+            return Vec::new();
+        }
+
+        let cursor = self.desktop.last_cursor.unwrap_or((0.0, 0.0));
+        let origin = self.window_rect().map_or((0, 0), |rect| (rect.x, rect.y));
+        let threshold = self.movement_threshold_px();
+        let outcome = self.desktop.gesture.release(
+            now,
+            cursor,
+            origin,
+            self.desktop.gesture_config,
+            threshold,
+        );
+
+        let events = match outcome {
+            GestureOutcome::Petted => match self.pet_state.pet(None) {
+                Ok(events) => events,
+                Err(error) => {
+                    debug!("Caresse refusée : {error}");
+                    Vec::new()
+                }
+            },
+            GestureOutcome::Dropped => {
+                self.begin_drop();
+                Vec::new()
+            }
+            GestureOutcome::Ignored => Vec::new(),
+        };
+
+        self.sync_animation_with_mood();
+        self.request_redraw();
+        events
+    }
+
+    /// Annule le geste en cours sans produire d'action métier.
+    fn cancel_pet_gesture(&mut self) {
+        if !self.desktop.gesture.is_armed() {
+            return;
+        }
+        self.desktop.gesture.cancel();
+        self.sync_animation_with_mood();
+        self.request_redraw();
+    }
+
+    /// Lance la chute vers l'ancre de la zone de travail.
+    ///
+    /// Sans mouvement activé, sans topologie exploitable ou sans fenêtre, le
+    /// familier reste simplement où il a été lâché : aucun faux placement.
+    fn begin_drop(&mut self) {
+        if !self.config.desktop_motion_enabled || !self.desktop.placement_available() {
+            self.capture_placement_intent();
+            return;
+        }
+        let Some(rect) = self.window_rect() else {
+            return;
+        };
+        let Some(display) = self.desktop.layout.display_for_window(rect).cloned() else {
+            return;
+        };
+
+        let snap_px = self.snap_distance_px(display.scale_factor_milli);
+        let intent = if self.config.desktop_magnetism_enabled {
+            PlacementIntent::from_window(rect, display.work_area, snap_px)
+        } else {
+            // Sans magnétisme, le familier retombe à la verticale : l'ancre garde
+            // son abscisse exacte et ne colle à aucun coin.
+            PlacementIntent::from_window(rect, display.work_area, 0)
+        };
+
+        let update = self.desktop.motion.begin(
+            rect,
+            display.work_area,
+            intent,
+            self.config.motion,
+            display.scale_factor_milli,
+            self.config.ui.reduced_motion,
+        );
+
+        self.config.placement.intent = intent;
+        self.config.placement.display_hint = Some(display.fingerprint.clone());
+        self.desktop.active_display = Some(display.fingerprint);
+        self.desktop.placement_dirty = true;
+        self.move_window_to(update.position);
+    }
+
+    /// Distance d'accroche aux coins, en pixels physiques.
+    fn snap_distance_px(&self, scale_factor_milli: u32) -> u32 {
+        u32::try_from(
+            u64::from(self.config.motion.corner_snap_points) * u64::from(scale_factor_milli)
+                / 1_000,
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Fait avancer la chute et déplace la fenêtre.
+    fn advance_desktop_motion(&mut self, delta: Duration) {
+        if !self.desktop.motion.is_active() {
+            return;
+        }
+        let update = self.desktop.motion.advance(delta);
+        self.move_window_to(update.position);
+    }
+
+    /// Applique une position physique à la fenêtre du familier.
+    ///
+    /// Déplacer la fenêtre ne demande **pas** de redessin : le tampon de la
+    /// scène est inchangé, seule sa position à l'écran bouge.
+    fn move_window_to(&self, position: (i32, i32)) {
+        if let Some(window) = &self.window {
+            window.set_outer_position(winit::dpi::PhysicalPosition::new(position.0, position.1));
+        }
+    }
+
+    /// Mémorise l'intention de placement déduite de la position courante.
+    fn capture_placement_intent(&mut self) {
+        let Some(rect) = self.window_rect() else {
+            return;
+        };
+        let Some(display) = self.desktop.layout.display_for_window(rect).cloned() else {
+            return;
+        };
+        let snap_px = self.snap_distance_px(display.scale_factor_milli);
+        self.config.placement.intent =
+            PlacementIntent::from_window(rect, display.work_area, snap_px);
+        self.config.placement.display_hint = Some(display.fingerprint.clone());
+        self.desktop.active_display = Some(display.fingerprint);
+        self.desktop.placement_dirty = true;
+    }
+
+    /// Restaure le placement mémorisé sur un écran réellement présent.
+    ///
+    /// L'écran mémorisé peut avoir été débranché ou avoir changé de définition :
+    /// l'ancre est alors reprojetée sur l'écran restant le plus proche, jamais
+    /// restaurée en coordonnées brutes.
+    fn restore_placement(&mut self) {
+        if !self.desktop.placement_available() {
+            // Sous Wayland, le compositeur place la fenêtre : forcer une position
+            // ne ferait qu'afficher un réglage sans effet.
+            return;
+        }
+        let Some(rect) = self.window_rect() else {
+            return;
+        };
+
+        let target = self
+            .config
+            .placement
+            .display_hint
+            .as_ref()
+            .and_then(|hint| self.desktop.layout.display_matching(hint))
+            .or_else(|| self.desktop.layout.display_for_window(rect))
+            .cloned();
+        let Some(target) = target else {
+            return;
+        };
+
+        if self.config.placement.display_hint.as_ref() != Some(&target.fingerprint) {
+            debug!(
+                screen = %target.fingerprint.name,
+                "Écran mémorisé absent : placement reprojeté sur un écran présent"
+            );
+            self.config.placement.display_hint = Some(target.fingerprint.clone());
+            self.desktop.placement_dirty = true;
+        }
+
+        let position = self
+            .config
+            .placement
+            .intent
+            .resolve((rect.width, rect.height), target.work_area);
+        self.desktop.active_display = Some(target.fingerprint);
+        self.move_window_to(position);
+    }
+
     /// Délai avant le prochain réveil de la boucle.
     ///
     /// # Le panneau ne confisque plus la cadence
@@ -2333,7 +3742,7 @@ impl GremlinApp {
     /// saisie. Le mode mouvement réduit l'éteint, et le plancher disparaît avec
     /// lui — la boucle n'a plus alors à se réveiller que sur événement.
     fn next_wake_delay(&self) -> Duration {
-        let mut delay = if self.ui.is_dragging {
+        let mut delay = if self.is_dragging() {
             DRAG_FRAME_INTERVAL
         } else {
             self.visuals
@@ -2350,10 +3759,28 @@ impl GremlinApp {
         if self.ui.is_palette_open && !self.config.ui.reduced_motion {
             delay = delay.min(PALETTE_FRAME_INTERVAL);
         }
+        // Une chute en cours impose son propre pas ; une fois stabilisée, plus
+        // aucune cadence physique ne subsiste.
+        if let Some(motion_delay) = self.desktop.motion.next_step_delay() {
+            delay = delay.min(motion_delay.max(MIN_FRAME_INTERVAL));
+        }
+        // Le compte à rebours ne se rafraîchit qu'à la seconde, et seulement
+        // quand le panneau est ouvert pour l'afficher.
+        if self.ui.is_palette_open && self.pet_state.productivity().pomodoro().is_running() {
+            delay = delay.min(POMODORO_TICK_INTERVAL);
+        }
         delay
     }
 
     fn next_accessory_frame_delay(&self) -> Option<Duration> {
+        if self.config.ui.reduced_motion {
+            return None;
+        }
+        let accessory_style = self
+            .visuals
+            .active_manifest
+            .as_ref()
+            .map_or("default", |manifest| manifest.accessory_style.as_str());
         self.config
             .wardrobe
             .equipped_slots()
@@ -2362,17 +3789,29 @@ impl GremlinApp {
                     .accessory_catalog
                     .get(accessory_id)?
                     .manifest
-                    .time_until_next_frame(self.visuals.scene_elapsed)
+                    .time_until_next_frame_for_style(accessory_style, self.visuals.scene_elapsed)
             })
             .min()
     }
 
     fn accessory_frame_changed(&self, before: Duration, after: Duration) -> bool {
+        if self.config.ui.reduced_motion {
+            return false;
+        }
+        let accessory_style = self
+            .visuals
+            .active_manifest
+            .as_ref()
+            .map_or("default", |manifest| manifest.accessory_style.as_str());
         self.config
             .wardrobe
             .equipped_slots()
             .filter_map(|(_, accessory_id)| self.visuals.accessory_catalog.get(accessory_id))
-            .any(|item| item.manifest.frame_key_at(before) != item.manifest.frame_key_at(after))
+            .any(|item| {
+                item.manifest
+                    .frame_key_at_for_style(accessory_style, before)
+                    != item.manifest.frame_key_at_for_style(accessory_style, after)
+            })
     }
 }
 
@@ -2495,6 +3934,11 @@ impl ApplicationHandler<CustomAppEvent> for GremlinApp {
                     }
                 }
 
+                // La topologie est relevée avant toute restauration : replacer
+                // le familier sur un écran débranché le rendrait invisible.
+                self.refresh_desktop_layout(event_loop);
+                self.restore_placement();
+
                 self.ui.needs_redraw = true;
                 arc_window.request_redraw();
                 info!("Fenêtre Gremlin initialisée avec succès");
@@ -2557,6 +4001,10 @@ impl ApplicationHandler<CustomAppEvent> for GremlinApp {
         if self.visuals.feedback.update(frame_delta) && !self.ui.is_palette_open {
             self.ui.needs_redraw = true;
         }
+
+        // La chute avance sur les réveils déjà programmés : aucun thread ni
+        // aucune horloge supplémentaire n'est nécessaire à la physique.
+        self.advance_desktop_motion(frame_delta);
 
         self.pump_events();
 
@@ -2656,6 +4104,481 @@ mod tests {
         .expect("construction headless")
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 8 : productivité, gestes et placement
+    // -------------------------------------------------------------------------
+
+    /// Jour civil de référence des tests, injecté plutôt que lu à l'horloge.
+    const TEST_YEAR: i32 = 2024;
+    const TEST_MONTH: u8 = 5;
+    const TEST_DAY: u8 = 10;
+
+    fn test_today() -> CivilDate {
+        CivilDate::new(TEST_YEAR, TEST_MONTH, TEST_DAY).expect("date de test valide")
+    }
+
+    /// Construit une application dont le jour courant et les écrans sont figés.
+    fn app_with_calendar(
+        env: &TempEnv,
+        config: AppConfig,
+        layout: &DesktopLayoutState,
+    ) -> GremlinApp {
+        let displays = layout.displays().to_vec();
+        GremlinApp::with_options(
+            PetState::new("Gizmo"),
+            config,
+            AppOptions {
+                enable_watchers: false,
+                enable_system_integration: false,
+                paths: Some(env.paths.clone()),
+                wake_proxy: None,
+                calendar: Some(Box::new(gremlin_system::FixedCalendar::new(
+                    TEST_YEAR, TEST_MONTH, TEST_DAY,
+                ))),
+                desktop_layout: Some(Box::new(gremlin_system::FixedDesktopLayout { displays })),
+            },
+        )
+        .expect("construction headless avec calendrier figé")
+    }
+
+    /// Topologie synthétique à deux écrans, le second à origine négative.
+    fn dual_screen_layout() -> DesktopLayoutState {
+        gremlin_system::normalize_layout(
+            &[
+                MonitorProbe {
+                    name: Some(String::from("Principal")),
+                    position: (0, 0),
+                    size: (1920, 1080),
+                    scale_factor: 1.0,
+                    is_primary: true,
+                },
+                MonitorProbe {
+                    name: Some(String::from("Gauche")),
+                    position: (-2560, -200),
+                    size: (2560, 1440),
+                    scale_factor: 1.5,
+                    is_primary: false,
+                },
+            ],
+            Some,
+        )
+    }
+
+    /// Horodatage de commit d'un jour donné, à midi UTC.
+    fn stamp_for(offset_days: i64) -> GitCommitStamp {
+        // 2024-05-10T12:00:00Z, décalé du nombre de jours voulu.
+        GitCommitStamp {
+            unix_seconds: 1_715_342_400 + offset_days * 86_400,
+            utc_offset_minutes: 0,
+        }
+    }
+
+    #[test]
+    fn test_a_history_seed_feeds_the_streak_without_granting_xp() {
+        let env = TempEnv::new("seed");
+        let mut app = app_with_calendar(&env, AppConfig::default(), &dual_screen_layout());
+        let xp_before = app.pet_state.progression().total_xp();
+        let commits_before = app.pet_state.progression().total_commits();
+
+        app.dev_sender()
+            .send(DevSignal::CommitHistorySeeded {
+                repo_name: String::from("gremlin"),
+                repo_path: env.root.clone(),
+                stamps: (0..5).map(|day| stamp_for(day - 4)).collect(),
+                truncated: false,
+            })
+            .expect("envoi du seed");
+
+        let events = app.pump_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::StreakChanged { .. })),
+            "la série doit être annoncée : {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::CommitReceived { .. })),
+            "un historique ne rejoue jamais un commit"
+        );
+        assert_eq!(app.pet_state.progression().total_xp(), xp_before);
+        assert_eq!(app.pet_state.progression().total_commits(), commits_before);
+        assert_eq!(
+            app.pet_state
+                .productivity()
+                .streak()
+                .current_streak(test_today()),
+            5
+        );
+    }
+
+    #[test]
+    fn test_a_live_commit_without_stamp_gives_xp_but_no_streak_day() {
+        let env = TempEnv::new("nostamp");
+        let mut app = app_with_calendar(&env, AppConfig::default(), &dual_screen_layout());
+
+        app.dev_sender()
+            .send(DevSignal::CommitCreated {
+                repo_path: env.root.clone(),
+                repo_name: String::from("gremlin"),
+                branch: String::from("main"),
+                commit_sha: Some("a".repeat(40)),
+                message: None,
+                stamp: None,
+            })
+            .expect("envoi du commit");
+
+        let events = app.pump_events();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::CommitReceived { .. })));
+        assert_eq!(
+            app.pet_state
+                .productivity()
+                .streak()
+                .current_streak(test_today()),
+            0,
+            "une journée ne s'invente pas sans preuve temporelle"
+        );
+    }
+
+    #[test]
+    fn test_a_live_commit_with_stamp_extends_the_streak() {
+        let env = TempEnv::new("stamp");
+        let mut app = app_with_calendar(&env, AppConfig::default(), &dual_screen_layout());
+
+        app.dev_sender()
+            .send(DevSignal::CommitCreated {
+                repo_path: env.root.clone(),
+                repo_name: String::from("gremlin"),
+                branch: String::from("main"),
+                commit_sha: Some("a".repeat(40)),
+                message: None,
+                stamp: Some(stamp_for(0)),
+            })
+            .expect("envoi du commit");
+
+        let events = app.pump_events();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::CommitReceived { .. })));
+        assert_eq!(
+            app.pet_state
+                .productivity()
+                .streak()
+                .current_streak(test_today()),
+            1
+        );
+        // Premier commit du jour : la récompense quotidienne tombe une seule fois.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, CoreEvent::ConsumableGranted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_an_unreadable_history_is_reported_and_keeps_the_streak() {
+        let env = TempEnv::new("unreadable");
+        let mut app = app_with_calendar(&env, AppConfig::default(), &dual_screen_layout());
+        app.dev_sender()
+            .send(DevSignal::CommitHistorySeeded {
+                repo_name: String::from("gremlin"),
+                repo_path: env.root.clone(),
+                stamps: vec![stamp_for(0)],
+                truncated: false,
+            })
+            .expect("envoi du seed");
+        app.pump_events();
+        let before = app
+            .pet_state
+            .productivity()
+            .streak()
+            .current_streak(test_today());
+
+        app.watchers
+            .status_sender
+            .send(WatcherStatus::HistoryUnreadable {
+                path: env.root.clone(),
+                reason: String::from("accès refusé"),
+            })
+            .expect("envoi du statut");
+        app.pump_events();
+
+        assert!(
+            app.ui
+                .last_observation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Historique")),
+            "l'incident doit être visible : {:?}",
+            app.ui.last_observation_error
+        );
+        assert_eq!(
+            app.pet_state
+                .productivity()
+                .streak()
+                .current_streak(test_today()),
+            before,
+            "une lecture refusée n'efface aucune journée déjà connue"
+        );
+    }
+
+    #[test]
+    fn test_using_a_consumable_is_atomic_and_refusals_are_shown() {
+        let env = TempEnv::new("consume");
+        let mut app = app_with_calendar(&env, AppConfig::default(), &dual_screen_layout());
+        app.pet_state
+            .set_stats(gremlin_core::PetStats::new(20.0, 20.0, 20.0));
+
+        let before = app
+            .pet_state
+            .productivity()
+            .inventory()
+            .quantity(ConsumableKind::Coffee);
+        app.handle_execution_result(PaletteExecutionResult::UseConsumable(
+            ConsumableKind::Coffee,
+        ));
+        assert_eq!(
+            app.pet_state
+                .productivity()
+                .inventory()
+                .quantity(ConsumableKind::Coffee),
+            before - 1
+        );
+        assert!(app.pet_state.stats().energy() > 20.0);
+
+        // Stock désormais vide : le refus est montré et rien n'est décrémenté.
+        app.handle_execution_result(PaletteExecutionResult::UseConsumable(
+            ConsumableKind::Coffee,
+        ));
+        assert_eq!(
+            app.pet_state
+                .productivity()
+                .inventory()
+                .quantity(ConsumableKind::Coffee),
+            0
+        );
+        assert!(
+            app.ui.last_observation_error.is_some(),
+            "un refus déclenché par l'utilisateur doit être affiché"
+        );
+    }
+
+    #[test]
+    fn test_the_timer_only_advances_on_time_really_lived() {
+        let env = TempEnv::new("timer");
+        let config = AppConfig {
+            pomodoro_enabled: true,
+            ..AppConfig::default()
+        };
+        let mut app = app_with_calendar(&env, config, &dual_screen_layout());
+
+        app.handle_execution_result(PaletteExecutionResult::StartPomodoro);
+        let started = app
+            .pet_state
+            .productivity()
+            .pomodoro()
+            .remaining()
+            .expect("minuteur démarré");
+
+        // Le rattrapage hors-ligne ne fait pas avancer le minuteur.
+        app.pet_state.tick(Duration::from_secs(3_600));
+        assert_eq!(
+            app.pet_state.productivity().pomodoro().remaining(),
+            Some(started)
+        );
+
+        // Le temps réellement vécu, si.
+        app.pet_state
+            .advance_live_productivity(Duration::from_secs(30));
+        assert_eq!(
+            app.pet_state.productivity().pomodoro().remaining(),
+            started.checked_sub(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn test_a_locked_reward_cannot_be_equipped() {
+        let env = TempEnv::new("locked");
+        let mut app = app_with_calendar(&env, AppConfig::default(), &dual_screen_layout());
+
+        app.handle_execution_result(PaletteExecutionResult::EquipAccessory {
+            category: AccessoryCategory::Aura,
+            id: String::from("aurora_aura"),
+        });
+        assert!(
+            !app.config
+                .wardrobe
+                .is_equipped_in(AccessoryCategory::Aura, "aurora_aura"),
+            "un cosmétique non mérité ne doit pas s'équiper"
+        );
+        assert!(app.ui.last_observation_error.is_some(), "refus muet");
+
+        // Un accessoire ordinaire reste équipable : la table de récompenses est
+        // fermée, elle ne verrouille rien d'autre.
+        app.handle_execution_result(PaletteExecutionResult::EquipAccessory {
+            category: AccessoryCategory::Aura,
+            id: String::from("fire_aura"),
+        });
+        assert!(app
+            .config
+            .wardrobe
+            .is_equipped_in(AccessoryCategory::Aura, "fire_aura"));
+    }
+
+    #[test]
+    fn test_a_locked_reward_injected_in_a_save_is_stripped_at_load() {
+        let env = TempEnv::new("stripped");
+        let mut config = AppConfig::default();
+        config
+            .wardrobe
+            .equip(AccessoryCategory::Hat, "streak_leaf_pin");
+
+        let app = app_with_calendar(&env, config, &dual_screen_layout());
+        assert!(
+            !app.config
+                .wardrobe
+                .is_equipped_in(AccessoryCategory::Hat, "streak_leaf_pin"),
+            "un cosmétique verrouillé injecté à la main doit être retiré"
+        );
+    }
+
+    #[test]
+    fn test_the_pomodoro_posture_falls_back_on_older_skins() {
+        let env = TempEnv::new("focus_anim");
+        let config = AppConfig {
+            pomodoro_enabled: true,
+            ..AppConfig::default()
+        };
+        let mut app = app_with_calendar(&env, config, &dual_screen_layout());
+        app.handle_execution_result(PaletteExecutionResult::StartPomodoro);
+        app.sync_animation_with_mood();
+
+        // Les skins livrés déclarent `focus` depuis la phase 8.
+        assert_eq!(app.current_animation_key(), "focus");
+
+        // Un pack sans `focus` retombe sur `coding`.
+        if let Some(manifest) = app.visuals.active_manifest.as_mut() {
+            manifest.animations.remove("focus");
+        }
+        assert_eq!(app.current_animation_key(), "coding");
+    }
+
+    #[test]
+    fn test_a_critical_gauge_takes_priority_over_the_focus_posture() {
+        let env = TempEnv::new("focus_priority");
+        let config = AppConfig {
+            pomodoro_enabled: true,
+            ..AppConfig::default()
+        };
+        let mut app = app_with_calendar(&env, config, &dual_screen_layout());
+        app.handle_execution_result(PaletteExecutionResult::StartPomodoro);
+
+        app.pet_state
+            .set_stats(gremlin_core::PetStats::new(50.0, 2.0, 50.0));
+        assert_ne!(
+            app.current_animation_key(),
+            "focus",
+            "une jauge critique doit passer devant la posture studieuse"
+        );
+
+        app.pet_state
+            .set_stats(gremlin_core::PetStats::new(0.0, 0.0, 0.0));
+        assert_eq!(app.current_animation_key(), "dead");
+    }
+
+    #[test]
+    fn test_wayland_style_unavailability_disables_placement_without_faking_it() {
+        let env = TempEnv::new("wayland");
+        let mut app = GremlinApp::with_options(
+            PetState::new("Gizmo"),
+            AppConfig::default(),
+            AppOptions {
+                enable_watchers: false,
+                enable_system_integration: false,
+                paths: Some(env.paths.clone()),
+                wake_proxy: None,
+                calendar: Some(Box::new(gremlin_system::FixedCalendar::new(
+                    TEST_YEAR, TEST_MONTH, TEST_DAY,
+                ))),
+                desktop_layout: Some(Box::new(gremlin_system::UnavailableDesktopLayout {
+                    reason: String::from("Wayland ne publie pas la position des surfaces"),
+                })),
+            },
+        )
+        .expect("construction headless");
+
+        // Sans fenêtre ni topologie, aucun placement n'est tenté et rien ne
+        // panique : la fonctionnalité s'annonce simplement indisponible.
+        app.restore_placement();
+        app.begin_drop();
+        assert!(!app.desktop.placement_available());
+        assert!(app.desktop.unavailable_reason().is_some());
+    }
+
+    #[test]
+    fn test_the_numeric_shortcut_only_fires_in_the_productivity_group() {
+        let env = TempEnv::new("shortcut");
+        let mut app = app_with_calendar(&env, AppConfig::default(), &dual_screen_layout());
+
+        // À la racine, « 1 » reste du texte de recherche.
+        assert!(app.consumable_shortcut("1").is_none());
+
+        app.command_palette.enter_group(PaletteGroup::Productivity);
+        assert_eq!(app.consumable_shortcut("1"), Some(ConsumableKind::Coffee));
+        assert_eq!(app.consumable_shortcut("3"), Some(ConsumableKind::Snack));
+        assert!(app.consumable_shortcut("4").is_none());
+
+        // Dès qu'une recherche est en cours, le chiffre redevient du texte : un
+        // dépôt nommé « projet2 » doit rester trouvable.
+        app.command_palette.set_query("proj");
+        assert!(app.consumable_shortcut("2").is_none());
+    }
+
+    #[test]
+    fn test_a_calendar_failure_is_shown_and_never_erases_the_streak() {
+        let env = TempEnv::new("nocalendar");
+        let mut app = GremlinApp::with_options(
+            PetState::new("Gizmo"),
+            AppConfig::default(),
+            AppOptions {
+                enable_watchers: false,
+                enable_system_integration: false,
+                paths: Some(env.paths.clone()),
+                wake_proxy: None,
+                calendar: Some(Box::new(gremlin_system::UnavailableCalendar)),
+                desktop_layout: Some(Box::new(gremlin_system::FixedDesktopLayout::default())),
+            },
+        )
+        .expect("construction headless");
+
+        assert!(
+            app.ui
+                .last_observation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Date locale")),
+            "l'indisponibilité du calendrier doit être visible"
+        );
+
+        // Un seed arrivant sans date courante n'est pas appliqué, mais ne casse
+        // rien non plus.
+        app.dev_sender()
+            .send(DevSignal::CommitHistorySeeded {
+                repo_name: String::from("gremlin"),
+                repo_path: env.root.clone(),
+                stamps: vec![stamp_for(0)],
+                truncated: false,
+            })
+            .expect("envoi du seed");
+        let events = app.pump_events();
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, CoreEvent::StreakChanged { .. })));
+    }
+
     #[test]
     fn test_app_initialization_and_animation_sync() {
         let env = TempEnv::new("init");
@@ -2726,14 +4649,16 @@ mod tests {
             Some("happy")
         );
 
-        app.ui.is_dragging = true;
+        app.desktop
+            .gesture
+            .arm(Instant::now(), (32.0, 32.0), (0, 0));
         app.sync_animation_with_mood();
         assert_eq!(
             app.visuals.animation_controller.current_animation_name(),
             Some("dragged")
         );
 
-        app.ui.is_dragging = false;
+        app.desktop.gesture.cancel();
         app.sync_animation_with_mood();
         assert_eq!(
             app.visuals.animation_controller.current_animation_name(),
@@ -2868,6 +4793,9 @@ mod tests {
                 branch: String::from("main"),
                 commit_sha: Some("a".repeat(40)),
                 message: Some(String::from("feat: première pierre")),
+                // Les tests d'XP n'exercent pas la série : sans horodatage,
+                // le familier réagit mais aucun jour n'est attribué.
+                stamp: None,
             })
             .expect("envoi du signal");
 
@@ -2944,47 +4872,244 @@ mod tests {
         );
     }
 
+    /// Configuration déclarant des dépôts suivis.
+    fn config_tracking(repos: &[&Path]) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.watcher.tracked_repos = repos.iter().map(|repo| repo.to_path_buf()).collect();
+        config
+    }
+
+    /// Crée un dépôt Git minimal sur le disque.
+    fn make_repo(root: &Path, name: &str) -> PathBuf {
+        let repo = root.join(name);
+        std::fs::create_dir_all(repo.join(".git")).expect("dépôt de test");
+        normalize_path(&repo)
+    }
+
     #[test]
-    fn test_repo_discovery_and_removal_update_the_palette() {
+    fn test_repo_signals_enrich_the_declared_list() {
         let env = TempEnv::new("repos");
-        let mut app = headless_app(&env, AppConfig::default());
+        let repo = make_repo(&env.root, "alpha");
+        let mut app = headless_app(&env, config_tracking(&[&repo]));
         let sender = app.dev_sender();
+
+        // Le dépôt est listé parce qu'il est **déclaré**, sans qu'aucun signal
+        // n'ait eu à le créer.
+        assert_eq!(app.monitored_repos().len(), 1);
+        assert_eq!(app.monitored_repos()[0].path, repo);
+        // Aucune branche n'est inventée avant qu'un signal ne la renseigne.
+        assert_eq!(app.monitored_repos()[0].branch, None);
+        assert_eq!(app.monitored_repos()[0].branch_label(), "inconnue");
 
         sender
             .send(DevSignal::RepoDiscovered {
-                path: env.root.clone(),
+                path: repo.clone(),
                 repo_name: String::from("alpha"),
             })
             .expect("envoi");
         app.pump_events();
-
-        assert_eq!(app.monitored_repos().len(), 1);
-        // Aucune branche n'est inventée à la découverte.
-        assert_eq!(app.monitored_repos()[0].branch, None);
-        assert_eq!(app.monitored_repos()[0].branch_label(), "inconnue");
+        assert_eq!(app.monitored_repos().len(), 1, "aucune ligne en double");
+        assert_eq!(
+            app.monitored_repos()[0].status,
+            RepoTrackingStatus::Active,
+            "la découverte confirme la surveillance"
+        );
 
         // Un commit renseigne la branche réelle.
         sender
             .send(DevSignal::CommitCreated {
-                repo_path: env.root.clone(),
+                repo_path: repo,
                 repo_name: String::from("alpha"),
                 branch: String::from("develop"),
                 commit_sha: None,
                 message: None,
+                // Les tests d'XP n'exercent pas la série : sans horodatage,
+                // le familier réagit mais aucun jour n'est attribué.
+                stamp: None,
             })
             .expect("envoi");
         app.pump_events();
         assert_eq!(app.monitored_repos()[0].branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn test_repo_removed_signal_marks_missing_without_erasing_the_config() {
+        // Un disque externe débranché ne doit pas effacer la liste de dépôts de
+        // l'utilisateur : seul son geste explicite écrit dans la configuration.
+        let env = TempEnv::new("repo_vanished");
+        let repo = make_repo(&env.root, "alpha");
+        let mut app = headless_app(&env, config_tracking(&[&repo]));
+        let sender = app.dev_sender();
 
         sender
             .send(DevSignal::RepoRemoved {
-                path: env.root.clone(),
+                path: repo.clone(),
                 repo_name: String::from("alpha"),
             })
             .expect("envoi");
         app.pump_events();
 
+        assert_eq!(app.monitored_repos().len(), 1, "le dépôt reste listé");
+        assert_eq!(
+            app.monitored_repos()[0].status,
+            RepoTrackingStatus::Unavailable
+        );
+        assert!(app.monitored_repos()[0].issue.is_some());
+        assert_eq!(
+            app.config().watcher.tracked_repos,
+            vec![repo],
+            "la configuration ne doit pas avoir changé"
+        );
+    }
+
+    #[test]
+    fn test_two_repos_sharing_a_name_are_tracked_independently() {
+        // Le rapprochement se fait par chemin : deux `api` sous deux racines
+        // différentes sont deux lignes distinctes.
+        let env = TempEnv::new("repo_homonymes");
+        let first = make_repo(&env.root.join("client"), "api");
+        let second = make_repo(&env.root.join("serveur"), "api");
+        let mut app = headless_app(&env, config_tracking(&[&first, &second]));
+        let sender = app.dev_sender();
+
+        assert_eq!(app.monitored_repos().len(), 2);
+
+        sender
+            .send(DevSignal::CommitCreated {
+                repo_path: second.clone(),
+                repo_name: String::from("api"),
+                branch: String::from("develop"),
+                commit_sha: None,
+                message: None,
+                // Les tests d'XP n'exercent pas la série : sans horodatage,
+                // le familier réagit mais aucun jour n'est attribué.
+                stamp: None,
+            })
+            .expect("envoi");
+        app.pump_events();
+
+        let branch_of = |path: &Path| {
+            app.monitored_repos()
+                .iter()
+                .find(|repo| repo.path == path)
+                .and_then(|repo| repo.branch.clone())
+        };
+        assert_eq!(
+            branch_of(&first),
+            None,
+            "le voisin homonyme n'est pas touché"
+        );
+        assert_eq!(branch_of(&second).as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn test_add_tracked_repo_rejects_a_non_git_folder() {
+        let env = TempEnv::new("add_non_git");
+        let ordinary = env.root.join("dossier_ordinaire");
+        std::fs::create_dir_all(&ordinary).expect("dossier de test");
+        let mut app = headless_app(&env, AppConfig::default());
+
+        let error = app
+            .add_tracked_repo(&ordinary)
+            .expect_err("un dossier sans .git doit être refusé");
+        assert!(
+            matches!(error, AppError::Watcher(WatcherError::NotARepository(_))),
+            "erreur inattendue : {error}"
+        );
+        assert!(
+            app.config().watcher.tracked_repos.is_empty(),
+            "rien ne doit être écrit en configuration après un refus"
+        );
         assert!(app.monitored_repos().is_empty());
+    }
+
+    #[test]
+    fn test_add_tracked_repo_persists_and_lists_the_repo() {
+        let env = TempEnv::new("add_repo");
+        let repo = make_repo(&env.root, "alpha");
+        let mut app = headless_app(&env, AppConfig::default());
+
+        app.add_tracked_repo(&repo).expect("ajout du dépôt");
+
+        assert_eq!(app.config().watcher.tracked_repos, vec![repo.clone()]);
+        assert_eq!(app.monitored_repos().len(), 1);
+        assert_eq!(app.monitored_repos()[0].path, repo);
+        assert_eq!(app.monitored_repos()[0].name, "alpha");
+
+        // Sans watcher, la ligne ne se prétend pas surveillée.
+        assert_eq!(
+            app.monitored_repos()[0].status,
+            RepoTrackingStatus::Unavailable
+        );
+        assert!(app.monitored_repos()[0].issue.is_some());
+
+        // La configuration a bien été écrite sur le disque.
+        let reloaded = match PersistenceManager::load(app.paths()) {
+            Ok(crate::persistence::LoadOutcome::Loaded(data)) => data,
+            other => panic!("sauvegarde attendue, obtenu : {other:?}"),
+        };
+        assert_eq!(reloaded.config.watcher.tracked_repos, vec![repo]);
+    }
+
+    #[test]
+    fn test_add_tracked_repo_is_idempotent() {
+        let env = TempEnv::new("add_repo_twice");
+        let repo = make_repo(&env.root, "alpha");
+        let mut app = headless_app(&env, AppConfig::default());
+
+        app.add_tracked_repo(&repo).expect("premier ajout");
+        app.add_tracked_repo(&repo)
+            .expect("un doublon ne doit pas être une erreur");
+
+        assert_eq!(app.config().watcher.tracked_repos, vec![repo]);
+        assert_eq!(app.monitored_repos().len(), 1);
+    }
+
+    #[test]
+    fn test_add_tracked_repo_rejects_a_relative_path() {
+        let env = TempEnv::new("add_relative");
+        let mut app = headless_app(&env, AppConfig::default());
+
+        assert!(
+            app.add_tracked_repo(Path::new("projet_relatif")).is_err(),
+            "un chemin relatif ne désigne rien de stable pour un démon résident"
+        );
+        assert!(app.config().watcher.tracked_repos.is_empty());
+    }
+
+    #[test]
+    fn test_removing_a_tracked_repo_persists_the_removal() {
+        let env = TempEnv::new("remove_repo");
+        let first = make_repo(&env.root, "alpha");
+        let second = make_repo(&env.root, "beta");
+        let mut app = headless_app(&env, config_tracking(&[&first, &second]));
+
+        app.remove_tracked_repo(&first);
+
+        assert_eq!(app.config().watcher.tracked_repos, vec![second.clone()]);
+        assert_eq!(app.monitored_repos().len(), 1);
+        assert_eq!(app.monitored_repos()[0].path, second);
+
+        // Un retrait déjà effectué ne fait rien de plus, et ne panique pas.
+        app.remove_tracked_repo(&first);
+        assert_eq!(app.config().watcher.tracked_repos, vec![second]);
+    }
+
+    #[test]
+    fn test_repos_group_is_reachable_without_any_tracked_repo() {
+        // L'état vide doit avoir un endroit où s'expliquer : le groupe reste
+        // visible à la racine grâce à ses actions permanentes.
+        let env = TempEnv::new("repos_vides");
+        let app = headless_app(&env, AppConfig::default());
+
+        assert!(app.monitored_repos().is_empty());
+        let expected = crate::ui::PaletteAction::EnterGroup(crate::ui::PaletteGroup::Repos);
+        assert!(
+            app.command_palette()
+                .filtered_items()
+                .any(|item| item.action == expected),
+            "le groupe des dépôts doit rester accessible sans aucun dépôt"
+        );
     }
 
     #[test]
@@ -3003,7 +5128,7 @@ mod tests {
     fn test_save_roundtrip_through_the_application() {
         let env = TempEnv::new("save");
         let mut app = headless_app(&env, AppConfig::default());
-        app.handle_execution_result(PaletteExecutionResult::FeedPet);
+        app.handle_execution_result(PaletteExecutionResult::UseConsumable(ConsumableKind::Snack));
         app.handle_execution_result(PaletteExecutionResult::SaveNow);
 
         assert!(
@@ -3022,9 +5147,9 @@ mod tests {
             .set_stats(gremlin_core::PetStats::new(0.0, 0.0, 0.0));
 
         for action in [
-            PaletteExecutionResult::FeedPet,
+            PaletteExecutionResult::UseConsumable(ConsumableKind::Snack),
             PaletteExecutionResult::PetGremlin,
-            PaletteExecutionResult::HealPet,
+            PaletteExecutionResult::UseConsumable(ConsumableKind::DebugPotion),
             PaletteExecutionResult::ToggleSleep,
         ] {
             app.handle_execution_result(action);
@@ -3078,13 +5203,15 @@ mod tests {
         let env = TempEnv::new("pacing");
         let mut app = headless_app(&env, AppConfig::default());
 
-        app.ui.is_dragging = true;
+        app.desktop
+            .gesture
+            .arm(Instant::now(), (32.0, 32.0), (0, 0));
         assert_eq!(app.next_wake_delay(), DRAG_FRAME_INTERVAL);
 
         // Panneau ouvert : sa cadence resserre celle du familier sans la
         // remplacer. Au repos, le familier demanderait une seconde entière ; le
         // curseur de saisie exige davantage.
-        app.ui.is_dragging = false;
+        app.desktop.gesture.cancel();
         app.ui.is_palette_open = true;
         assert_eq!(app.next_wake_delay(), PALETTE_FRAME_INTERVAL);
 

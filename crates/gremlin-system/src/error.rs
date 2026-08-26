@@ -51,6 +51,25 @@ pub enum SystemError {
     #[error("échec de lecture de l'inactivité : {0}")]
     ActivityReadFailed(String),
 
+    /// La date civile locale n'a pas pu être obtenue.
+    ///
+    /// Remontée telle quelle plutôt que repliée sur UTC : une date fausse
+    /// décalerait silencieusement les séries de productivité d'une journée.
+    #[error("date locale indisponible : {0}")]
+    CalendarUnavailable(String),
+
+    /// La topologie des écrans n'est pas interrogeable sur cette plateforme.
+    ///
+    /// C'est le cas de Wayland, dont le protocole ne donne à un client ordinaire
+    /// ni sa position globale ni celle des autres surfaces. L'interface doit le
+    /// dire au lieu de proposer un magnétisme qui ne s'appliquerait pas.
+    #[error("topologie des écrans indisponible : {0}")]
+    DesktopLayoutUnavailable(String),
+
+    /// La topologie existe, mais sa lecture a échoué.
+    #[error("échec de lecture de la topologie des écrans : {0}")]
+    DesktopLayoutReadFailed(String),
+
     /// Erreur d'I/O système.
     #[error("erreur I/O système : {0}")]
     Io(#[from] std::io::Error),

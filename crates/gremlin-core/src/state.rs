@@ -6,11 +6,13 @@
 //! bornées et finies, et `mood` reste toujours cohérente avec `stats`.
 
 use crate::action::ActionKind;
+use crate::calendar::CivilDate;
 use crate::config::{CoreConfig, MAX_CATCHUP_DURATION_SECS};
 use crate::error::CoreError;
 use crate::events::CoreEvent;
 use crate::focus::{ActivityState, FocusTracker};
 use crate::mood::PetMood;
+use crate::productivity::{ConsumableKind, PauseReason, ProductivityState};
 use crate::progression::PetProgression;
 use crate::stats::PetStats;
 use crate::tooling::{BreakReason, BuildSummary, RepositoryId, TestSummary, ToolingSession};
@@ -43,6 +45,12 @@ pub struct PetState {
     config: CoreConfig,
     is_sleeping: bool,
     coding_timer_secs: f32,
+    /// Séries de commits, inventaire et minuteur de concentration.
+    ///
+    /// Regroupés dans un seul champ : ces trois mécaniques dépendent toutes du
+    /// jour courant injecté, et les disperser dans l'agrégat racine aurait
+    /// ajouté une dizaine de champs corrélés.
+    productivity: ProductivityState,
     /// Cooldowns et transitions propres au processus courant.
     #[serde(skip)]
     tooling_session: ToolingSession,
@@ -62,6 +70,7 @@ impl Default for PetState {
             config: CoreConfig::default(),
             is_sleeping: false,
             coding_timer_secs: 0.0,
+            productivity: ProductivityState::default(),
             tooling_session: ToolingSession::default(),
             focus_tracker: FocusTracker::default(),
         }
@@ -487,6 +496,16 @@ impl PetState {
 
         self.is_sleeping = true;
         let mut events = vec![CoreEvent::FellAsleep];
+        // Un familier endormi ne mesure pas un bloc de concentration : le
+        // minuteur est suspendu plutôt que laissé à courir dans le vide.
+        // L'échec est attendu quand aucun cycle n'est engagé.
+        if let Ok(paused) = self
+            .productivity
+            .pomodoro_mut()
+            .pause(PauseReason::PetAsleep)
+        {
+            events.extend(paused);
+        }
         self.reevaluate_mood(&mut events);
         Ok(events)
     }
@@ -551,6 +570,147 @@ impl PetState {
         ])
     }
 
+    /// Séries, inventaire et minuteur de concentration, en lecture seule.
+    #[must_use]
+    pub const fn productivity(&self) -> &ProductivityState {
+        &self.productivity
+    }
+
+    /// Enregistre le jour civil d'un commit observé en direct.
+    ///
+    /// Le gain d'XP et la réaction émotionnelle restent l'affaire de
+    /// [`Self::handle_commit`] : cette méthode ne traite que la série et la
+    /// récompense quotidienne. Les deux chemins sont séparés parce qu'un commit
+    /// peut être détecté sans horodatage fiable — le familier réagit alors sans
+    /// que la série ne bouge.
+    pub fn record_commit_activity(
+        &mut self,
+        commit_day: CivilDate,
+        today: CivilDate,
+    ) -> Vec<CoreEvent> {
+        self.productivity
+            .record_commit_day(commit_day, today, &self.config)
+    }
+
+    /// Réconcilie un historique de jours de commits lu dans les reflogs.
+    ///
+    /// Aucun XP n'est rejoué : un historique prouve des journées de travail, pas
+    /// des commits à récompenser une seconde fois.
+    pub fn reconcile_commit_history(
+        &mut self,
+        days: impl IntoIterator<Item = CivilDate>,
+        today: CivilDate,
+    ) -> Vec<CoreEvent> {
+        self.productivity
+            .reconcile_commit_history(days, today, &self.config)
+    }
+
+    /// Recalcule la série visible pour un nouveau jour courant.
+    ///
+    /// Appelée au passage de minuit et après une reprise de la machine.
+    pub fn refresh_current_day(&mut self, today: CivilDate) -> Vec<CoreEvent> {
+        self.productivity.refresh_for_day(today)
+    }
+
+    /// Consomme un objet de l'inventaire et applique son effet.
+    ///
+    /// La transaction est atomique et ordonnée : état validé, effet réel
+    /// calculé, stock décrémenté, jauges modifiées, humeur réévaluée. Un refus
+    /// intervient donc toujours **avant** toute mutation — le stock reste
+    /// intact.
+    ///
+    /// # Errors
+    /// Renvoie `CoreError::PetIsDead` si le familier est décédé,
+    /// `CoreError::InvalidActionForMood` s'il dort,
+    /// `CoreError::ConsumableOutOfStock` si le stock est vide et
+    /// `CoreError::ConsumableWithoutEffect` si les jauges concernées sont déjà
+    /// pleines.
+    pub fn use_consumable(&mut self, kind: ConsumableKind) -> Result<Vec<CoreEvent>, CoreError> {
+        self.ensure_actionable(ActionKind::UseConsumable)?;
+
+        if self.productivity.inventory().quantity(kind) == 0 {
+            return Err(CoreError::ConsumableOutOfStock(kind));
+        }
+
+        let applied = kind.potential_effect(self.stats, &self.config.inventory);
+        if !applied.is_meaningful() {
+            return Err(CoreError::ConsumableWithoutEffect(kind));
+        }
+
+        if !self.productivity.take_consumable(kind) {
+            return Err(CoreError::ConsumableOutOfStock(kind));
+        }
+
+        self.stats.rest(applied.energy);
+        self.stats.feed(applied.satiety);
+        self.stats.pet(applied.happiness);
+
+        let mut events = vec![CoreEvent::ConsumableUsed {
+            kind,
+            remaining: self.productivity.inventory().quantity(kind),
+            applied,
+            stats: self.stats,
+        }];
+        self.reevaluate_mood(&mut events);
+        Ok(events)
+    }
+
+    /// Démarre un bloc de concentration.
+    ///
+    /// # Errors
+    /// Renvoie `CoreError::PetIsDead` si le familier est décédé, ou
+    /// `CoreError::InvalidPomodoroTransition` si un cycle est déjà engagé.
+    pub fn start_pomodoro(&mut self) -> Result<Vec<CoreEvent>, CoreError> {
+        self.ensure_not_dead(ActionKind::UseConsumable)?;
+        self.productivity
+            .pomodoro_mut()
+            .start(&self.config.pomodoro)
+    }
+
+    /// Suspend le minuteur de concentration.
+    ///
+    /// # Errors
+    /// Renvoie `CoreError::InvalidPomodoroTransition` si aucun cycle n'est engagé.
+    pub fn pause_pomodoro(&mut self, reason: PauseReason) -> Result<Vec<CoreEvent>, CoreError> {
+        self.productivity.pomodoro_mut().pause(reason)
+    }
+
+    /// Reprend le minuteur de concentration.
+    ///
+    /// # Errors
+    /// Renvoie `CoreError::PetIsDead` si le familier est décédé, ou
+    /// `CoreError::InvalidPomodoroTransition` si le minuteur n'est pas en pause.
+    pub fn resume_pomodoro(&mut self) -> Result<Vec<CoreEvent>, CoreError> {
+        self.ensure_not_dead(ActionKind::UseConsumable)?;
+        self.productivity.pomodoro_mut().resume()
+    }
+
+    /// Arrête le cycle de concentration. Idempotent.
+    pub fn stop_pomodoro(&mut self) -> Vec<CoreEvent> {
+        self.productivity.pomodoro_mut().stop()
+    }
+
+    /// Passe la pause en cours et prépare le bloc de travail suivant.
+    ///
+    /// # Errors
+    /// Renvoie `CoreError::InvalidPomodoroTransition` si la phase courante est
+    /// un bloc de travail : un bloc non accompli ne se comptabilise pas.
+    pub fn skip_pomodoro_break(&mut self) -> Result<Vec<CoreEvent>, CoreError> {
+        self.productivity
+            .pomodoro_mut()
+            .skip_break(&self.config.pomodoro)
+    }
+
+    /// Fait avancer le minuteur du temps réellement vécu par le processus.
+    ///
+    /// Volontairement distincte de [`Self::tick`] : le rattrapage hors-ligne
+    /// simule la décroissance des jauges pendant une absence, alors que le
+    /// minuteur ne doit progresser que sur du temps réellement mesuré.
+    pub fn advance_live_productivity(&mut self, elapsed: Duration) -> Vec<CoreEvent> {
+        let config = self.config.pomodoro;
+        self.productivity.pomodoro_mut().advance(elapsed, &config)
+    }
+
     /// Restaure tous les invariants de l'agrégat.
     ///
     /// Appelée après toute désérialisation : une sauvegarde éditée à la main
@@ -563,6 +723,7 @@ impl PetState {
         self.config.normalize();
         self.stats.normalize();
         self.progression.normalize();
+        self.productivity.normalize(&self.config);
 
         self.coding_timer_secs = if self.coding_timer_secs.is_finite() {
             self.coding_timer_secs
@@ -600,6 +761,11 @@ impl PetState {
         }
 
         state.normalize();
+        // Un minuteur laissé « en cours » dans le fichier n'a mesuré aucun
+        // temps pendant l'arrêt du processus. La conversion vit ici et non dans
+        // `normalize`, qui est aussi appelée par `set_config` : elle y
+        // suspendrait une session légitimement en cours.
+        state.productivity.mark_restarted();
         Ok(state)
     }
 

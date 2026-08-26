@@ -2,7 +2,7 @@
 
 Ce document décrit les étapes d'implémentation incrémentales pour développer **Gremlin**, du moteur autonome jusqu'aux binaires finaux distribuables.
 
-Les phases 1 à 7 sont livrées, ainsi que la phase 6bis consacrée au panneau de paramètres et à son accessibilité. Les phases 8 à 10 constituent la feuille de route active pour étendre les interactions de bureau, la personnalisation et la distribution certifiée.
+Les phases 1 à 8 sont livrées, ainsi que la phase 6bis consacrée au panneau de paramètres et à son accessibilité. Les phases 9 et 10 constituent la feuille de route active pour la personnalisation communautaire et la distribution certifiée.
 
 ---
 
@@ -37,19 +37,35 @@ Les phases 1 à 7 sont livrées, ainsi que la phase 6bis consacrée au panneau d
 
 ---
 
-## Phase 3 : Surveillance passive des dépôts (*Zero-Config Watcher*) — livrée
+## Phase 3 : Surveillance passive des dépôts — livrée, puis révisée
 
-**Objectif :** Rendre Gremlin réactif aux actions Git locales sans aucune configuration requise de l'utilisateur.
+**Objectif :** Rendre Gremlin réactif aux actions Git locales sans hook manuel ni port réseau.
 
 * **Tâches :**
-  * [x] Coder le module `scanner` avec `directories` et `walkdir` pour identifier les dépôts existants, avec profondeur bornée et exclusion des arborescences lourdes.
+  * [x] ~~Coder le module `scanner` avec `directories` et `walkdir` pour identifier les dépôts existants, avec profondeur bornée et exclusion des arborescences lourdes.~~ **Retiré** — voir la révision ci-dessous.
   * [x] Intégrer `notify` pour surveiller `.git/logs/HEAD` et `.git/refs/heads/` en arrière-plan.
   * [x] Implémenter le *debouncing* pour fusionner les rafales d'écritures de fichiers.
   * [x] Connecter les événements détectés au moteur de jeu via des canaux bornés.
-  * [x] Ajouter la détection à chaud des nouveaux dépôts (`git init`, `git clone`) et de leur disparition.
+  * [x] ~~Ajouter la détection à chaud des nouveaux dépôts (`git init`, `git clone`).~~ **Retirée** ; la disparition d'un dépôt suivi, elle, reste détectée.
   * [x] Distinguer un vrai commit d'un `checkout` via l'action du reflog, pour ne pas attribuer d'XP à un simple changement de branche.
   * [x] Remonter les incidents de surveillance (enregistrement refusé, événements perdus) à l'application au lieu de les laisser dans les journaux.
 * **Livrable :** Gremlin réagit en direct dès qu'un commit est réalisé sur la machine.
+
+### Révision : de la découverte automatique aux dépôts explicites
+
+La livraison initiale devinait les racines de développement puis les parcourait
+en arrière-plan. Trois défauts l'ont fait retirer : une empreinte d'entrées-sorties
+imprévisible sur une machine chargée de projets, une pollution de la liste par des
+dépôts archivés ou clonés en dépendance, et une perte de souveraineté — c'est au
+développeur de déclarer les espaces de travail qu'il confie à son Gremlin.
+
+* **Tâches :**
+  * [x] Remplacer `auto_discovery` / `custom_roots` / `max_scan_depth` par `tracked_repos` dans `WatcherConfig`, avec plafond, déduplication et rejet des chemins relatifs.
+  * [x] Supprimer le module `scanner`, les racines de découverte et la détection à chaud du worker.
+  * [x] Monter les dépôts déclarés au démarrage, un échec isolé n'empêchant pas les autres.
+  * [x] Gérer les dépôts depuis la palette : saisie de chemin, sélecteur de dossier natif, dossier courant, corbeille par ligne, état vide pédagogique.
+  * [x] Ne jamais retirer un dépôt de la configuration sans geste de l'utilisateur : un dépôt disparu du disque est marqué indisponible, pas effacé.
+* **Livrable :** Gremlin ne surveille que ce qu'on lui confie, et n'ouvre aucun répertoire de son propre chef.
 
 ---
 
@@ -63,7 +79,9 @@ Les phases 1 à 7 sont livrées, ainsi que la phase 6bis consacrée au panneau d
   * [x] Créer l'observateur du dossier utilisateur pour recharger les mods à chaud sans redémarrage.
 * **Livrable :** Gremlin peut équiper des accessoires superposés sur n'importe lequel de ses états émotionnels.
 
-> **Convention arrêtée :** les sprites sont fournis pré-positionnés sur une toile de 64×64. Les ancres du manifest décrivent la morphologie et les origines d'effets mais ne translatent aucun calque ; seuls les décalages par humeur déplacent les accessoires.
+> **Convention actuelle :** les sprites restent fournis sur une toile de 64×64, avec une ancre source compatible avec les anciens packs. Le compositeur aligne cette ancre sur la morphologie du skin et applique ses corrections de pose ; les tenues sont découpées sur la silhouette alpha courante.
+>
+> **Catalogue intégré :** les dix accessoires officiels sont des PNG embarqués dans l'exécutable, déclinés pour les trois morphologies. Le skin choisit sa famille avec `accessory_style` ; une variante absente ou vide retombe sur les frames communes, ce qui laisse les mods existants valides sans migration.
 
 ---
 
@@ -140,17 +158,27 @@ Les phases 1 à 7 sont livrées, ainsi que la phase 6bis consacrée au panneau d
 
 ---
 
-## Phase 8 : Interactions bureau & Bien-être (*Desk Companion & Productivity*) — planifiée
+## Phase 8 : Interactions bureau & Bien-être (*Desk Companion & Productivity*) — livrée
 
 **Objectif :** Transformer Gremlin en un véritable familier de bureau interactif favorisant la productivité et les pauses saines.
 
 * **Tâches :**
-  * [ ] Implémenter les interactions directes à la souris : caresses (clics affectueux), physique de gravité douce lors du lâcher après un déplacement.
-  * [ ] Mettre en place un système de séries de productivité (*Streaks* de jours consécutifs de commits) avec déblocage de cosmétiques rares.
-  * [ ] Créer un inventaire virtuel et des consommables (café pour remonter l'énergie, potion de debug, collation) activables par raccourci ou glisser-déposer.
-  * [ ] Ajouter un mode Minuteur de concentration (*Pomodoro*) optionnel avec posture studieuse de Gremlin et rappels discrets d'étirement et d'hydratation.
-  * [ ] Développer le magnétisme d'écran (ancrage fluide aux coins de l'écran ou au-dessus de la barre des tâches) et support multi-moniteurs robuste.
+  * [x] Implémenter les interactions directes à la souris : caresses (clics affectueux), physique de gravité douce lors du lâcher après un déplacement.
+  * [x] Mettre en place un système de séries de productivité (*Streaks* de jours consécutifs de commits) avec déblocage de cosmétiques rares.
+  * [x] Créer un inventaire virtuel et des consommables (café pour remonter l'énergie, potion de debug, collation) activables par raccourci ou glisser-déposer.
+  * [x] Ajouter un mode Minuteur de concentration (*Pomodoro*) optionnel avec posture studieuse de Gremlin et rappels discrets d'étirement et d'hydratation.
+  * [x] Développer le magnétisme d'écran (ancrage fluide aux coins de l'écran ou au-dessus de la barre des tâches) et support multi-moniteurs robuste.
 * **Livrable :** interactions directes avec le familier, gestion de séries et fonctionnalités de bien-être développeur.
+
+> **Écart assumé — Wayland.** Un client Wayland ordinaire ne connaît ni sa position globale, ni celle des autres surfaces, et ne choisit pas librement l'emplacement de sa fenêtre. Le magnétisme y est annoncé **indisponible** et ses réglages sont désactivés, plutôt que d'afficher une bascule sans effet. Windows (`rcWork`), macOS (`visibleFrame`) et X11 (`_NET_WORKAREA`) utilisent leur zone de travail réelle ; un gestionnaire X11 qui ne publie pas la propriété obtient un repli explicitement marqué sur les limites du moniteur.
+
+> **Écart assumé — glisser-déposer.** `winit` ne fournit pas de glisser-déposer de **données applicatives** entre deux fenêtres ; l'implémenter aurait exigé trois piles natives distinctes, une capture globale de pointeur et des autorisations supplémentaires sur certains bureaux. Le geste retenu est donc interne au panneau : de la ligne d'inventaire vers l'aperçu vivant du familier, deux zones de la même fenêtre. `Entrée` et les raccourcis `1`/`2`/`3` produisent exactement la même action, et aucun raccourci global ni hook clavier n'est installé.
+
+> **Écart assumé — dépendance de dates.** Compter des jours civils locaux suppose de connaître le décalage UTC en vigueur à l'instant présent, heure d'été comprise. Cette règle vit dans la base IANA et change plusieurs fois par an par décision politique ; l'approximer décalerait les séries d'une journée entière à chaque changement d'heure. `jiff` est donc utilisé, confiné à `gremlin-system::calendar` et réduit aux features de lecture du fuseau système.
+
+> **Correction de cadrage — les séries ne peuvent pas dépendre des seuls événements vus en direct.** Le watcher établit volontairement une baseline au démarrage : un commit préexistant ne donne pas d'XP. Fonder les séries sur ce seul flux aurait cassé une série à chaque arrêt de Gremlin pendant un week-end de travail. Les jours sont donc reconstitués depuis le journal `.git/logs/HEAD`, lu de manière bornée au rattachement du dépôt — sans jamais rejouer l'XP des commits passés.
+
+> **Reste à faire :** la passe manuelle multi-écrans et lecteur d'écran. La géométrie est couverte par des topologies synthétiques et l'arbre d'accessibilité par des tests de forme, mais ni le comportement réel d'un débranchement de moniteur ni ce qu'une voix de synthèse fait du groupe Productivité ne sont automatisables. Le protocole est décrit à la section « Vérification manuelle » du plan de phase.
 
 ---
 

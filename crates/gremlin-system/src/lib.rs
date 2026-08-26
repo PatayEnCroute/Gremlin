@@ -14,6 +14,8 @@
 
 pub mod activity;
 pub mod autostart;
+pub mod calendar;
+pub mod desktop_layout;
 pub mod error;
 pub mod paths;
 pub mod platform;
@@ -26,6 +28,14 @@ mod test_support;
 
 pub use activity::{ActivityEvent, ActivityMonitor, ActivitySample};
 pub use autostart::AutostartManager;
+pub use calendar::{
+    FixedCalendar, LocalCalendar, LocalDateParts, SystemLocalCalendar, UnavailableCalendar,
+};
+pub use desktop_layout::{
+    normalize_layout, DesktopLayoutProvider, DesktopLayoutState, DisplayArea, DisplayFingerprint,
+    FixedDesktopLayout, MonitorProbe, PhysicalRect, SystemDesktopLayout, UnavailableDesktopLayout,
+    WorkAreaAccuracy, MAX_DISPLAYS, MAX_DISPLAY_NAME_CHARS,
+};
 pub use error::SystemError;
 pub use paths::AppPaths;
 pub use platform::{

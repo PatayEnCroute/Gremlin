@@ -157,6 +157,17 @@ impl PanelDp {
     pub const CAPTION_TEXT_HEIGHT: i32 = 11;
     /// Épaisseur du liseré d'accent marquant la ligne sélectionnée.
     pub const SELECTION_MARKER_WIDTH: i32 = 3;
+    /// Côté de la vignette d'accessoire dessinée dans une ligne de garde-robe.
+    pub const ROW_THUMBNAIL_SIZE: i32 = 28;
+    /// Espace entre la vignette et le texte de la ligne.
+    pub const ROW_THUMBNAIL_GAP: i32 = 7;
+    /// Largeur de la zone cliquable de l'action secondaire d'une ligne.
+    ///
+    /// Prise sur la marge droite du volet gauche, juste avant l'ascenseur. Elle
+    /// couvre toute la hauteur de la ligne pour rester atteignable à la souris.
+    pub const ROW_ACTION_WIDTH: i32 = 30;
+    /// Côté du pictogramme dessiné au centre de cette zone.
+    pub const ROW_ACTION_ICON: i32 = 12;
     /// Marge intérieure horizontale d'un badge, de chaque côté du texte.
     pub const BADGE_PADDING_X: i32 = 6;
     /// Marge intérieure verticale d'un badge.
@@ -318,6 +329,56 @@ impl UiMetrics {
         let row = ((y - top) / row_height) as usize;
 
         (row < visible_rows).then_some(row)
+    }
+
+    /// Abscisse du bord gauche de la zone d'action secondaire d'une ligne.
+    ///
+    /// Source de vérité **unique**, partagée par le dessin et le test de survol :
+    /// dupliquer ce calcul ferait retirer un dépôt sur lequel l'utilisateur n'a
+    /// pas cliqué dès que les deux formules divergeraient d'un pixel.
+    #[must_use]
+    pub fn row_action_left(&self) -> i32 {
+        self.px(PanelDp::LEFT_PANE_WIDTH)
+            - self.px(PanelDp::SCROLLBAR_WIDTH + 4)
+            - self.px(PanelDp::ROW_ACTION_WIDTH)
+    }
+
+    /// Indique si le point `(x, y)` tombe dans la zone d'action de la ligne visible.
+    ///
+    /// Renvoie l'indice de ligne, comme [`Self::row_at`], mais seulement pour la
+    /// bande réservée au bouton.
+    #[must_use]
+    pub fn row_action_at(&self, x: i32, y: i32, visible_rows: usize) -> Option<usize> {
+        let row = self.row_at(x, y, visible_rows)?;
+        let left = self.row_action_left();
+        let right = left + self.px(PanelDp::ROW_ACTION_WIDTH);
+        (x >= left && x < right).then_some(row)
+    }
+
+    /// Rectangle de la zone d'aperçu du familier : `(x, y, côté)`.
+    ///
+    /// Source de vérité **unique**, partagée par le dessin et par la cible du
+    /// glisser d'un consommable. Dupliquer ce calcul ferait relâcher l'objet
+    /// « à côté » du familier dès que les deux formules divergeraient d'un pixel.
+    #[must_use]
+    pub fn preview_rect(&self) -> (i32, i32, i32) {
+        let pane_x = self.px(PanelDp::LEFT_PANE_WIDTH) + self.px(PanelDp::PANE_PADDING);
+        let pane_width = self.px(PanelDp::WIDTH)
+            - self.px(PanelDp::LEFT_PANE_WIDTH)
+            - 2 * self.px(PanelDp::PANE_PADDING);
+        let side = self.px(PanelDp::PREVIEW_AREA);
+        (
+            pane_x + (pane_width - side) / 2,
+            self.px(PanelDp::SEARCH_BAR_HEIGHT + 14),
+            side,
+        )
+    }
+
+    /// Indique que le point `(x, y)` tombe dans la zone d'aperçu du familier.
+    #[must_use]
+    pub fn is_over_preview(&self, x: i32, y: i32) -> bool {
+        let (left, top, side) = self.preview_rect();
+        x >= left && x < left + side && y >= top && y < top + side
     }
 }
 
@@ -499,6 +560,57 @@ mod tests {
             None
         );
         assert_eq!(metrics.row_at(-1, list_top + 1, rows), None);
+    }
+
+    #[test]
+    fn test_row_action_zone_stays_inside_the_left_pane() {
+        // La zone d'action est prise sur la marge droite du volet gauche : elle
+        // ne doit ni mordre sur l'ascenseur, ni déborder dans l'inspecteur.
+        for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            for size in [TextSize::Compact, TextSize::Normal, TextSize::Large] {
+                let metrics = UiMetrics::for_display(scale, size);
+                let left = metrics.row_action_left();
+                let right = left + metrics.px(PanelDp::ROW_ACTION_WIDTH);
+
+                assert!(left > 0, "zone d'action hors du volet à l'échelle {scale}");
+                assert!(
+                    right
+                        <= metrics.px(PanelDp::LEFT_PANE_WIDTH)
+                            - metrics.px(PanelDp::SCROLLBAR_WIDTH),
+                    "zone d'action recouvrant l'ascenseur à l'échelle {scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_row_action_hit_test_agrees_with_row_hit_test() {
+        // Même source de vérité géométrique : un point dans la zone d'action est
+        // forcément dans une ligne, et désigne la même ligne.
+        let metrics = UiMetrics::for_display(1.0, TextSize::Normal);
+        let rows = metrics.visible_rows();
+        let left = metrics.row_action_left();
+        let width = metrics.px(PanelDp::ROW_ACTION_WIDTH);
+
+        for row in 0..rows {
+            let middle_y = metrics.row_top(row) + metrics.px(PanelDp::ROW_HEIGHT) / 2;
+
+            assert_eq!(metrics.row_action_at(left, middle_y, rows), Some(row));
+            assert_eq!(
+                metrics.row_action_at(left + width - 1, middle_y, rows),
+                Some(row)
+            );
+            // Juste à gauche de la zone : la ligne répond, le bouton non.
+            assert_eq!(metrics.row_at(left - 1, middle_y, rows), Some(row));
+            assert_eq!(metrics.row_action_at(left - 1, middle_y, rows), None);
+        }
+    }
+
+    #[test]
+    fn test_row_action_hit_test_does_not_overflow_on_absurd_coordinates() {
+        let metrics = UiMetrics::for_display(1.0, TextSize::Normal);
+        let _ = metrics.row_action_at(i32::MAX, i32::MAX, usize::MAX);
+        let _ = metrics.row_action_at(i32::MIN, i32::MIN, 0);
     }
 
     #[test]

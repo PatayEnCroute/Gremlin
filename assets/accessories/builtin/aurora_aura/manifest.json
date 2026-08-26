@@ -1,0 +1,24 @@
+{
+  "id": "aurora_aura",
+  "name": "Aura aurorale",
+  "author": "Gremlin Studio",
+  "version": "1.0.0",
+  "category": "Aura",
+  "description": "Récompense de trente jours de commits consécutifs.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "aurora_aura_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 0,
+    "y": 0
+  },
+  "variants": {
+    "baby": {},
+    "evolved": {}
+  },
+  "clip_to_body": false
+}

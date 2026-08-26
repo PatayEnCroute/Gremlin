@@ -5,12 +5,16 @@
 //! l'absence d'un signal pendant une période de calme. Une machine chargée ralentit
 //! les tests, elle ne les fait pas échouer.
 
+// Un test peut paniquer : c'est même sa façon d'échouer. La règle du workspace
+// qui bannit `expect` vise le code de production, pas les assertions d'une suite.
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use common::{
     assert_no_signal, create_dir, init_repo, ref_file, remove_tree, simulate_commit, test_config,
-    wait_for, wait_for_all, wait_for_discoveries, wait_for_discovery, write_file, write_reflog,
-    TempDirGuard,
+    tracked_config, wait_for, wait_for_all, wait_for_discoveries, wait_for_discovery, write_file,
+    write_reflog, TempDirGuard,
 };
 use crossbeam_channel::unbounded;
 use gremlin_watcher::{DevSignal, RepoWatcher, WatcherConfig, WatcherStatus};
@@ -33,10 +37,12 @@ fn watch_repo(watcher: &mut RepoWatcher, repo: &std::path::Path) {
     }
 }
 
-/// Raccourci : enregistre une racine de projets ou fait échouer le test.
-fn watch_root(watcher: &mut RepoWatcher, root: &std::path::Path) {
-    if let Err(e) = watcher.watch_workspace_root(root) {
-        panic!("la racine {} doit être surveillée : {e}", root.display());
+/// Raccourci : monte les dépôts déclarés, en exigeant qu'aucun n'échoue.
+fn arm(watcher: &mut RepoWatcher) {
+    match watcher.arm_tracked_repos() {
+        Ok(failures) if failures.is_empty() => {}
+        Ok(failures) => panic!("dépôts configurés non montés : {failures:?}"),
+        Err(e) => panic!("l'armement des dépôts configurés doit réussir : {e}"),
     }
 }
 
@@ -268,49 +274,18 @@ fn test_interleaved_repositories_are_debounced_independently() {
 }
 
 #[test]
-fn test_hot_discovery_of_new_repo() {
-    let guard = TempDirGuard::new("hot_discovery");
-    let workspace_root = guard.path().to_path_buf();
-
-    let (tx, rx) = unbounded();
-    let mut watcher = new_watcher(tx, &test_config(100));
-    // L'enregistrement est confirmé par le worker : aucune temporisation nécessaire.
-    watch_root(&mut watcher, &workspace_root);
-
-    let new_repo = workspace_root.join("super_project");
-    create_dir(&new_repo);
-    init_repo(&new_repo, "main", &"7".repeat(40));
-
-    let signal = wait_for(
-        &rx,
-        "RepoDiscovered à chaud",
-        |signal| matches!(signal, DevSignal::RepoDiscovered { path, .. } if *path == new_repo),
-    );
-    match signal {
-        DevSignal::RepoDiscovered { repo_name, .. } => assert_eq!(repo_name, "super_project"),
-        other => panic!("signal inattendu : {other:?}"),
-    }
-
-    // Le dépôt découvert à chaud est bien suivi par la source de vérité unique.
-    match watcher.watched_repos() {
-        Ok(repos) => assert!(repos.contains(&new_repo)),
-        Err(e) => panic!("interrogation du worker impossible : {e}"),
-    }
-}
-
-#[test]
-fn test_git_clone_progressive_creation_emits_no_fake_commit() {
+fn test_adding_a_repo_being_cloned_emits_no_fake_commit() {
     let guard = TempDirGuard::new("clone_detect");
-    let workspace_root = guard.path().to_path_buf();
+
+    // `git clone` : le dossier apparaît d'abord, puis `.git`, puis HEAD, puis la
+    // ref. L'utilisateur peut déclarer le dépôt à n'importe quel moment de cette
+    // séquence — ici au plus tôt, sur un `.git` encore vide.
+    let cloned = guard.child("cloned_project");
+    create_dir(&cloned.join(".git"));
 
     let (tx, rx) = unbounded();
     let mut watcher = new_watcher(tx, &test_config(100));
-    watch_root(&mut watcher, &workspace_root);
-
-    // `git clone` : le dossier apparaît d'abord, puis `.git`, puis HEAD, puis la ref.
-    let cloned = workspace_root.join("cloned_project");
-    create_dir(&cloned);
-    create_dir(&cloned.join(".git"));
+    watch_repo(&mut watcher, &cloned);
     wait_for_discovery(&rx, &cloned);
 
     let sha = "c".repeat(40);
@@ -403,113 +378,101 @@ fn test_unwatch_explicitly_watched_repo() {
 }
 
 #[test]
-fn test_unwatch_auto_discovered_repo() {
-    let guard = TempDirGuard::new("unwatch_discovered");
-    let workspace_root = guard.path().to_path_buf();
+fn test_unwatch_tracked_repo() {
+    // Un dépôt monté depuis la configuration se retire exactement comme un dépôt
+    // ajouté à la volée : c'est la même liste, pas deux origines distinctes.
+    let guard = TempDirGuard::new("unwatch_tracked");
+    let repo = guard.child("configured_project");
+    init_repo(&repo, "main", &"1".repeat(40));
 
     let (tx, rx) = unbounded();
-    let mut watcher = new_watcher(tx, &test_config(100));
-    watch_root(&mut watcher, &workspace_root);
+    let mut watcher = new_watcher(tx, &tracked_config(100, &[&repo]));
+    arm(&mut watcher);
+    wait_for_discovery(&rx, &repo);
 
-    // Dépôt jamais passé à `watch_repo` : découvert à chaud par la racine.
-    let discovered = workspace_root.join("auto_project");
-    create_dir(&discovered);
-    init_repo(&discovered, "main", &"1".repeat(40));
-    wait_for_discovery(&rx, &discovered);
-
-    // Un dépôt auto-découvert doit pouvoir être retiré comme un autre.
-    if let Err(e) = watcher.unwatch_repo(&discovered) {
+    if let Err(e) = watcher.unwatch_repo(&repo) {
         panic!("la désinscription doit réussir : {e}");
     }
     let _ = wait_for(
         &rx,
-        "RepoRemoved d'un dépôt auto-découvert",
-        |signal| matches!(signal, DevSignal::RepoRemoved { path, .. } if *path == discovered),
+        "RepoRemoved d'un dépôt configuré",
+        |signal| matches!(signal, DevSignal::RepoRemoved { path, .. } if *path == repo),
     );
 
     match watcher.watched_repos() {
         Ok(repos) => assert!(
-            !repos.contains(&discovered),
-            "le dépôt auto-découvert doit avoir disparu de l'état : {repos:?}"
+            !repos.contains(&repo),
+            "le dépôt configuré doit avoir disparu de l'état : {repos:?}"
         ),
         Err(e) => panic!("interrogation du worker impossible : {e}"),
     }
 }
 
 #[test]
-fn test_unwatch_workspace_root_stops_hot_discovery() {
-    let guard = TempDirGuard::new("unwatch_root");
-    let workspace_root = guard.path().to_path_buf();
-
-    let (tx, rx) = unbounded();
-    let mut watcher = new_watcher(tx, &test_config(100));
-    watch_root(&mut watcher, &workspace_root);
-    if let Err(e) = watcher.unwatch_workspace_root(&workspace_root) {
-        panic!("le retrait de la racine doit réussir : {e}");
-    }
-
-    let late_repo = workspace_root.join("late_project");
-    create_dir(&late_repo);
-    init_repo(&late_repo, "main", &"1".repeat(40));
-
-    assert_no_signal(&rx, "découverte après retrait de la racine", |signal| {
-        matches!(signal, DevSignal::RepoDiscovered { .. })
-    });
-}
-
-#[test]
-fn test_background_scan_registers_existing_repos() {
-    let guard = TempDirGuard::new("background_scan");
-    let first = guard.child("scanned_a");
-    let second = guard.child("nested/scanned_b");
-    let ignored = guard.child("node_modules/scanned_c");
-    for repo in [&first, &second, &ignored] {
+fn test_tracked_repos_are_armed_at_startup() {
+    let guard = TempDirGuard::new("tracked_startup");
+    let first = guard.child("projet_a");
+    let second = guard.child("imbrique/projet_b");
+    for repo in [&first, &second] {
         init_repo(repo, "main", &"1".repeat(40));
     }
 
     let (tx, rx) = unbounded();
-    let mut watcher = new_watcher(tx, &test_config(100));
-    watcher.start_background_scan(vec![guard.path().to_path_buf()], 4);
+    let mut watcher = new_watcher(tx, &tracked_config(100, &[&first, &second]));
+    arm(&mut watcher);
 
+    // Les deux dépôts déclarés sont montés, quelle que soit leur profondeur :
+    // aucun parcours d'arborescence n'intervient, donc aucune limite de niveau.
     wait_for_discoveries(&rx, &[&first, &second]);
 
-    match watcher.watched_repos() {
-        Ok(repos) => assert!(
-            !repos.contains(&ignored),
-            "les dossiers ignorés ne doivent pas être scannés : {repos:?}"
-        ),
-        Err(e) => panic!("interrogation du worker impossible : {e}"),
-    }
+    // Et l'activité Git y est bien suivie.
+    simulate_commit(
+        &second,
+        "main",
+        &"1".repeat(40),
+        &"2".repeat(40),
+        "feat: dépôt configuré",
+    );
+    let _ = wait_for(
+        &rx,
+        "CommitCreated sur un dépôt configuré",
+        |signal| matches!(signal, DevSignal::CommitCreated { repo_path, .. } if *repo_path == second),
+    );
 }
 
 #[test]
-fn test_auto_discovery_consumes_custom_roots() {
-    let guard = TempDirGuard::new("custom_roots");
-    let repo = guard.child("configured_project");
-    init_repo(&repo, "main", &"1".repeat(40));
-
-    let config = WatcherConfig {
-        debounce_duration_ms: 100,
-        auto_discovery: false,
-        custom_roots: vec![guard.path().to_path_buf()],
-        max_scan_depth: 3,
-        ..WatcherConfig::default()
-    };
+fn test_a_repo_created_next_to_a_tracked_one_stays_ignored() {
+    // Anti-régression du retrait du scanner : ni un dépôt voisin, ni un dépôt
+    // imbriqué dans un dépôt suivi ne doivent s'enregistrer d'eux-mêmes.
+    let guard = TempDirGuard::new("no_hot_discovery");
+    let tracked = guard.child("suivi");
+    init_repo(&tracked, "main", &"1".repeat(40));
 
     let (tx, rx) = unbounded();
-    let mut watcher = new_watcher(tx, &config);
-    if let Err(e) = watcher.start_auto_discovery() {
-        panic!("la découverte configurée doit démarrer : {e}");
+    let mut watcher = new_watcher(tx, &tracked_config(100, &[&tracked]));
+    arm(&mut watcher);
+    wait_for_discovery(&rx, &tracked);
+
+    let sibling = guard.path().join("intrus");
+    create_dir(&sibling);
+    init_repo(&sibling, "main", &"2".repeat(40));
+
+    let nested = tracked.join("sous_projet");
+    create_dir(&nested);
+    init_repo(&nested, "main", &"3".repeat(40));
+
+    assert_no_signal(&rx, "découverte automatique d'un dépôt", |signal| {
+        matches!(signal, DevSignal::RepoDiscovered { .. })
+    });
+
+    match watcher.watched_repos() {
+        Ok(repos) => assert_eq!(
+            repos,
+            vec![tracked],
+            "seul le dépôt explicitement déclaré doit être surveillé"
+        ),
+        Err(e) => panic!("interrogation du worker impossible : {e}"),
     }
-
-    // Le dépôt existant est trouvé par le scan des racines personnalisées...
-    wait_for_discovery(&rx, &repo);
-
-    // ...et la racine personnalisée est aussi surveillée à chaud.
-    let hot = guard.path().join("hot_project");
-    create_dir(&hot);
-    init_repo(&hot, "main", &"2".repeat(40));
-    wait_for_discovery(&rx, &hot);
 }
 
 #[test]
@@ -586,6 +549,7 @@ fn test_status_channel_reports_watch_failure() {
         WatcherStatus::WatchFailed { path, .. } => assert!(path.starts_with(&missing)),
         other @ (WatcherStatus::EventsLost { .. }
         | WatcherStatus::ReportRejected { .. }
+        | WatcherStatus::HistoryUnreadable { .. }
         | WatcherStatus::ToolingStateChanged { .. }) => {
             panic!("statut inattendu : {other:?}")
         }
@@ -766,4 +730,242 @@ fn test_tooling_toggle_is_confirmed_and_rebaselines_reports() {
     let _ = wait_for(&rx, "TestCompleted", |signal| {
         matches!(signal, DevSignal::TestCompleted { .. })
     });
+}
+
+// -----------------------------------------------------------------------------
+// Phase 8 : historique des jours de commits
+// -----------------------------------------------------------------------------
+
+/// Journal de références contenant plusieurs journées de commits.
+///
+/// Chaque ligne porte son propre horodatage : c'est l'unique preuve, sur cette
+/// machine, qu'un commit y a été **créé** un jour donné.
+fn write_history(repo_root: &std::path::Path, entries: &[(i64, &str)]) {
+    use std::fmt::Write as _;
+
+    let mut content = String::new();
+    for (index, (unix_seconds, action)) in entries.iter().enumerate() {
+        let old = format!("{index:040}");
+        let new = format!("{:040}", index + 1);
+        // L'écriture dans une `String` ne peut pas échouer : le résultat est
+        // ignoré plutôt que déballé, pour ne pas introduire de panic de test.
+        let _ = writeln!(
+            content,
+            "{old} {new} Dev Le Gremlin <dev@gremlin.rs> {unix_seconds} +0000\t{action}"
+        );
+    }
+    write_file(&repo_root.join(".git").join("logs").join("HEAD"), &content);
+}
+
+/// Instant de midi UTC du `offset`-ième jour après le 2024-05-06.
+const fn day_at(offset: i64) -> i64 {
+    1_714_996_800 + offset * 86_400
+}
+
+#[test]
+fn test_attaching_a_repository_seeds_its_commit_history_without_replaying_commits() {
+    let guard = TempDirGuard::new("history_seed");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+    write_history(
+        &repo,
+        &[
+            (day_at(0), "commit (initial): premier"),
+            (day_at(0), "commit: encore le même jour"),
+            (day_at(1), "commit: lendemain"),
+            (day_at(2), "commit (amend): correction"),
+        ],
+    );
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(100));
+    watch_repo(&mut watcher, &repo);
+
+    let signal = wait_for(&rx, "CommitHistorySeeded", |signal| {
+        matches!(signal, DevSignal::CommitHistorySeeded { .. })
+    });
+    match signal {
+        DevSignal::CommitHistorySeeded {
+            stamps,
+            truncated,
+            repo_path,
+            ..
+        } => {
+            assert_eq!(repo_path, repo);
+            assert!(!truncated, "un journal court n'est pas tronqué");
+            assert_eq!(
+                stamps.len(),
+                3,
+                "trois journées distinctes, quatre commits : {stamps:?}"
+            );
+            assert!(
+                stamps.windows(2).all(|pair| pair[0] <= pair[1]),
+                "les horodatages doivent être triés"
+            );
+        }
+        other => panic!("signal inattendu : {other:?}"),
+    }
+
+    // L'attachement ne rejoue aucun commit : le familier ne gagne pas d'XP pour
+    // un historique qu'il n'a pas vu naître.
+    assert_no_signal(&rx, "CommitCreated", |signal| {
+        matches!(signal, DevSignal::CommitCreated { .. })
+    });
+}
+
+#[test]
+fn test_a_repository_without_journal_seeds_an_empty_history() {
+    let guard = TempDirGuard::new("history_empty");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(100));
+    watch_repo(&mut watcher, &repo);
+
+    let signal = wait_for(&rx, "CommitHistorySeeded", |signal| {
+        matches!(signal, DevSignal::CommitHistorySeeded { .. })
+    });
+    match signal {
+        DevSignal::CommitHistorySeeded {
+            stamps, truncated, ..
+        } => {
+            // Un dépôt sans commit est une observation valide, pas un échec :
+            // sans ce signal, l'orchestrateur ne saurait pas distinguer les deux.
+            assert!(stamps.is_empty());
+            assert!(!truncated);
+        }
+        other => panic!("signal inattendu : {other:?}"),
+    }
+}
+
+#[test]
+fn test_history_ignores_entries_that_created_no_local_commit() {
+    let guard = TempDirGuard::new("history_actions");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+    write_history(
+        &repo,
+        &[
+            (day_at(0), "clone: from github.com"),
+            (day_at(1), "checkout: moving from main to dev"),
+            (day_at(2), "pull: Fast-forward"),
+            (day_at(3), "reset: moving to HEAD~1"),
+            (day_at(4), "commit: le seul vrai commit"),
+        ],
+    );
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(100));
+    watch_repo(&mut watcher, &repo);
+
+    let signal = wait_for(&rx, "CommitHistorySeeded", |signal| {
+        matches!(signal, DevSignal::CommitHistorySeeded { .. })
+    });
+    match signal {
+        DevSignal::CommitHistorySeeded { stamps, .. } => {
+            assert_eq!(
+                stamps.len(),
+                1,
+                "clone/checkout/pull/reset comptés : {stamps:?}"
+            );
+            assert_eq!(stamps[0].unix_seconds, day_at(4));
+        }
+        other => panic!("signal inattendu : {other:?}"),
+    }
+}
+
+#[test]
+fn test_a_live_commit_carries_its_stamp_only_when_the_reflog_is_authoritative() {
+    let guard = TempDirGuard::new("live_stamp");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(100));
+    watch_repo(&mut watcher, &repo);
+    wait_for_discovery(&rx, &repo);
+
+    // Reflog à jour et daté : le commit porte son horodatage.
+    let new_sha = "a".repeat(40);
+    write_file(
+        &repo.join(".git").join("logs").join("HEAD"),
+        &format!(
+            "{old} {new_sha} Dev Le Gremlin <dev@gremlin.rs> {stamp} +0200\tcommit: daté\n",
+            old = "1".repeat(40),
+            stamp = day_at(3),
+        ),
+    );
+    write_file(&ref_file(&repo, "main"), &format!("{new_sha}\n"));
+
+    let signal = wait_for(&rx, "CommitCreated", |signal| {
+        matches!(signal, DevSignal::CommitCreated { .. })
+    });
+    match signal {
+        DevSignal::CommitCreated { stamp, .. } => {
+            let stamp = stamp.expect("un reflog daté et à jour doit fournir son horodatage");
+            assert_eq!(stamp.unix_seconds, day_at(3));
+            assert_eq!(stamp.utc_offset_minutes, 120);
+        }
+        other => panic!("signal inattendu : {other:?}"),
+    }
+}
+
+#[test]
+fn test_a_commit_without_a_usable_reflog_reacts_without_dating_the_streak() {
+    let guard = TempDirGuard::new("live_nostamp");
+    let repo = guard.path().to_path_buf();
+    init_repo(&repo, "main", &"1".repeat(40));
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(100));
+    watch_repo(&mut watcher, &repo);
+    wait_for_discovery(&rx, &repo);
+
+    // Aucun reflog : le changement de SHA fait bien réagir le familier, mais
+    // aucune journée n'est attribuée faute de preuve temporelle.
+    let new_sha = "b".repeat(40);
+    write_file(&ref_file(&repo, "main"), &format!("{new_sha}\n"));
+
+    let signal = wait_for(&rx, "CommitCreated", |signal| {
+        matches!(signal, DevSignal::CommitCreated { .. })
+    });
+    match signal {
+        DevSignal::CommitCreated { stamp, .. } => {
+            assert!(stamp.is_none(), "journée inventée sans reflog : {stamp:?}");
+        }
+        other => panic!("signal inattendu : {other:?}"),
+    }
+}
+
+#[test]
+fn test_history_seeding_survives_a_burst_of_attachments_and_a_shutdown() {
+    let guard = TempDirGuard::new("history_burst");
+    let mut repos = Vec::new();
+    for index in 0..6 {
+        let repo = guard.path().join(format!("projet-{index}"));
+        create_dir(&repo);
+        init_repo(&repo, "main", &"1".repeat(40));
+        write_history(&repo, &[(day_at(index), "commit: travail")]);
+        repos.push(repo);
+    }
+
+    let (tx, rx) = unbounded();
+    let mut watcher = new_watcher(tx, &test_config(100));
+    for repo in &repos {
+        watch_repo(&mut watcher, repo);
+    }
+
+    // Chaque dépôt reçoit son seed, malgré la rafale de rattachements.
+    let mut seeded = 0;
+    while seeded < repos.len() {
+        wait_for(&rx, "CommitHistorySeeded", |signal| {
+            matches!(signal, DevSignal::CommitHistorySeeded { .. })
+        });
+        seeded += 1;
+    }
+
+    // L'arrêt reste déterministe : le worker sert `Shutdown` entre deux
+    // analyses, il n'est pas bloqué dans une boucle de lectures.
+    drop(watcher);
 }

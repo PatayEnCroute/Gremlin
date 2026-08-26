@@ -2,6 +2,7 @@
   "name": "Evolved Cyber Gremlin",
   "author": "Gremlin Studio",
   "version": "2.0.0",
+  "accessory_style": "evolved",
   "frame_width": 64,
   "frame_height": 64,
   "anchors": {
@@ -18,8 +19,8 @@
       "y": 18
     },
     "outfit": {
-      "x": 0,
-      "y": 0
+      "x": 32,
+      "y": 42
     },
     "hat": {
       "x": 16,
@@ -36,6 +37,78 @@
     "effect_origin": {
       "x": 32,
       "y": 30
+    }
+  },
+  "anchor_offsets_per_mood": {
+    "happy": {
+      "head": {
+        "x": 0,
+        "y": 1
+      },
+      "held": {
+        "x": 0,
+        "y": -4
+      }
+    },
+    "sleep": {
+      "head": {
+        "x": 4,
+        "y": 5
+      },
+      "body": {
+        "x": 2,
+        "y": -4
+      },
+      "held": {
+        "x": 4,
+        "y": -1
+      }
+    },
+    "dead": {
+      "head": {
+        "x": 7,
+        "y": 18
+      },
+      "body": {
+        "x": 2,
+        "y": 0
+      },
+      "held": {
+        "x": 4,
+        "y": 4
+      }
+    },
+    "coding": {
+      "head": {
+        "x": -2,
+        "y": 0
+      },
+      "held": {
+        "x": -3,
+        "y": -3
+      }
+    },
+    "hungry": {
+      "head": {
+        "x": 0,
+        "y": 1
+      }
+    },
+    "sick": {
+      "head": {
+        "x": 0,
+        "y": 1
+      }
+    },
+    "dragged": {
+      "head": {
+        "x": 0,
+        "y": -1
+      },
+      "held": {
+        "x": -2,
+        "y": -4
+      }
     }
   },
   "animations": {
@@ -108,6 +181,14 @@
         "sick_1"
       ],
       "frame_duration_ms": 500,
+      "mode": "Loop"
+    },
+    "focus": {
+      "frames": [
+        "coding_0",
+        "coding_1"
+      ],
+      "frame_duration_ms": 140,
       "mode": "Loop"
     }
   }

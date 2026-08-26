@@ -82,17 +82,24 @@ pub fn remove_tree(path: &Path) {
     }
 }
 
-/// Configuration de test : debounce court et découverte automatique désactivée.
+/// Configuration de test : debounce court, aucun dépôt suivi au départ.
 ///
-/// La découverte automatique explorerait le répertoire personnel de la machine :
-/// hors de question dans une suite de tests.
+/// Le garde-fou est devenu structurel : la surveillance ne pouvant plus explorer
+/// d'arborescence, aucun test ne *peut* parcourir le répertoire personnel de la
+/// machine, quelle que soit la configuration.
 pub fn test_config(debounce_ms: u64) -> WatcherConfig {
     WatcherConfig {
         debounce_duration_ms: debounce_ms,
         tooling_debounce_duration_ms: debounce_ms,
-        auto_discovery: false,
-        max_scan_depth: 4,
         ..WatcherConfig::default()
+    }
+}
+
+/// Configuration de test montant d'emblée une liste de dépôts déclarés.
+pub fn tracked_config(debounce_ms: u64, repos: &[&Path]) -> WatcherConfig {
+    WatcherConfig {
+        tracked_repos: repos.iter().map(|repo| repo.to_path_buf()).collect(),
+        ..test_config(debounce_ms)
     }
 }
 

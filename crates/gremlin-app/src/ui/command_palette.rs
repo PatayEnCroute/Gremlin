@@ -2,9 +2,12 @@
 
 use crate::config::AppConfig;
 use crate::ui::search;
-use gremlin_core::PetState;
-use gremlin_render::{AccessoryCatalog, AccessoryCategory, WardrobeEquipment};
+use gremlin_core::{
+    CivilDate, ConsumableKind, PetState, PomodoroPhase, PomodoroState, StreakReward,
+};
+use gremlin_render::{AccessoryCatalog, AccessoryCategory, AccessorySource, WardrobeEquipment};
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 /// Section logique regroupant les éléments dans la liste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -27,6 +30,14 @@ pub enum PaletteSection {
     Auras,
     /// Surveillance des dépôts Git.
     GitWatcher,
+    /// Séries de jours de commits et récompenses associées.
+    Streak,
+    /// Consommables détenus.
+    Inventory,
+    /// Minuteur de concentration.
+    FocusTimer,
+    /// Placement du familier sur le bureau.
+    DesktopBehaviour,
     /// Préférences générales et système.
     GeneralSettings,
 }
@@ -45,6 +56,10 @@ impl PaletteSection {
             Self::Held => "OBJETS TENUS",
             Self::Auras => "AURAS",
             Self::GitWatcher => "SURVEILLANCE GIT",
+            Self::Streak => "SÉRIE DE COMMITS",
+            Self::Inventory => "INVENTAIRE",
+            Self::FocusTimer => "CONCENTRATION",
+            Self::DesktopBehaviour => "PLACEMENT SUR LE BUREAU",
             Self::GeneralSettings => "PRÉFÉRENCES SYSTÈME",
         }
     }
@@ -65,7 +80,8 @@ impl PaletteSection {
             | Self::Held
             | Self::Auras => PaletteGroup::Wardrobe,
             Self::GitWatcher => PaletteGroup::Repos,
-            Self::GeneralSettings => PaletteGroup::Preferences,
+            Self::Streak | Self::Inventory | Self::FocusTimer => PaletteGroup::Productivity,
+            Self::DesktopBehaviour | Self::GeneralSettings => PaletteGroup::Preferences,
         }
     }
 }
@@ -88,17 +104,20 @@ pub enum PaletteGroup {
     Wardrobe,
     /// Dépôts Git surveillés.
     Repos,
+    /// Séries, inventaire et minuteur de concentration.
+    Productivity,
     /// Préférences système et actions de maintenance.
     Preferences,
 }
 
 impl PaletteGroup {
     /// Tous les groupes, dans l'ordre d'affichage à la racine.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Profile,
         Self::Care,
         Self::Wardrobe,
         Self::Repos,
+        Self::Productivity,
         Self::Preferences,
     ];
 
@@ -110,6 +129,7 @@ impl PaletteGroup {
             Self::Care => "Soins et actions",
             Self::Wardrobe => "Garde-robe",
             Self::Repos => "Dépôts surveillés",
+            Self::Productivity => "Productivité",
             Self::Preferences => "Préférences système",
         }
     }
@@ -126,6 +146,7 @@ impl PaletteGroup {
             Self::Care => PaletteSection::PetCare,
             Self::Wardrobe => PaletteSection::Hats,
             Self::Repos => PaletteSection::GitWatcher,
+            Self::Productivity => PaletteSection::Streak,
             Self::Preferences => PaletteSection::GeneralSettings,
         }
     }
@@ -138,7 +159,92 @@ impl PaletteGroup {
             Self::Care => "Nourrir, soigner, endormir, réanimer",
             Self::Wardrobe => "Chapeaux, lunettes, tenues, objets, auras",
             Self::Repos => "Branches et derniers commits détectés",
+            Self::Productivity => "Série de commits, inventaire, concentration",
             Self::Preferences => "Démarrage, échelle, dossiers, sauvegarde",
+        }
+    }
+}
+
+/// Nature d'une saisie guidée occupant le champ de recherche.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// Chemin absolu du dépôt Git à confier à la surveillance.
+    AddTrackedRepo,
+}
+
+impl PromptKind {
+    /// Fil d'Ariane du mode saisie.
+    #[must_use]
+    pub const fn breadcrumb(self) -> &'static str {
+        match self {
+            Self::AddTrackedRepo => "Ajouter un dépôt",
+        }
+    }
+
+    /// Consigne affichée quand la saisie est encore vide.
+    #[must_use]
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::AddTrackedRepo => "Chemin absolu du dépôt, puis Entrée",
+        }
+    }
+
+    /// Groupe auquel revenir en quittant la saisie.
+    #[must_use]
+    pub const fn parent_group(self) -> PaletteGroup {
+        match self {
+            Self::AddTrackedRepo => PaletteGroup::Repos,
+        }
+    }
+}
+
+/// Verdict de la validation d'un chemin saisi par l'utilisateur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoPathVerdict {
+    /// Rien n'a encore été saisi.
+    Empty,
+    /// Chemin relatif : le répertoire de travail d'une application résidente
+    /// n'est pas un point de départ fiable.
+    Relative,
+    /// Le dossier existe peut-être, mais ne porte pas de `.git`.
+    NotARepo,
+    /// Dépôt Git valide.
+    Valid,
+}
+
+impl RepoPathVerdict {
+    /// Analyse une saisie brute.
+    fn of(raw: &str) -> Self {
+        if raw.is_empty() {
+            return Self::Empty;
+        }
+        let path = Path::new(raw);
+        if !path.is_absolute() {
+            return Self::Relative;
+        }
+        if gremlin_watcher::is_git_repo(path) {
+            Self::Valid
+        } else {
+            Self::NotARepo
+        }
+    }
+
+    /// Message montré à l'utilisateur pendant sa saisie.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "Collez ou saisissez le chemin du dépôt",
+            Self::Relative => "Chemin relatif : indiquez un chemin absolu",
+            Self::NotARepo => "Ce dossier n'est pas un dépôt Git valide",
+            Self::Valid => "Dépôt Git valide — Entrée pour confirmer",
+        }
+    }
+
+    /// Pastille de la ligne de confirmation.
+    const fn badge(self) -> &'static str {
+        match self {
+            Self::Empty => "EN ATTENTE",
+            Self::Relative | Self::NotARepo => "INVALIDE",
+            Self::Valid => "VALIDE",
         }
     }
 }
@@ -151,6 +257,8 @@ pub enum PaletteView {
     Root,
     /// Contenu d'un groupe.
     Group(PaletteGroup),
+    /// Saisie guidée : le champ de recherche devient un champ de valeur.
+    Prompt(PromptKind),
 }
 
 impl PaletteView {
@@ -160,7 +268,14 @@ impl PaletteView {
         match self {
             Self::Root => None,
             Self::Group(group) => Some(group.title()),
+            Self::Prompt(prompt) => Some(prompt.breadcrumb()),
         }
+    }
+
+    /// Indique si le champ de saisie sert à autre chose qu'à rechercher.
+    #[must_use]
+    pub const fn is_prompt(self) -> bool {
+        matches!(self, Self::Prompt(_))
     }
 }
 
@@ -174,14 +289,31 @@ pub enum PaletteAction {
         /// Identifiant de l'accessoire.
         id: String,
     },
-    /// Nourrit le Gremlin d'une collation.
-    FeedPet,
     /// Caresse le Gremlin pour augmenter son bonheur.
     PetGremlin,
-    /// Soigne le Gremlin en cas de maladie.
-    HealPet,
     /// Réanime un Gremlin décédé.
     RevivePet,
+    /// Consomme un objet de l'inventaire.
+    ///
+    /// Remplace les anciennes actions illimitées « nourrir » et « soigner » :
+    /// les laisser à côté de l'inventaire l'aurait rendu purement décoratif.
+    UseConsumable(ConsumableKind),
+    /// Active ou désactive le minuteur de concentration.
+    TogglePomodoro,
+    /// Démarre un bloc de concentration.
+    StartPomodoro,
+    /// Suspend le minuteur.
+    PausePomodoro,
+    /// Reprend le minuteur suspendu.
+    ResumePomodoro,
+    /// Arrête le cycle de concentration.
+    StopPomodoro,
+    /// Passe la pause en cours et prépare le bloc suivant.
+    SkipPomodoroBreak,
+    /// Active ou désactive la chute douce au lâcher.
+    ToggleDesktopMotion,
+    /// Active ou désactive l'ancrage aux bords de la zone de travail.
+    ToggleDesktopMagnetism,
     /// Bascule le mode sommeil du Gremlin.
     ToggleSleep,
     /// Bascule le mode click-through (la souris traverse la fenêtre).
@@ -223,8 +355,45 @@ pub enum PaletteAction {
     /// Traitée intégralement par la palette : la navigation est un état
     /// d'interface, elle n'a pas à remonter jusqu'à l'orchestrateur.
     EnterGroup(PaletteGroup),
+    /// Ouvre le mode saisie du chemin d'un dépôt à ajouter.
+    ///
+    /// Comme [`Self::EnterGroup`], c'est de la navigation : la palette la traite
+    /// elle-même.
+    PromptAddTrackedRepo,
+    /// Ouvre le sélecteur de dossier du système.
+    BrowseForTrackedRepo,
+    /// Confie un dépôt à la surveillance.
+    AddTrackedRepo(PathBuf),
+    /// Retire un dépôt de la surveillance et de la configuration.
+    RemoveTrackedRepo(PathBuf),
+    /// Ouvre le dossier d'un dépôt suivi dans le gestionnaire de fichiers.
+    OpenRepoFolder(PathBuf),
     /// Action sans effet direct.
     None,
+}
+
+/// Pictogramme d'une action secondaire de ligne.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowActionIcon {
+    /// Corbeille : retire l'élément de la liste.
+    Trash,
+}
+
+/// Action secondaire d'une ligne, déclenchée par son propre bouton.
+///
+/// Volontairement générique : le moteur de rendu dessine un pictogramme et une
+/// zone cliquable sans jamais apprendre ce qu'est un dépôt Git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowAction {
+    /// Pictogramme dessiné dans la marge droite de la ligne.
+    pub icon: RowActionIcon,
+    /// Libellé annoncé par les lecteurs d'écran.
+    ///
+    /// Sans lui, le bouton n'existerait pas à l'oreille : une zone cliquable
+    /// muette est une fonctionnalité réservée à ceux qui la voient.
+    pub label: String,
+    /// Action déclenchée par le bouton.
+    pub action: PaletteAction,
 }
 
 /// Un item sélectionnable dans la palette de commande.
@@ -248,6 +417,8 @@ pub struct PaletteItem {
     pub action: PaletteAction,
     /// Métadonnées libres exploitées par le panneau d'inspection.
     pub metadata: HashMap<String, String>,
+    /// Action secondaire portée par la ligne, avec son propre bouton.
+    pub row_action: Option<RowAction>,
 }
 
 /// Résultat d'une action déclenchée par l'utilisateur.
@@ -265,14 +436,28 @@ pub enum PaletteExecutionResult {
         /// Emplacement concerné.
         category: AccessoryCategory,
     },
-    /// Nourrit le familier.
-    FeedPet,
     /// Caresse le familier.
     PetGremlin,
-    /// Soigne le familier.
-    HealPet,
     /// Réanime le familier.
     RevivePet,
+    /// Consomme un objet de l'inventaire.
+    UseConsumable(ConsumableKind),
+    /// Active ou désactive le minuteur de concentration.
+    TogglePomodoro,
+    /// Démarre un bloc de concentration.
+    StartPomodoro,
+    /// Suspend le minuteur.
+    PausePomodoro,
+    /// Reprend le minuteur suspendu.
+    ResumePomodoro,
+    /// Arrête le cycle de concentration.
+    StopPomodoro,
+    /// Passe la pause en cours.
+    SkipPomodoroBreak,
+    /// Active ou désactive la chute douce.
+    ToggleDesktopMotion,
+    /// Active ou désactive l'ancrage aux bords.
+    ToggleDesktopMagnetism,
     /// Bascule le sommeil.
     ToggleSleep,
     /// Bascule le mode click-through.
@@ -303,13 +488,48 @@ pub enum PaletteExecutionResult {
     ToggleReducedMotion,
     /// Bascule la fermeture à la perte de focus.
     ToggleCloseOnFocusLoss,
+    /// Confie un dépôt Git à la surveillance.
+    AddTrackedRepo(PathBuf),
+    /// Retire un dépôt de la surveillance et de la configuration.
+    RemoveTrackedRepo(PathBuf),
+    /// Ouvre le dossier d'un dépôt suivi.
+    OpenRepoFolder(PathBuf),
+    /// Ouvre le sélecteur de dossier du système.
+    BrowseForTrackedRepo,
     /// Aucune action.
     None,
 }
 
-/// Informations sommaires d'un dépôt Git surveillé pour l'affichage Raycast.
+/// État de surveillance d'un dépôt déclaré.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoTrackingStatus {
+    /// Surveillé activement : commits, branches et rapports y sont détectés.
+    Active,
+    /// Déclaré mais non surveillé : chemin introuvable, dépôt supprimé, ou
+    /// surveillance indisponible. Le dépôt reste listé — et donc retirable.
+    Unavailable,
+}
+
+impl RepoTrackingStatus {
+    /// Pastille affichée à droite de la ligne.
+    #[must_use]
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::Active => "SUIVI",
+            Self::Unavailable => "INDISPONIBLE",
+        }
+    }
+}
+
+/// Informations sommaires d'un dépôt Git suivi, pour l'affichage Raycast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoDisplayInfo {
+    /// Chemin déclaré du dépôt.
+    ///
+    /// Identifiant de la ligne, et non son nom : deux dépôts nommés `api` sous
+    /// deux racines différentes sont deux entrées distinctes, et le retrait doit
+    /// désigner celle que l'utilisateur a visée.
+    pub path: PathBuf,
     /// Nom court du dépôt.
     pub name: String,
     /// Branche courante, si elle a pu être lue.
@@ -320,6 +540,10 @@ pub struct RepoDisplayInfo {
     pub branch: Option<String>,
     /// Dernier message de commit connu.
     pub last_commit_msg: Option<String>,
+    /// État de la surveillance de ce dépôt.
+    pub status: RepoTrackingStatus,
+    /// Cause de l'indisponibilité, telle qu'elle sera montrée à l'utilisateur.
+    pub issue: Option<String>,
 }
 
 impl PaletteItem {
@@ -351,16 +575,75 @@ impl PaletteItem {
                 | PaletteAction::ToggleBreakReminders
                 | PaletteAction::ToggleReducedMotion
                 | PaletteAction::ToggleCloseOnFocusLoss
+                | PaletteAction::TogglePomodoro
+                | PaletteAction::ToggleDesktopMotion
+                | PaletteAction::ToggleDesktopMagnetism
         )
+    }
+
+    /// Indique que l'item déclenche une commande immédiate.
+    ///
+    /// Le lecteur d'écran l'annonce alors comme un **bouton** : « Café, bouton »
+    /// dit ce que la validation va faire, là où « élément de liste » laisse
+    /// deviner.
+    #[must_use]
+    pub const fn is_command_button(&self) -> bool {
+        matches!(
+            self.action,
+            PaletteAction::UseConsumable(_)
+                | PaletteAction::StartPomodoro
+                | PaletteAction::PausePomodoro
+                | PaletteAction::ResumePomodoro
+                | PaletteAction::StopPomodoro
+                | PaletteAction::SkipPomodoroBreak
+                | PaletteAction::PetGremlin
+                | PaletteAction::RevivePet
+        )
+    }
+
+    /// Indique que la ligne est purement informative.
+    ///
+    /// Une ligne sans action ne doit pas annoncer qu'elle est activable : c'est
+    /// le cas du résumé de série et d'une récompense encore verrouillée, qui
+    /// restent lisibles mais ne déclenchent rien.
+    #[must_use]
+    pub const fn is_informational(&self) -> bool {
+        matches!(self.action, PaletteAction::None)
     }
 }
 
 impl RepoDisplayInfo {
+    /// Construit l'entrée d'un dépôt déclaré, avant tout signal du watcher.
+    #[must_use]
+    pub fn declared(path: PathBuf, status: RepoTrackingStatus, issue: Option<String>) -> Self {
+        let name = repo_name_from_path(&path);
+        Self {
+            path,
+            name,
+            branch: None,
+            last_commit_msg: None,
+            status,
+            issue,
+        }
+    }
+
     /// Libellé de branche affichable, y compris lorsqu'elle est inconnue.
     #[must_use]
     pub fn branch_label(&self) -> &str {
         self.branch.as_deref().unwrap_or("inconnue")
     }
+}
+
+/// Nom court d'un dépôt, déduit du dernier composant de son chemin.
+///
+/// Une racine de volume (`C:\`, `/`) n'a pas de dernier composant : le chemin
+/// complet est alors conservé, ce qui vaut mieux qu'une ligne sans nom.
+#[must_use]
+pub fn repo_name_from_path(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// Contexte de construction des items de la palette.
@@ -379,14 +662,40 @@ pub struct PaletteContext<'a> {
     pub config: &'a AppConfig,
     /// Indique si le lancement automatique est réellement actif au niveau OS.
     pub autostart_active: bool,
-    /// Dépôts Git actuellement surveillés.
+    /// Dépôts Git déclarés par l'utilisateur.
     pub repos: &'a [RepoDisplayInfo],
+    /// Répertoire de lancement, s'il se trouve être un dépôt Git.
+    ///
+    /// Résolu une seule fois au démarrage : il ne change pas pendant la vie du
+    /// processus, et le recalculer à chaque reconstruction de la liste ferait
+    /// toucher au disque pour rien.
+    pub current_dir_repo: Option<&'a Path>,
+    /// Indique si le sélecteur de dossier du système est utilisable.
+    pub folder_picker_available: bool,
     /// Dernière erreur de sauvegarde à signaler à l'utilisateur.
     pub last_save_error: Option<&'a str>,
     /// Dernier incident du watcher ou du moniteur d'activité.
     pub last_observation_error: Option<&'a str>,
     /// État d'outillage demandé, tant que le worker ne l'a pas confirmé.
     pub pending_tooling_enabled: Option<bool>,
+    /// Jour civil courant, absent si le calendrier local est indisponible.
+    ///
+    /// Sans lui la série n'est pas calculable : l'interface le dit au lieu
+    /// d'afficher un zéro qui passerait pour une série rompue.
+    pub today: Option<CivilDate>,
+    /// Indique que le placement natif est exploitable sur cette plateforme.
+    pub desktop_placement_available: bool,
+    /// Raison de l'indisponibilité du placement natif, le cas échéant.
+    pub desktop_unavailable_reason: Option<&'a str>,
+}
+
+/// Formate un temps restant en `MM:SS`, arrondi à la seconde.
+///
+/// L'arrondi est volontaire : le panneau n'affiche pas les dixièmes, et
+/// rafraîchir plus finement ferait vivre l'application pour rien.
+fn format_remaining(remaining: std::time::Duration) -> String {
+    let seconds = remaining.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// État de la palette de commande et gestionnaire de filtrage.
@@ -405,6 +714,8 @@ pub struct CommandPalette {
     all_items: Vec<PaletteItem>,
     /// Entrées de racine, une par groupe non vide.
     root_items: Vec<PaletteItem>,
+    /// Ligne de confirmation du mode saisie, reconstruite à chaque frappe.
+    prompt_item: Option<PaletteItem>,
     /// Lignes retenues par le filtre courant.
     ///
     /// Stocker des références plutôt que des copies évite de cloner la totalité
@@ -419,6 +730,8 @@ enum FilteredRef {
     Root(usize),
     /// Feuille, indice dans `all_items`.
     Leaf(usize),
+    /// Unique ligne du mode saisie.
+    Prompt,
 }
 
 impl CommandPalette {
@@ -432,6 +745,7 @@ impl CommandPalette {
             selected_index: 0,
             all_items: Vec::new(),
             root_items: Vec::new(),
+            prompt_item: None,
             filtered: Vec::new(),
         };
 
@@ -449,9 +763,14 @@ impl CommandPalette {
             config,
             autostart_active,
             repos,
+            current_dir_repo,
+            folder_picker_available,
             last_save_error,
             last_observation_error,
             pending_tooling_enabled,
+            today,
+            desktop_placement_available,
+            desktop_unavailable_reason,
         } = *context;
 
         let progression = pet_state.progression();
@@ -525,49 +844,35 @@ impl CommandPalette {
             is_equipped: true,
             action: PaletteAction::PetGremlin,
             metadata: meta_profile,
+            row_action: None,
         });
 
-        // 2. Soins et actions sur le familier
-        let feed_amount = core_actions.default_feed_amount;
-        let mut meta_feed = HashMap::new();
-        meta_feed.insert("name".into(), "Nourrir Gremlin".into());
-        meta_feed.insert(
+        // 2. Soins et actions sur le familier.
+        //
+        // Nourrir et soigner passent désormais par l'inventaire : garder ici des
+        // équivalents illimités aurait rendu les consommables décoratifs.
+        // Caresser et réanimer restent des actions directes — elles ne
+        // consomment rien.
+        let pet_amount = core_actions.default_pet_happiness;
+        let mut meta_pet = HashMap::new();
+        meta_pet.insert("name".into(), "Caresser Gremlin".into());
+        meta_pet.insert(
             "description".into(),
-            format!("Donne une friandise pour restaurer la satiété (+{feed_amount:.0})."),
-        );
-        items.push(PaletteItem {
-            id: "care_feed".into(),
-            title: "Nourrir d'un snack".into(),
-            subtitle: format!("Satiété actuelle : {:.0}%", stats.satiety()),
-            section: PaletteSection::PetCare,
-            category: None,
-            badge: Some(format!("+{feed_amount:.0} SATIÉTÉ")),
-            is_equipped: false,
-            action: PaletteAction::FeedPet,
-            metadata: meta_feed,
-        });
-
-        let heal_amount = core_actions.default_heal_amount;
-        let mut meta_heal = HashMap::new();
-        meta_heal.insert("name".into(), "Soigner Gremlin".into());
-        meta_heal.insert(
-            "description".into(),
-            format!("Administre des soins et potions au Gremlin (+{heal_amount:.0})."),
-        );
-        items.push(PaletteItem {
-            id: "care_heal".into(),
-            title: "Soigner le familier".into(),
-            subtitle: format!(
-                "Bonheur : {:.0}% • Énergie : {:.0}%",
-                stats.happiness(),
-                stats.energy()
+            format!(
+                "Caresse le familier pour lui remonter le moral (+{pet_amount:.0} bonheur).                  Équivaut à un clic bref sur le familier lorsque le mode interactif est actif."
             ),
+        );
+        items.push(PaletteItem {
+            id: "care_pet".into(),
+            title: "Caresser le familier".into(),
+            subtitle: format!("Bonheur actuel : {:.0}%", stats.happiness()),
             section: PaletteSection::PetCare,
             category: None,
-            badge: Some("SOIN".into()),
+            badge: Some(format!("+{pet_amount:.0} BONHEUR")),
             is_equipped: false,
-            action: PaletteAction::HealPet,
-            metadata: meta_heal,
+            action: PaletteAction::PetGremlin,
+            metadata: meta_pet,
+            row_action: None,
         });
 
         let is_sleeping = pet_state.is_sleeping();
@@ -595,6 +900,7 @@ impl CommandPalette {
             is_equipped: is_sleeping,
             action: PaletteAction::ToggleSleep,
             metadata: meta_sleep,
+            row_action: None,
         });
 
         if !pet_state.is_alive() {
@@ -614,6 +920,7 @@ impl CommandPalette {
                 is_equipped: false,
                 action: PaletteAction::RevivePet,
                 metadata: meta_revive,
+                row_action: None,
             });
         }
 
@@ -631,7 +938,7 @@ impl CommandPalette {
                 let is_equipped = wardrobe.is_equipped_in(cat, item.id());
                 let badge = if is_equipped {
                     Some(String::from("ÉQUIPÉ"))
-                } else if item.is_procedural {
+                } else if matches!(item.source, AccessorySource::BuiltIn) {
                     Some(String::from("INTÉGRÉ"))
                 } else {
                     Some(String::from("MOD"))
@@ -657,37 +964,513 @@ impl CommandPalette {
                         id: item.id().to_string(),
                     },
                     metadata: meta,
+                    row_action: None,
                 });
             }
         }
 
-        // 4. Surveillance des dépôts Git
+        // 4. Dépôts Git suivis — actions d'ajout, puis un item par dépôt déclaré.
+        //
+        // Ces actions sont permanentes : le groupe « Dépôts surveillés » reste
+        // donc visible à la racine même sans aucun dépôt, ce qui donne à l'état
+        // vide un endroit où s'expliquer.
+        let mut meta_add = HashMap::new();
+        meta_add.insert("name".into(), "Ajouter un dépôt Git".into());
+        meta_add.insert(
+            "description".into(),
+            "Indiquez le chemin absolu d'un dépôt : Gremlin surveillera ses commits, ses branches et ses rapports de tests."
+                .into(),
+        );
+        items.push(PaletteItem {
+            id: "repo_add_by_path".into(),
+            title: "Ajouter un dépôt Git…".into(),
+            subtitle: if repos.is_empty() {
+                "Aucun dépôt surveillé — commencez ici".into()
+            } else {
+                "Saisir le chemin d'un dépôt à surveiller".into()
+            },
+            section: PaletteSection::GitWatcher,
+            category: None,
+            badge: Some("+".into()),
+            is_equipped: false,
+            action: PaletteAction::PromptAddTrackedRepo,
+            metadata: meta_add,
+            row_action: None,
+        });
+
+        if folder_picker_available {
+            let mut meta_browse = HashMap::new();
+            meta_browse.insert("name".into(), "Parcourir un dossier".into());
+            meta_browse.insert(
+                "description".into(),
+                "Ouvre le sélecteur de dossier du système pour désigner un dépôt.".into(),
+            );
+            items.push(PaletteItem {
+                id: "repo_browse".into(),
+                title: "Parcourir un dossier…".into(),
+                subtitle: "Sélecteur de dossier du système".into(),
+                section: PaletteSection::GitWatcher,
+                category: None,
+                badge: Some("DOSSIER".into()),
+                is_equipped: false,
+                action: PaletteAction::BrowseForTrackedRepo,
+                metadata: meta_browse,
+                row_action: None,
+            });
+        }
+
+        // Le répertoire de lancement n'est proposé que s'il est un dépôt Git et
+        // qu'il n'est pas déjà suivi : sinon la ligne ne ferait rien.
+        if let Some(current) = current_dir_repo {
+            if !repos.iter().any(|repo| repo.path == current) {
+                let name = repo_name_from_path(current);
+                let mut meta_current = HashMap::new();
+                meta_current.insert("name".into(), name.clone());
+                meta_current.insert("path".into(), current.display().to_string());
+                meta_current.insert(
+                    "description".into(),
+                    "Répertoire depuis lequel Gremlin a été lancé.".into(),
+                );
+                items.push(PaletteItem {
+                    id: "repo_add_current_dir".into(),
+                    title: format!("Ajouter le dossier courant : {name}"),
+                    subtitle: current.display().to_string(),
+                    section: PaletteSection::GitWatcher,
+                    category: None,
+                    badge: Some("COURANT".into()),
+                    is_equipped: false,
+                    action: PaletteAction::AddTrackedRepo(current.to_path_buf()),
+                    metadata: meta_current,
+                    row_action: None,
+                });
+            }
+        }
+
         for repo in repos {
             let mut meta_repo = HashMap::new();
             meta_repo.insert("name".into(), repo.name.clone());
+            meta_repo.insert("path".into(), repo.path.display().to_string());
             meta_repo.insert("branch".into(), repo.branch_label().to_owned());
             if let Some(ref msg) = repo.last_commit_msg {
                 meta_repo.insert("last_commit".into(), msg.clone());
             }
+            meta_repo.insert(
+                "description".into(),
+                repo.issue.clone().unwrap_or_else(|| {
+                    "Commits, bascules de branche et rapports de tests y sont détectés.".to_owned()
+                }),
+            );
+
+            let subtitle = repo.issue.as_ref().map_or_else(
+                || {
+                    format!(
+                        "Branche : {} • Dernier commit : {}",
+                        repo.branch_label(),
+                        repo.last_commit_msg.as_deref().unwrap_or("aucun")
+                    )
+                },
+                // Pas de pictogramme d'alerte ici : la pastille « INDISPONIBLE »
+                // porte déjà l'état, le sous-titre n'a plus qu'à en donner la
+                // cause. Le « ⚠ » est réservé aux incidents dont la pastille ne
+                // dit rien — celle de l'outillage affiche ON ou OFF, jamais
+                // l'incident lui-même.
+                Clone::clone,
+            );
 
             items.push(PaletteItem {
-                id: format!("repo_{}", repo.name),
+                // Le chemin fait l'identité : deux dépôts homonymes doivent
+                // rester deux lignes distinctes et retirables séparément.
+                id: format!("repo_{}", repo.path.display()),
                 title: format!("Dépôt : {}", repo.name),
-                subtitle: format!(
-                    "Branche : {} • Dernier commit : {}",
-                    repo.branch_label(),
-                    repo.last_commit_msg.as_deref().unwrap_or("aucun")
-                ),
+                subtitle,
                 section: PaletteSection::GitWatcher,
                 category: None,
-                badge: Some(repo.branch_label().to_owned()),
+                badge: Some(match repo.status {
+                    RepoTrackingStatus::Active => repo.branch_label().to_owned(),
+                    RepoTrackingStatus::Unavailable => repo.status.badge().to_owned(),
+                }),
                 is_equipped: false,
-                action: PaletteAction::None,
+                action: PaletteAction::OpenRepoFolder(repo.path.clone()),
                 metadata: meta_repo,
+                row_action: Some(RowAction {
+                    icon: RowActionIcon::Trash,
+                    label: format!("Retirer {} de la surveillance", repo.name),
+                    action: PaletteAction::RemoveTrackedRepo(repo.path.clone()),
+                }),
             });
         }
 
-        // 5. Actions et préférences système
+        // 5. Productivité : série de commits, inventaire et concentration.
+        let productivity = pet_state.productivity();
+        let streak = productivity.streak();
+        let inventory = productivity.inventory();
+        let timer = productivity.pomodoro();
+        let streak_config = core_config.streak;
+
+        // 5a. Série de commits.
+        let mut meta_streak = HashMap::new();
+        meta_streak.insert("name".into(), "Série de commits".into());
+        // `if let` plutôt que `Option::map_or_else` : les deux branches
+        // renseignent la même table de métadonnées, et deux fermetures ne
+        // peuvent pas l'emprunter en écriture simultanément.
+        let streak_subtitle = if let Some(today) = today {
+            let snapshot = streak.snapshot(today);
+            meta_streak.insert(
+                "current".into(),
+                format!("{} jour(s) d'affilée", snapshot.current_days),
+            );
+            meta_streak.insert(
+                "longest".into(),
+                format!("record : {} jour(s)", snapshot.longest_days),
+            );
+            meta_streak.insert(
+                "total".into(),
+                format!(
+                    "{} jour(s) de commits au total",
+                    snapshot.total_productive_days
+                ),
+            );
+            if let Some(last) = snapshot.last_active_day {
+                meta_streak.insert("last".into(), format!("dernier commit le {last}"));
+            }
+            let next = streak.next_milestone(today, streak_config).map_or_else(
+                || String::from("toutes les récompenses sont acquises"),
+                |(reward, remaining)| format!("{remaining} jour(s) avant « {} »", reward.label()),
+            );
+            meta_streak.insert("next".into(), next);
+            format!(
+                "{} jour(s) d'affilée • record {} jour(s)",
+                snapshot.current_days, snapshot.longest_days
+            )
+        } else {
+            // Sans date locale, afficher « 0 » ferait passer une série intacte
+            // pour une série rompue.
+            meta_streak.insert(
+                "description".into(),
+                "La date locale est indisponible : la série ne peut pas être calculée. \
+                 Les jours déjà enregistrés sont conservés."
+                    .into(),
+            );
+            String::from("Date locale indisponible")
+        };
+        items.push(PaletteItem {
+            id: "productivity_streak".into(),
+            title: "Série de commits".into(),
+            subtitle: streak_subtitle,
+            section: PaletteSection::Streak,
+            category: None,
+            badge: Some(today.map_or_else(
+                || String::from("INDISPONIBLE"),
+                |today| format!("{} J", streak.current_streak(today)),
+            )),
+            is_equipped: today.is_some_and(|today| streak.current_streak(today) > 0),
+            action: PaletteAction::None,
+            metadata: meta_streak,
+            row_action: None,
+        });
+
+        // 5b. Récompenses de série, acquises comme verrouillées.
+        //
+        // Une récompense verrouillée reste lisible et annonce son critère : la
+        // griser sans texte la rendrait muette au lecteur d'écran.
+        for (reward, required) in StreakReward::ALL
+            .into_iter()
+            .zip(streak_config.milestone_days)
+        {
+            let unlocked = streak.is_unlocked(reward);
+            let mut meta = HashMap::new();
+            meta.insert("name".into(), reward.label().to_owned());
+            meta.insert("accessory".into(), reward.accessory_id().to_owned());
+            meta.insert(
+                "description".into(),
+                if unlocked {
+                    format!(
+                        "Débloqué à {required} jours consécutifs. Disponible dans la garde-robe."
+                    )
+                } else {
+                    format!(
+                        "Se débloque après {required} jours de commits consécutifs. \
+                         Non équipable avant cela."
+                    )
+                },
+            );
+            items.push(PaletteItem {
+                id: format!("streak_reward_{}", reward.accessory_id()),
+                title: reward.label().to_owned(),
+                subtitle: if unlocked {
+                    format!("Acquis • {required} jours consécutifs")
+                } else {
+                    format!("Verrouillé • {required} jours consécutifs requis")
+                },
+                section: PaletteSection::Streak,
+                category: None,
+                badge: Some(if unlocked { "ACQUIS" } else { "VERROUILLÉ" }.into()),
+                is_equipped: unlocked,
+                action: PaletteAction::None,
+                metadata: meta,
+                row_action: None,
+            });
+        }
+
+        // 5c. Inventaire : un item par consommable, utilisable ou refusé.
+        for (index, kind) in ConsumableKind::ALL.into_iter().enumerate() {
+            let quantity = inventory.quantity(kind);
+            let effect = kind.potential_effect(stats, &core_config.inventory);
+            let refusal = if !pet_state.is_alive() {
+                Some("Gremlin est décédé")
+            } else if pet_state.is_sleeping() {
+                Some("Gremlin dort")
+            } else if quantity == 0 {
+                Some("stock vide")
+            } else if !effect.is_meaningful() {
+                Some("jauge déjà pleine")
+            } else {
+                None
+            };
+
+            let mut meta = HashMap::new();
+            meta.insert("name".into(), kind.title().to_owned());
+            meta.insert("stock".into(), format!("{quantity} en stock"));
+            meta.insert(
+                "effect".into(),
+                format!(
+                    "+{:.0} énergie, +{:.0} satiété, +{:.0} bonheur",
+                    effect.energy, effect.satiety, effect.happiness
+                ),
+            );
+            meta.insert(
+                "description".into(),
+                refusal.map_or_else(
+                    || {
+                        format!(
+                            "Raccourci {} • ou glissez l'objet sur le familier de l'aperçu.",
+                            index + 1
+                        )
+                    },
+                    |reason| format!("Inutilisable pour l'instant : {reason}."),
+                ),
+            );
+
+            items.push(PaletteItem {
+                id: format!("inventory_{}", kind.id()),
+                title: kind.title().to_owned(),
+                subtitle: refusal.map_or_else(
+                    || {
+                        format!(
+                            "{quantity} en stock • +{:.0} énergie, +{:.0} satiété, +{:.0} bonheur",
+                            effect.energy, effect.satiety, effect.happiness
+                        )
+                    },
+                    |reason| format!("{quantity} en stock • {reason}"),
+                ),
+                section: PaletteSection::Inventory,
+                category: None,
+                // « STOCK n » plutôt que « ×n » : la police dessinée à la main
+                // ne couvre pas le signe multiplié, qui sortirait en tofu.
+                badge: Some(format!("STOCK {quantity}")),
+                is_equipped: refusal.is_none(),
+                action: PaletteAction::UseConsumable(kind),
+                metadata: meta,
+                row_action: None,
+            });
+        }
+
+        // 5d. Minuteur de concentration.
+        let pomodoro_enabled = config.pomodoro_enabled;
+        let mut meta_timer = HashMap::new();
+        meta_timer.insert("name".into(), "Minuteur de concentration".into());
+        meta_timer.insert(
+            "description".into(),
+            format!(
+                "Cycle {} min de travail / {} min de pause, pause longue de {} min tous les {} blocs. \
+                 Aucune récompense : le minuteur favorise la santé, pas l'accumulation.",
+                core_config.pomodoro.work_secs / 60,
+                core_config.pomodoro.short_break_secs / 60,
+                core_config.pomodoro.long_break_secs / 60,
+                core_config.pomodoro.blocks_before_long_break,
+            ),
+        );
+        items.push(PaletteItem {
+            id: "focus_timer_enabled".into(),
+            title: "Minuteur de concentration".into(),
+            subtitle: if pomodoro_enabled {
+                "Activé • le démarrage de chaque phase reste volontaire".into()
+            } else {
+                "Désactivé • aucun temps mesuré ni rappel affiché".into()
+            },
+            section: PaletteSection::FocusTimer,
+            category: None,
+            badge: Some(
+                if pomodoro_enabled {
+                    "ACTIVÉ"
+                } else {
+                    "DÉSACTIVÉ"
+                }
+                .into(),
+            ),
+            is_equipped: pomodoro_enabled,
+            action: PaletteAction::TogglePomodoro,
+            metadata: meta_timer,
+            row_action: None,
+        });
+
+        if pomodoro_enabled {
+            // Seules les transitions réellement possibles sont proposées : une
+            // commande affichée puis refusée serait un faux bouton.
+            let timer_state = timer.state();
+            let mut meta_status = HashMap::new();
+            meta_status.insert("name".into(), "État du minuteur".into());
+            let (status_title, status_badge, status_subtitle) = match timer_state {
+                PomodoroState::Idle => (
+                    "Démarrer un bloc de concentration",
+                    "ARRÊTÉ".to_owned(),
+                    format!("{} min de travail", core_config.pomodoro.work_secs / 60),
+                ),
+                PomodoroState::Running(session) => (
+                    "Mettre en pause",
+                    format_remaining(session.remaining()),
+                    format!(
+                        "{} en cours • {} bloc(s) accompli(s)",
+                        session.phase().label(),
+                        session.completed_work_blocks()
+                    ),
+                ),
+                PomodoroState::Paused(session, reason) => (
+                    match session.phase() {
+                        PomodoroPhase::Work => "Reprendre la concentration",
+                        PomodoroPhase::ShortBreak | PomodoroPhase::LongBreak => {
+                            "Commencer la pause"
+                        }
+                    },
+                    format_remaining(session.remaining()),
+                    format!("{} • {}", session.phase().label(), reason.label()),
+                ),
+            };
+            meta_status.insert("description".into(), status_subtitle.clone());
+            items.push(PaletteItem {
+                id: "focus_timer_status".into(),
+                title: status_title.to_owned(),
+                subtitle: status_subtitle,
+                section: PaletteSection::FocusTimer,
+                category: None,
+                badge: Some(status_badge),
+                is_equipped: timer.is_running(),
+                action: match timer_state {
+                    PomodoroState::Idle => PaletteAction::StartPomodoro,
+                    PomodoroState::Running(_) => PaletteAction::PausePomodoro,
+                    PomodoroState::Paused(_, _) => PaletteAction::ResumePomodoro,
+                },
+                metadata: meta_status,
+                row_action: None,
+            });
+
+            if let PomodoroState::Running(session) | PomodoroState::Paused(session, _) = timer_state
+            {
+                if session.phase().is_break() {
+                    let mut meta_skip = HashMap::new();
+                    meta_skip.insert("name".into(), "Passer la pause".into());
+                    meta_skip.insert(
+                        "description".into(),
+                        "Prépare le bloc de travail suivant. Un bloc de travail, lui, ne se \
+                         saute pas : il serait comptabilisé sans avoir été accompli."
+                            .into(),
+                    );
+                    items.push(PaletteItem {
+                        id: "focus_timer_skip".into(),
+                        title: "Passer la pause".into(),
+                        subtitle: "Enchaîne sur le bloc de travail suivant".into(),
+                        section: PaletteSection::FocusTimer,
+                        category: None,
+                        badge: Some("PASSER".into()),
+                        is_equipped: false,
+                        action: PaletteAction::SkipPomodoroBreak,
+                        metadata: meta_skip,
+                        row_action: None,
+                    });
+                }
+
+                let mut meta_stop = HashMap::new();
+                meta_stop.insert("name".into(), "Arrêter le cycle".into());
+                meta_stop.insert(
+                    "description".into(),
+                    "Remet le minuteur à l'arrêt. Les blocs déjà accomplis ne sont pas perdus."
+                        .into(),
+                );
+                items.push(PaletteItem {
+                    id: "focus_timer_stop".into(),
+                    title: "Arrêter le cycle".into(),
+                    subtitle: format!("{} bloc(s) accompli(s)", session.completed_work_blocks()),
+                    section: PaletteSection::FocusTimer,
+                    category: None,
+                    badge: Some("ARRÊTER".into()),
+                    is_equipped: false,
+                    action: PaletteAction::StopPomodoro,
+                    metadata: meta_stop,
+                    row_action: None,
+                });
+            }
+        }
+
+        // 5e. Placement sur le bureau.
+        //
+        // Sous un compositeur qui ne publie ni position ni zone de travail, les
+        // bascules sont annoncées indisponibles plutôt que présentées comme
+        // actives : le réglage n'aurait aucun effet.
+        let placement_note = desktop_unavailable_reason
+            .map(|reason| format!("Indisponible sur cette plateforme : {reason}"));
+        for (id, title, enabled, action, description) in [
+            (
+                "desktop_motion",
+                "Chute douce au lâcher",
+                config.desktop_motion_enabled,
+                PaletteAction::ToggleDesktopMotion,
+                "Le familier retombe doucement vers le bas de la zone de travail après un \
+                 déplacement. Le mouvement réduit le place instantanément.",
+            ),
+            (
+                "desktop_magnetism",
+                "Ancrage aux bords",
+                config.desktop_magnetism_enabled,
+                PaletteAction::ToggleDesktopMagnetism,
+                "Le familier vient se caler au coin le plus proche lorsqu'il est lâché près \
+                 d'un bord, sinon il reste où il tombe.",
+            ),
+        ] {
+            let mut meta = HashMap::new();
+            meta.insert("name".into(), title.to_owned());
+            meta.insert(
+                "description".into(),
+                placement_note.as_ref().map_or_else(
+                    || description.to_owned(),
+                    |note| format!("{description}\n{note}"),
+                ),
+            );
+            items.push(PaletteItem {
+                id: id.to_owned(),
+                title: title.to_owned(),
+                subtitle: placement_note
+                    .clone()
+                    .unwrap_or_else(|| if enabled { "Activé" } else { "Désactivé" }.to_owned()),
+                section: PaletteSection::DesktopBehaviour,
+                category: None,
+                badge: Some(if !desktop_placement_available {
+                    "INDISPONIBLE".to_owned()
+                } else if enabled {
+                    "ACTIVÉ".to_owned()
+                } else {
+                    "DÉSACTIVÉ".to_owned()
+                }),
+                is_equipped: desktop_placement_available && enabled,
+                action: if desktop_placement_available {
+                    action
+                } else {
+                    PaletteAction::None
+                },
+                metadata: meta,
+                row_action: None,
+            });
+        }
+        // 6. Actions et préférences système
         let mut meta_autostart = HashMap::new();
         meta_autostart.insert("name".into(), "Lancement au démarrage de l'OS".into());
         meta_autostart.insert(
@@ -708,6 +1491,7 @@ impl CommandPalette {
             is_equipped: autostart_active,
             action: PaletteAction::ToggleAutostart,
             metadata: meta_autostart,
+            row_action: None,
         });
 
         let tooling_enabled = config.watcher.tooling_enabled;
@@ -750,6 +1534,7 @@ impl CommandPalette {
             is_equipped: tooling_enabled,
             action: PaletteAction::ToggleToolingWatcher,
             metadata: meta_tooling,
+            row_action: None,
         });
 
         let mut meta_focus_tracking = HashMap::new();
@@ -779,6 +1564,7 @@ impl CommandPalette {
             is_equipped: config.focus_tracking_enabled,
             action: PaletteAction::ToggleFocusTracking,
             metadata: meta_focus_tracking,
+            row_action: None,
         });
 
         let mut meta_breaks = HashMap::new();
@@ -804,6 +1590,7 @@ impl CommandPalette {
             is_equipped: config.break_reminders_enabled,
             action: PaletteAction::ToggleBreakReminders,
             metadata: meta_breaks,
+            row_action: None,
         });
 
         // Réglages d'accessibilité, groupés avant les réglages de fenêtre : ce
@@ -828,6 +1615,7 @@ impl CommandPalette {
             is_equipped: false,
             action: PaletteAction::CycleTextSize,
             metadata: meta_text_size,
+            row_action: None,
         });
 
         let mut meta_theme = HashMap::new();
@@ -850,6 +1638,7 @@ impl CommandPalette {
             is_equipped: false,
             action: PaletteAction::CycleTheme,
             metadata: meta_theme,
+            row_action: None,
         });
 
         let mut meta_motion = HashMap::new();
@@ -880,6 +1669,7 @@ impl CommandPalette {
             is_equipped: config.ui.reduced_motion,
             action: PaletteAction::ToggleReducedMotion,
             metadata: meta_motion,
+            row_action: None,
         });
 
         let mut meta_focus = HashMap::new();
@@ -910,6 +1700,7 @@ impl CommandPalette {
             is_equipped: config.ui.close_on_focus_loss,
             action: PaletteAction::ToggleCloseOnFocusLoss,
             metadata: meta_focus,
+            row_action: None,
         });
 
         let next_scale = config.next_scale_factor();
@@ -933,6 +1724,7 @@ impl CommandPalette {
             is_equipped: false,
             action: PaletteAction::CycleScaleFactor { next: next_scale },
             metadata: meta_scale,
+            row_action: None,
         });
 
         let mut meta_ct = HashMap::new();
@@ -962,6 +1754,7 @@ impl CommandPalette {
             is_equipped: config.click_through_enabled,
             action: PaletteAction::ToggleClickThrough,
             metadata: meta_ct,
+            row_action: None,
         });
 
         let mut meta_save = HashMap::new();
@@ -990,6 +1783,7 @@ impl CommandPalette {
             is_equipped: false,
             action: PaletteAction::SaveNow,
             metadata: meta_save,
+            row_action: None,
         });
 
         let mut meta_reload = HashMap::new();
@@ -1008,6 +1802,7 @@ impl CommandPalette {
             is_equipped: false,
             action: PaletteAction::ReloadAssets,
             metadata: meta_reload,
+            row_action: None,
         });
 
         let mut meta_folder = HashMap::new();
@@ -1026,6 +1821,7 @@ impl CommandPalette {
             is_equipped: false,
             action: PaletteAction::OpenModsFolder,
             metadata: meta_folder,
+            row_action: None,
         });
 
         let mut meta_data_folder = HashMap::new();
@@ -1044,6 +1840,7 @@ impl CommandPalette {
             is_equipped: false,
             action: PaletteAction::OpenDataFolder,
             metadata: meta_data_folder,
+            row_action: None,
         });
 
         self.all_items = items;
@@ -1083,6 +1880,7 @@ impl CommandPalette {
                 is_equipped: false,
                 action: PaletteAction::EnterGroup(group),
                 metadata,
+                row_action: None,
             });
         }
     }
@@ -1190,11 +1988,28 @@ impl CommandPalette {
         self.selected_index = 0;
     }
 
+    /// Ouvre une saisie guidée : le champ de recherche devient un champ de valeur.
+    pub fn enter_prompt(&mut self, kind: PromptKind) {
+        self.view = PaletteView::Prompt(kind);
+        self.query.clear();
+        self.caret = 0;
+        self.apply_filter();
+        self.selected_index = 0;
+    }
+
     /// Remonte d'un niveau, en signalant si un niveau a été quitté.
     ///
     /// La sélection est reposée sur le groupe qu'on quitte : remonter ne fait
     /// pas perdre le fil de là où l'on était.
     pub fn ascend(&mut self) -> bool {
+        // Une saisie guidée redescend dans le groupe qui l'a ouverte, jamais à
+        // la racine : abandonner un ajout ne doit pas renvoyer l'utilisateur
+        // deux niveaux plus haut que là où il était.
+        if let PaletteView::Prompt(kind) = self.view {
+            self.enter_group(kind.parent_group());
+            return true;
+        }
+
         let PaletteView::Group(group) = self.view else {
             return false;
         };
@@ -1223,6 +2038,15 @@ impl CommandPalette {
         self.filtered.clear();
         let query = self.query.trim();
 
+        // Mode saisie : le champ ne filtre plus, il porte une valeur. La liste se
+        // réduit à la ligne qui rend compte de sa validité en direct.
+        if let PaletteView::Prompt(kind) = self.view {
+            self.prompt_item = Some(Self::build_prompt_item(kind, query));
+            self.filtered.push(FilteredRef::Prompt);
+            return;
+        }
+        self.prompt_item = None;
+
         if query.is_empty() {
             match self.view {
                 PaletteView::Root => self
@@ -1235,6 +2059,8 @@ impl CommandPalette {
                         .filter(|(_, item)| item.section.group() == group)
                         .map(|(index, _)| FilteredRef::Leaf(index)),
                 ),
+                // Traité plus haut : le mode saisie ne passe jamais ici.
+                PaletteView::Prompt(_) => {}
             }
             return;
         }
@@ -1278,6 +2104,44 @@ impl CommandPalette {
                 .into_iter()
                 .map(|(_, _, index)| FilteredRef::Leaf(index)),
         );
+    }
+
+    /// Construit la ligne de confirmation du mode saisie.
+    ///
+    /// La validation est refaite à chaque frappe : un seul appel système par
+    /// caractère, et l'utilisateur sait immédiatement où il en est plutôt que de
+    /// découvrir le refus après avoir validé.
+    fn build_prompt_item(kind: PromptKind, raw: &str) -> PaletteItem {
+        let verdict = RepoPathVerdict::of(raw);
+        let mut metadata = HashMap::new();
+        metadata.insert("name".into(), kind.breadcrumb().to_owned());
+        metadata.insert("description".into(), verdict.message().to_owned());
+        if !raw.is_empty() {
+            metadata.insert("path".into(), raw.to_owned());
+        }
+
+        PaletteItem {
+            id: "prompt_add_tracked_repo".into(),
+            title: if raw.is_empty() {
+                kind.hint().to_owned()
+            } else {
+                raw.to_owned()
+            },
+            subtitle: verdict.message().to_owned(),
+            section: PaletteSection::GitWatcher,
+            category: None,
+            badge: Some(verdict.badge().to_owned()),
+            is_equipped: verdict == RepoPathVerdict::Valid,
+            // Une saisie invalide ne porte aucune action : valider ne produit
+            // alors rien, et surtout aucun faux succès.
+            action: if verdict == RepoPathVerdict::Valid {
+                PaletteAction::AddTrackedRepo(PathBuf::from(raw))
+            } else {
+                PaletteAction::None
+            },
+            metadata,
+            row_action: None,
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -1395,6 +2259,7 @@ impl CommandPalette {
         match reference {
             FilteredRef::Root(index) => self.root_items.get(index),
             FilteredRef::Leaf(index) => self.all_items.get(index),
+            FilteredRef::Prompt => self.prompt_item.as_ref(),
         }
     }
 
@@ -1412,10 +2277,35 @@ impl CommandPalette {
         let Some(action) = self.current_selected_item().map(|item| item.action.clone()) else {
             return PaletteExecutionResult::None;
         };
+        self.execute(&action, wardrobe)
+    }
 
-        match &action {
+    /// Exécute l'action secondaire de la ligne sélectionnée, si elle en porte une.
+    #[must_use]
+    pub fn execute_row_action(&mut self, wardrobe: &WardrobeEquipment) -> PaletteExecutionResult {
+        let Some(action) = self
+            .current_selected_item()
+            .and_then(|item| item.row_action.as_ref())
+            .map(|row_action| row_action.action.clone())
+        else {
+            return PaletteExecutionResult::None;
+        };
+        self.execute(&action, wardrobe)
+    }
+
+    /// Traduit une action de palette en résultat pour l'orchestrateur.
+    fn execute(
+        &mut self,
+        action: &PaletteAction,
+        wardrobe: &WardrobeEquipment,
+    ) -> PaletteExecutionResult {
+        match action {
             PaletteAction::EnterGroup(group) => {
                 self.enter_group(*group);
+                PaletteExecutionResult::None
+            }
+            PaletteAction::PromptAddTrackedRepo => {
+                self.enter_prompt(PromptKind::AddTrackedRepo);
                 PaletteExecutionResult::None
             }
             PaletteAction::ToggleAccessory { category, id } => {
@@ -1430,10 +2320,17 @@ impl CommandPalette {
                     }
                 }
             }
-            PaletteAction::FeedPet => PaletteExecutionResult::FeedPet,
             PaletteAction::PetGremlin => PaletteExecutionResult::PetGremlin,
-            PaletteAction::HealPet => PaletteExecutionResult::HealPet,
             PaletteAction::RevivePet => PaletteExecutionResult::RevivePet,
+            PaletteAction::UseConsumable(kind) => PaletteExecutionResult::UseConsumable(*kind),
+            PaletteAction::TogglePomodoro => PaletteExecutionResult::TogglePomodoro,
+            PaletteAction::StartPomodoro => PaletteExecutionResult::StartPomodoro,
+            PaletteAction::PausePomodoro => PaletteExecutionResult::PausePomodoro,
+            PaletteAction::ResumePomodoro => PaletteExecutionResult::ResumePomodoro,
+            PaletteAction::StopPomodoro => PaletteExecutionResult::StopPomodoro,
+            PaletteAction::SkipPomodoroBreak => PaletteExecutionResult::SkipPomodoroBreak,
+            PaletteAction::ToggleDesktopMotion => PaletteExecutionResult::ToggleDesktopMotion,
+            PaletteAction::ToggleDesktopMagnetism => PaletteExecutionResult::ToggleDesktopMagnetism,
             PaletteAction::ToggleSleep => PaletteExecutionResult::ToggleSleep,
             PaletteAction::ToggleClickThrough => PaletteExecutionResult::ToggleClickThrough,
             PaletteAction::ToggleAutostart => PaletteExecutionResult::ToggleAutostart,
@@ -1451,6 +2348,16 @@ impl CommandPalette {
             PaletteAction::CycleTheme => PaletteExecutionResult::CycleTheme,
             PaletteAction::ToggleReducedMotion => PaletteExecutionResult::ToggleReducedMotion,
             PaletteAction::ToggleCloseOnFocusLoss => PaletteExecutionResult::ToggleCloseOnFocusLoss,
+            PaletteAction::AddTrackedRepo(path) => {
+                PaletteExecutionResult::AddTrackedRepo(path.clone())
+            }
+            PaletteAction::RemoveTrackedRepo(path) => {
+                PaletteExecutionResult::RemoveTrackedRepo(path.clone())
+            }
+            PaletteAction::OpenRepoFolder(path) => {
+                PaletteExecutionResult::OpenRepoFolder(path.clone())
+            }
+            PaletteAction::BrowseForTrackedRepo => PaletteExecutionResult::BrowseForTrackedRepo,
             PaletteAction::None => PaletteExecutionResult::None,
         }
     }
@@ -1474,9 +2381,14 @@ mod tests {
             config,
             autostart_active: false,
             repos: &[],
+            current_dir_repo: None,
+            folder_picker_available: false,
             last_save_error: None,
             last_observation_error: None,
             pending_tooling_enabled: None,
+            today: CivilDate::new(2024, 5, 10).ok(),
+            desktop_placement_available: true,
+            desktop_unavailable_reason: None,
         }
     }
 
@@ -1497,15 +2409,20 @@ mod tests {
         palette.select_prev();
         assert_eq!(palette.selected_index(), 0);
 
-        palette.set_query("nourrir");
+        // Nourrir passe désormais par l'inventaire : la recherche doit tomber
+        // sur la collation, pas sur une action illimitée disparue.
+        palette.set_query("collation");
         assert_eq!(palette.filtered_len(), 1);
         assert_eq!(
             palette.filtered_item(0).map(|i| i.id.as_str()),
-            Some("care_feed")
+            Some("inventory_snack")
         );
 
         let res = palette.execute_selected(&wardrobe);
-        assert_eq!(res, PaletteExecutionResult::FeedPet);
+        assert_eq!(
+            res,
+            PaletteExecutionResult::UseConsumable(ConsumableKind::Snack)
+        );
     }
 
     #[test]
@@ -1624,5 +2541,218 @@ mod tests {
             palette.execute_selected(&wardrobe),
             PaletteExecutionResult::RevivePet
         );
+    }
+
+    /// Palette avec une liste de dépôts déclarés.
+    fn palette_with_repos(
+        catalog: &AccessoryCatalog,
+        wardrobe: &WardrobeEquipment,
+        pet: &PetState,
+        config: &AppConfig,
+        repos: &[RepoDisplayInfo],
+    ) -> CommandPalette {
+        CommandPalette::new(&PaletteContext {
+            repos,
+            ..context(catalog, wardrobe, pet, config)
+        })
+    }
+
+    /// Dépôt déclaré factice.
+    fn fake_repo(name: &str) -> RepoDisplayInfo {
+        let path = if cfg!(windows) {
+            PathBuf::from(format!(r"C:\depots\{name}"))
+        } else {
+            PathBuf::from(format!("/depots/{name}"))
+        };
+        RepoDisplayInfo::declared(path, RepoTrackingStatus::Active, None)
+    }
+
+    #[test]
+    fn test_repos_group_survives_an_empty_repo_list() {
+        // L'action d'ajout est permanente : sans elle, le groupe disparaîtrait
+        // de la racine et l'état vide n'aurait nulle part où s'expliquer.
+        let catalog = AccessoryCatalog::new();
+        let wardrobe = WardrobeEquipment::default();
+        let pet = PetState::new("Gizmo");
+        let config = AppConfig::default();
+
+        let mut palette = CommandPalette::new(&context(&catalog, &wardrobe, &pet, &config));
+        assert!(palette
+            .filtered_items()
+            .any(|item| item.action == PaletteAction::EnterGroup(PaletteGroup::Repos)));
+
+        palette.enter_group(PaletteGroup::Repos);
+        assert_eq!(palette.filtered_len(), 1);
+        let item = palette.filtered_item(0).expect("action d'ajout");
+        assert_eq!(item.action, PaletteAction::PromptAddTrackedRepo);
+        assert!(item.subtitle.contains("Aucun dépôt surveillé"));
+    }
+
+    #[test]
+    fn test_repo_rows_carry_a_named_removal_action() {
+        let catalog = AccessoryCatalog::new();
+        let wardrobe = WardrobeEquipment::default();
+        let pet = PetState::new("Gizmo");
+        let config = AppConfig::default();
+        let repos = [fake_repo("alpha")];
+
+        let mut palette = palette_with_repos(&catalog, &wardrobe, &pet, &config, &repos);
+        palette.enter_group(PaletteGroup::Repos);
+
+        let row = (0..palette.filtered_len())
+            .find(|index| {
+                palette
+                    .filtered_item(*index)
+                    .is_some_and(|item| item.row_action.is_some())
+            })
+            .expect("la ligne du dépôt doit porter une action");
+        palette.select_index(row);
+
+        let item = palette.filtered_item(row).expect("ligne de dépôt");
+        let action = item.row_action.as_ref().expect("action de ligne");
+        assert_eq!(action.icon, RowActionIcon::Trash);
+        assert_eq!(action.label, "Retirer alpha de la surveillance");
+
+        // Valider la ligne ouvre le dossier ; le bouton, lui, retire le dépôt.
+        assert_eq!(
+            palette.execute_selected(&wardrobe),
+            PaletteExecutionResult::OpenRepoFolder(repos[0].path.clone())
+        );
+        assert_eq!(
+            palette.execute_row_action(&wardrobe),
+            PaletteExecutionResult::RemoveTrackedRepo(repos[0].path.clone())
+        );
+    }
+
+    #[test]
+    fn test_rows_without_action_ignore_the_row_action_gesture() {
+        let catalog = AccessoryCatalog::new();
+        let wardrobe = WardrobeEquipment::default();
+        let pet = PetState::new("Gizmo");
+        let config = AppConfig::default();
+
+        let mut palette = CommandPalette::new(&context(&catalog, &wardrobe, &pet, &config));
+        palette.enter_group(PaletteGroup::Preferences);
+
+        assert_eq!(
+            palette.execute_row_action(&wardrobe),
+            PaletteExecutionResult::None,
+            "la touche de retrait ne doit rien déclencher hors des dépôts"
+        );
+    }
+
+    #[test]
+    fn test_prompt_mode_reports_the_verdict_of_the_typed_path() {
+        let catalog = AccessoryCatalog::new();
+        let wardrobe = WardrobeEquipment::default();
+        let pet = PetState::new("Gizmo");
+        let config = AppConfig::default();
+
+        let mut palette = CommandPalette::new(&context(&catalog, &wardrobe, &pet, &config));
+        palette.enter_prompt(PromptKind::AddTrackedRepo);
+
+        // Saisie vide : une seule ligne, en attente, sans action.
+        assert_eq!(palette.filtered_len(), 1);
+        let item = palette.filtered_item(0).expect("ligne de confirmation");
+        assert_eq!(item.badge.as_deref(), Some("EN ATTENTE"));
+        assert_eq!(item.action, PaletteAction::None);
+
+        // Chemin relatif : refusé, et le motif est dit.
+        palette.set_query("projet_relatif");
+        let item = palette.filtered_item(0).expect("ligne de confirmation");
+        assert_eq!(item.badge.as_deref(), Some("INVALIDE"));
+        assert!(item.subtitle.contains("chemin absolu"));
+        assert_eq!(
+            palette.execute_selected(&wardrobe),
+            PaletteExecutionResult::None,
+            "valider une saisie invalide ne doit produire aucun faux succès"
+        );
+
+        // Chemin absolu qui n'est pas un dépôt : refusé aussi.
+        palette.set_query(if cfg!(windows) {
+            r"C:\chemin\qui\nexiste\pas"
+        } else {
+            "/chemin/qui/nexiste/pas"
+        });
+        let item = palette.filtered_item(0).expect("ligne de confirmation");
+        assert_eq!(item.badge.as_deref(), Some("INVALIDE"));
+        assert!(item.subtitle.contains("dépôt Git valide"));
+    }
+
+    #[test]
+    fn test_prompt_mode_accepts_a_real_repository() {
+        let catalog = AccessoryCatalog::new();
+        let wardrobe = WardrobeEquipment::default();
+        let pet = PetState::new("Gizmo");
+        let config = AppConfig::default();
+
+        // Le dépôt doit exister sur le disque : c'est tout l'intérêt de la
+        // validation en direct.
+        let root = std::env::temp_dir().join(format!(
+            "gremlin-palette-prompt-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(root.join(".git")).expect("dépôt de test");
+
+        let mut palette = CommandPalette::new(&context(&catalog, &wardrobe, &pet, &config));
+        palette.enter_prompt(PromptKind::AddTrackedRepo);
+        palette.set_query(root.to_string_lossy().as_ref());
+
+        let item = palette.filtered_item(0).expect("ligne de confirmation");
+        assert_eq!(item.badge.as_deref(), Some("VALIDE"));
+        assert_eq!(
+            palette.execute_selected(&wardrobe),
+            PaletteExecutionResult::AddTrackedRepo(root.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_leaving_the_prompt_returns_to_the_repos_group() {
+        // Abandonner un ajout ne doit pas renvoyer deux niveaux plus haut.
+        let catalog = AccessoryCatalog::new();
+        let wardrobe = WardrobeEquipment::default();
+        let pet = PetState::new("Gizmo");
+        let config = AppConfig::default();
+
+        let mut palette = CommandPalette::new(&context(&catalog, &wardrobe, &pet, &config));
+        palette.enter_group(PaletteGroup::Repos);
+        palette.enter_prompt(PromptKind::AddTrackedRepo);
+        assert!(palette.view().is_prompt());
+
+        assert!(palette.ascend());
+        assert_eq!(palette.view(), PaletteView::Group(PaletteGroup::Repos));
+        assert!(palette.query().is_empty());
+
+        assert!(palette.ascend());
+        assert_eq!(palette.view(), PaletteView::Root);
+    }
+
+    #[test]
+    fn test_folder_browsing_entry_appears_only_when_supported() {
+        let catalog = AccessoryCatalog::new();
+        let wardrobe = WardrobeEquipment::default();
+        let pet = PetState::new("Gizmo");
+        let config = AppConfig::default();
+
+        let has_browse = |available: bool| {
+            let mut palette = CommandPalette::new(&PaletteContext {
+                folder_picker_available: available,
+                ..context(&catalog, &wardrobe, &pet, &config)
+            });
+            palette.enter_group(PaletteGroup::Repos);
+            (0..palette.filtered_len()).any(|index| {
+                palette
+                    .filtered_item(index)
+                    .is_some_and(|item| item.action == PaletteAction::BrowseForTrackedRepo)
+            })
+        };
+
+        // Une commande qui échouerait systématiquement vaut moins qu'une
+        // commande absente : la saisie du chemin reste disponible partout.
+        assert!(has_browse(true));
+        assert!(!has_browse(false));
     }
 }

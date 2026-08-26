@@ -1,13 +1,21 @@
 //! Types d'erreurs pour la surveillance de fichiers et dépôts Git.
 
+use std::path::PathBuf;
 use thiserror::Error;
 
-/// Erreurs de surveillance de fichiers et de découverte de dépôts.
+/// Erreurs de surveillance de fichiers et d'enregistrement de dépôts.
 #[derive(Debug, Error)]
 pub enum WatcherError {
     /// Erreur liée au moteur `notify`.
     #[error("erreur notify : {0}")]
     Notify(#[from] notify::Error),
+
+    /// Le chemin demandé n'est pas la racine d'un dépôt Git.
+    ///
+    /// Distinguée d'une erreur `notify` pour que l'interface puisse l'expliquer
+    /// en clair au lieu de recopier un message système.
+    #[error("« {0} » n'est pas un dépôt Git valide")]
+    NotARepository(PathBuf),
 
     /// Erreur d'entrée/sortie système.
     #[error("erreur I/O : {0}")]

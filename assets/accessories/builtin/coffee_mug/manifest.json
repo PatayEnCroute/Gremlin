@@ -1,0 +1,46 @@
+{
+  "id": "coffee_mug",
+  "name": "Mug de Café",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Held",
+  "description": "Un petit mug en céramique dont la vapeur accompagne les sessions concentrées.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "coffee_mug_default_0",
+    "coffee_mug_default_1",
+    "coffee_mug_default_2"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 32,
+    "y": 28
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "coffee_mug_baby_0",
+        "coffee_mug_baby_1",
+        "coffee_mug_baby_2"
+      ],
+      "anchor": {
+        "x": 32,
+        "y": 24
+      }
+    },
+    "evolved": {
+      "frames": [
+        "coffee_mug_evolved_0",
+        "coffee_mug_evolved_1",
+        "coffee_mug_evolved_2"
+      ],
+      "anchor": {
+        "x": 32,
+        "y": 30
+      }
+    }
+  },
+  "clip_to_body": false
+}

@@ -112,6 +112,13 @@ pub struct Theme {
     pub text_section: [u8; 4],
     /// Texte d'une pastille active.
     pub text_badge_active: [u8; 4],
+    /// Pictogramme d'une action secondaire de ligne, au repos.
+    ///
+    /// Composant porteur d'état : soumis au seuil WCAG de 3:1 sur le fond de la
+    /// ligne, et non au seuil de texte.
+    pub icon_action: [u8; 4],
+    /// Pictogramme d'une action secondaire de ligne, sous le curseur.
+    pub icon_action_hover: [u8; 4],
     /// Rail de l'ascenseur.
     pub scrollbar_track: [u8; 4],
     /// Curseur de l'ascenseur.
@@ -147,6 +154,8 @@ impl Theme {
         text_muted: [158, 158, 172, 255],
         text_section: [150, 150, 164, 255],
         text_badge_active: [255, 150, 150, 255],
+        icon_action: [158, 158, 172, 255],
+        icon_action_hover: [240, 96, 100, 255],
         scrollbar_track: [30, 30, 38, 255],
         scrollbar_thumb: [124, 124, 140, 255],
         bar_bg: [34, 34, 44, 255],
@@ -173,6 +182,8 @@ impl Theme {
         text_muted: [82, 82, 96, 255],
         text_section: [88, 88, 102, 255],
         text_badge_active: [150, 22, 28, 255],
+        icon_action: [96, 97, 112, 255],
+        icon_action_hover: [176, 26, 34, 255],
         scrollbar_track: [234, 234, 241, 255],
         scrollbar_thumb: [118, 119, 134, 255],
         bar_bg: [222, 223, 232, 255],
@@ -202,6 +213,8 @@ impl Theme {
         text_muted: [235, 235, 235, 255],
         text_section: [235, 235, 235, 255],
         text_badge_active: [255, 214, 0, 255],
+        icon_action: [255, 255, 255, 255],
+        icon_action_hover: [255, 214, 0, 255],
         scrollbar_track: [40, 40, 40, 255],
         scrollbar_thumb: [255, 255, 255, 255],
         bar_bg: [50, 50, 50, 255],
@@ -400,6 +413,30 @@ mod tests {
                 "liseré de survol sur fond",
                 theme.accent,
                 theme.bg_row_hover,
+            ),
+            // Le pictogramme d'action est le seul indice qu'une ligne peut être
+            // retirée : sans lui, la fonction n'existe pas pour l'œil. Il est
+            // donc porteur d'information au sens de WCAG 1.4.11, sur les trois
+            // fonds de ligne possibles et dans ses deux états.
+            (
+                "pictogramme d'action sur fond",
+                theme.icon_action,
+                theme.bg_primary,
+            ),
+            (
+                "pictogramme d'action sur ligne sélectionnée",
+                theme.icon_action,
+                theme.bg_selected,
+            ),
+            (
+                "pictogramme d'action sur ligne survolée",
+                theme.icon_action_hover,
+                theme.bg_row_hover,
+            ),
+            (
+                "pictogramme d'action survolé sur ligne sélectionnée",
+                theme.icon_action_hover,
+                theme.bg_selected,
             ),
             (
                 "curseur d'ascenseur sur rail",

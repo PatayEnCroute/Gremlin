@@ -52,6 +52,13 @@ pub const LIST_ID: NodeId = NodeId(2);
 /// sans renuméroter les lignes, ce qui provoquerait des annonces parasites.
 const FIRST_ROW_ID: u64 = 16;
 
+/// Nombre d'identifiants réservés par ligne.
+///
+/// Une ligne peut porter un bouton d'action, qui est un nœud à part entière :
+/// sans identifiant propre, il n'existerait pas pour un lecteur d'écran et la
+/// commande ne serait accessible qu'à la souris.
+const IDS_PER_ROW: u64 = 2;
+
 /// Nombre maximal de lignes exposées à l'arbre.
 ///
 /// Un lecteur d'écran parcourt la liste entière, pas seulement la portion
@@ -63,13 +70,30 @@ const MAX_EXPOSED_ROWS: usize = 500;
 /// Identifiant du nœud de la `index`-ième ligne filtrée.
 #[must_use]
 pub const fn row_id(index: usize) -> NodeId {
-    NodeId(FIRST_ROW_ID + index as u64)
+    NodeId(FIRST_ROW_ID + index as u64 * IDS_PER_ROW)
+}
+
+/// Identifiant du bouton d'action de la `index`-ième ligne filtrée.
+#[must_use]
+pub const fn row_action_id(index: usize) -> NodeId {
+    NodeId(FIRST_ROW_ID + index as u64 * IDS_PER_ROW + 1)
 }
 
 /// Indice de ligne correspondant à un identifiant de nœud, s'il en désigne une.
+///
+/// Le bouton d'action d'une ligne renvoie l'indice de **sa** ligne : activer le
+/// bouton et activer la ligne visent la même entrée, seule l'action diffère.
 #[must_use]
 pub fn row_index(id: NodeId) -> Option<usize> {
-    id.0.checked_sub(FIRST_ROW_ID).map(|index| index as usize)
+    id.0.checked_sub(FIRST_ROW_ID)
+        .map(|offset| (offset / IDS_PER_ROW) as usize)
+}
+
+/// Indique si l'identifiant désigne un bouton d'action plutôt que sa ligne.
+#[must_use]
+pub fn is_row_action(id: NodeId) -> bool {
+    id.0.checked_sub(FIRST_ROW_ID)
+        .is_some_and(|offset| offset % IDS_PER_ROW == 1)
 }
 
 /// Construit l'arbre complet décrivant l'état courant du panneau.
@@ -105,7 +129,17 @@ pub fn tree_update(palette: &CommandPalette) -> TreeUpdate {
         let Some(item) = palette.filtered_item(index) else {
             continue;
         };
-        nodes.push((*id, build_row(item)));
+        nodes.push((*id, build_row(item, index)));
+
+        // Le bouton d'action est un nœud enfant, avec son propre libellé : sans
+        // lui, retirer un dépôt resterait une commande réservée à la souris.
+        if let Some(action) = item.row_action.as_ref() {
+            let mut button = Node::new(Role::Button);
+            button.set_label(action.label.clone());
+            button.add_action(Action::Click);
+            button.add_action(Action::Focus);
+            nodes.push((row_action_id(index), button));
+        }
     }
 
     // --- racine -------------------------------------------------------------
@@ -132,7 +166,7 @@ pub fn tree_update(palette: &CommandPalette) -> TreeUpdate {
 }
 
 /// Construit le nœud d'une ligne.
-fn build_row(item: &PaletteItem) -> Node {
+fn build_row(item: &PaletteItem, index: usize) -> Node {
     // Une bascule est annoncée comme telle, avec son état : un lecteur d'écran
     // dira « activé » ou « désactivé » au lieu de laisser l'utilisateur deviner
     // ce que fait la validation.
@@ -144,15 +178,24 @@ fn build_row(item: &PaletteItem) -> Node {
             Toggled::False
         });
         node
+    } else if item.is_command_button() {
+        Node::new(Role::Button)
     } else {
         Node::new(Role::ListItem)
     };
 
     node.set_label(item.title.clone());
     node.set_description(describe_row(item));
-    node.add_action(Action::Click);
+    // Une ligne informative n'annonce pas d'activation : promettre un clic qui
+    // ne fait rien est pire que de ne rien promettre.
+    if !item.is_informational() {
+        node.add_action(Action::Click);
+    }
     node.add_action(Action::Focus);
     node.add_action(Action::ScrollIntoView);
+    if item.row_action.is_some() {
+        node.set_children([row_action_id(index)]);
+    }
 
     node
 }
@@ -171,6 +214,14 @@ fn describe_row(item: &PaletteItem) -> String {
         // Sans cette mention, rien ne distingue à l'oreille une entrée qui ouvre
         // une sous-liste d'une commande qui agit immédiatement.
         parts.push(String::from("ouvre une sous-liste"));
+    }
+    if item.row_action.is_some() {
+        parts.push(String::from("touche Suppr pour retirer"));
+    }
+    if item.is_informational() {
+        // Sans cette mention, rien ne distingue à l'oreille une ligne de lecture
+        // d'une commande dont la validation resterait sans effet visible.
+        parts.push(String::from("information"));
     }
 
     parts.join(" — ")
@@ -199,9 +250,20 @@ fn describe_count(total: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
-    use crate::ui::command_palette::{PaletteContext, PaletteGroup, RepoDisplayInfo};
+    use crate::ui::command_palette::{
+        PaletteContext, PaletteGroup, RepoDisplayInfo, RepoTrackingStatus,
+    };
+
+    /// Chemin absolu de test, valide sur les trois systèmes.
+    fn test_repo_path(name: &str) -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(format!(r"C:\depots\{name}"))
+        } else {
+            std::path::PathBuf::from(format!("/depots/{name}"))
+        }
+    }
     use gremlin_core::PetState;
-    use gremlin_render::procedural_accessories::register_default_procedural_accessories;
+    use gremlin_render::register_default_accessories;
     use gremlin_render::{AccessoryCatalog, SpriteAtlas, WardrobeEquipment};
 
     struct Harness {
@@ -216,7 +278,7 @@ mod tests {
             let mut atlas = SpriteAtlas::new();
             atlas.load_default_procedural_sprites();
             let mut catalog = AccessoryCatalog::new();
-            register_default_procedural_accessories(&mut atlas, &mut catalog);
+            register_default_accessories(&mut atlas, &mut catalog);
 
             Self {
                 catalog,
@@ -234,9 +296,14 @@ mod tests {
                 config: &self.config,
                 autostart_active: false,
                 repos,
+                current_dir_repo: None,
+                folder_picker_available: false,
                 last_save_error: None,
                 last_observation_error: None,
                 pending_tooling_enabled: None,
+                today: gremlin_core::CivilDate::new(2024, 5, 10).ok(),
+                desktop_placement_available: true,
+                desktop_unavailable_reason: None,
             })
         }
     }
@@ -409,9 +476,12 @@ mod tests {
         let harness = Harness::new();
         let repos: Vec<RepoDisplayInfo> = (0..MAX_EXPOSED_ROWS + 200)
             .map(|index| RepoDisplayInfo {
+                path: test_repo_path(&format!("dépôt-{index}")),
                 name: format!("dépôt-{index}"),
                 branch: Some(String::from("main")),
                 last_commit_msg: None,
+                status: RepoTrackingStatus::Active,
+                issue: None,
             })
             .collect();
 
@@ -434,6 +504,12 @@ mod tests {
     fn test_row_identifiers_round_trip() {
         for index in [0_usize, 1, 42, MAX_EXPOSED_ROWS - 1] {
             assert_eq!(row_index(row_id(index)), Some(index));
+            assert!(!is_row_action(row_id(index)));
+
+            // Le bouton d'une ligne désigne la même ligne, mais se distingue.
+            assert_eq!(row_index(row_action_id(index)), Some(index));
+            assert!(is_row_action(row_action_id(index)));
+            assert_ne!(row_action_id(index), row_id(index));
         }
         // Les nœuds fixes ne doivent pas être pris pour des lignes.
         assert_eq!(row_index(ROOT_ID), None);
@@ -442,12 +518,70 @@ mod tests {
     }
 
     #[test]
+    fn test_row_action_is_exposed_as_a_named_button() {
+        // Le retrait d'un dépôt ne doit pas être une commande réservée à la
+        // souris : elle existe comme bouton nommé dans l'arbre.
+        let harness = Harness::new();
+        let repos = vec![RepoDisplayInfo {
+            path: test_repo_path("alpha"),
+            name: "alpha".into(),
+            branch: Some("main".into()),
+            last_commit_msg: None,
+            status: RepoTrackingStatus::Active,
+            issue: None,
+        }];
+
+        let mut palette = harness.palette(&repos);
+        palette.enter_group(PaletteGroup::Repos);
+
+        let row = (0..palette.filtered_len())
+            .find(|index| {
+                palette
+                    .filtered_item(*index)
+                    .is_some_and(|item| item.row_action.is_some())
+            })
+            .expect("une ligne de dépôt doit porter une action");
+
+        let update = tree_update(&palette);
+        let button = node_of(&update, row_action_id(row));
+
+        assert_eq!(button.role(), Role::Button);
+        assert_eq!(
+            button.label(),
+            Some("Retirer alpha de la surveillance"),
+            "le bouton doit se nommer, sinon il est muet au lecteur d'écran"
+        );
+        assert!(button.supports_action(Action::Click));
+
+        // Il est rattaché à sa ligne, et non orphelin dans l'arbre.
+        assert!(node_of(&update, row_id(row))
+            .children()
+            .contains(&row_action_id(row)));
+    }
+
+    #[test]
+    fn test_rows_without_action_expose_no_button() {
+        let harness = Harness::new();
+        let mut palette = harness.palette(&[]);
+        palette.enter_group(PaletteGroup::Repos);
+
+        let update = tree_update(&palette);
+        assert!(
+            !update.nodes.iter().any(|(id, _)| is_row_action(*id)),
+            "aucun bouton ne doit exister sans ligne qui le porte"
+        );
+    }
+
+    #[test]
     fn test_hostile_metadata_does_not_break_the_tree() {
         let harness = Harness::new();
         let repos = vec![RepoDisplayInfo {
+            path: test_repo_path("dépôt-🐉-漢字-très-long"),
             name: "dépôt-🐉-漢字-très-long".into(),
             branch: Some("feature/été".into()),
             last_commit_msg: Some("fix: gère « l'unicode » — et le reste".into()),
+            status: RepoTrackingStatus::Active,
+            issue: None,
         }];
 
         let mut palette = harness.palette(&repos);

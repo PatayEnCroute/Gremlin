@@ -16,26 +16,34 @@
 //! * `tick` termine toujours, quelle que soit la durée écoulée fournie.
 
 pub mod action;
+pub mod calendar;
 pub mod config;
 pub mod error;
 pub mod events;
 pub mod focus;
 pub mod mood;
+pub mod productivity;
 pub mod progression;
 pub mod state;
 pub mod stats;
 pub mod tooling;
 
 pub use action::ActionKind;
+pub use calendar::{CivilDate, MAX_CIVIL_YEAR, MIN_CIVIL_YEAR};
 pub use config::{
-    ActionConfig, CoreConfig, DecayConfig, FocusConfig, MoodConfig, ToolingRewardsConfig,
-    DEFAULT_CATCHUP_STEP_SECS, MAX_CATCHUP_DURATION_SECS, MAX_CATCHUP_STEP_SECS,
-    MIN_CATCHUP_STEP_SECS,
+    ActionConfig, CoreConfig, DecayConfig, FocusConfig, InventoryConfig, MoodConfig,
+    PomodoroConfig, StreakConfig, ToolingRewardsConfig, DEFAULT_CATCHUP_STEP_SECS,
+    MAX_CATCHUP_DURATION_SECS, MAX_CATCHUP_STEP_SECS, MIN_CATCHUP_STEP_SECS,
 };
 pub use error::CoreError;
 pub use events::CoreEvent;
 pub use focus::ActivityState;
 pub use mood::PetMood;
+pub use productivity::{
+    ConsumableEffect, ConsumableKind, GrantOutcome, GrantReason, Inventory, PauseReason,
+    PomodoroPhase, PomodoroState, PomodoroTimer, ProductivityState, StreakReward, StreakSnapshot,
+    StreakTracker, WellbeingReminderKind, CONSUMABLE_COUNT, STREAK_REWARD_COUNT,
+};
 pub use progression::{EvolutionStage, PetProgression, MIN_LEVEL};
 pub use state::{PetState, SAVE_FORMAT_VERSION};
 pub use stats::{PetStats, MAX_STAT_VALUE, MIN_STAT_VALUE};

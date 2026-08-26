@@ -1,0 +1,49 @@
+{
+  "id": "matrix_aura",
+  "name": "Pluie de Code",
+  "author": "Gremlin Studio",
+  "version": "3.0.0",
+  "category": "Aura",
+  "description": "Des flux de glyphes abstraits descendent autour du Gremlin en laissant son centre libre.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "matrix_aura_default_0",
+    "matrix_aura_default_1",
+    "matrix_aura_default_2",
+    "matrix_aura_default_3"
+  ],
+  "frame_duration_ms": 180,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 0,
+    "y": 0
+  },
+  "variants": {
+    "baby": {
+      "frames": [
+        "matrix_aura_baby_0",
+        "matrix_aura_baby_1",
+        "matrix_aura_baby_2",
+        "matrix_aura_baby_3"
+      ],
+      "anchor": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    "evolved": {
+      "frames": [
+        "matrix_aura_evolved_0",
+        "matrix_aura_evolved_1",
+        "matrix_aura_evolved_2",
+        "matrix_aura_evolved_3"
+      ],
+      "anchor": {
+        "x": 0,
+        "y": 0
+      }
+    }
+  },
+  "clip_to_body": false
+}

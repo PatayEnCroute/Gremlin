@@ -62,10 +62,10 @@ impl AnimationDef {
 ///
 /// # Convention d'ancrage
 ///
-/// Voir [`crate::layer::LayerCompositor`] : les sprites de calque sont dessinés sur un
-/// canevas pleine taille et déjà positionnés. Le champ [`SkinManifest::anchors`] porte
-/// des points sémantiques pour les auteurs, l'outillage et les effets (`head`,
-/// `effect_origin`) ; il n'est jamais ajouté comme translation à la composition.
+/// Les sprites de calque restent dessinés sur un canevas pleine taille, mais leur point
+/// d'attache est recalé sur [`SkinManifest::anchors`]. Les décalages de
+/// [`SkinManifest::anchor_offsets_per_mood`] font ensuite suivre les changements de pose
+/// sans imposer une variante PNG de chaque accessoire pour chaque animation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkinManifest {
     /// Nom du skin (ex: "Classic Gremlin").
@@ -74,16 +74,31 @@ pub struct SkinManifest {
     pub author: String,
     /// Version du format de manifest.
     pub version: String,
+    /// Famille visuelle utilisée pour résoudre les variantes d'accessoires.
+    ///
+    /// Les valeurs intégrées sont `default`, `baby` et `evolved`. Toute autre
+    /// valeur est normalisée vers `default`, ce qui garde les packs historiques
+    /// compatibles et empêche une entrée disque arbitraire de piloter un chemin.
+    #[serde(default = "default_accessory_style")]
+    pub accessory_style: String,
     /// Largeur d'une frame en pixels (ex: 64), bornée par [`MAX_FRAME_DIMENSION`].
     pub frame_width: u32,
     /// Hauteur d'une frame en pixels (ex: 64), bornée par [`MAX_FRAME_DIMENSION`].
     pub frame_height: u32,
     /// Points d'ancrage de référence pour chaque calque ("hat", "glasses", "held", etc.).
     ///
-    /// Métadonnées sémantiques : consultées par l'outillage et éventuellement par
-    /// l'orchestrateur d'effets, jamais appliquées comme décalage par le compositeur.
+    /// Le compositeur aligne le point source déclaré par l'accessoire sur le point
+    /// correspondant du skin actif.
     #[serde(default)]
     pub anchors: BTreeMap<String, AnchorPoint>,
+    /// Ajustements d'ancrage propres à chaque humeur ou pose.
+    ///
+    /// Une entrée peut cibler directement un calque (`hat`, `glasses`, `outfit`,
+    /// `held`, `aura`) ou un groupe sémantique : `head` s'applique aux chapeaux et
+    /// lunettes, `body` aux tenues et objets tenus. Une entrée de calque précise
+    /// prime sur celle du groupe.
+    #[serde(default)]
+    pub anchor_offsets_per_mood: BTreeMap<String, BTreeMap<String, AnchorPoint>>,
     /// Définitions des animations configurées dans le skin.
     #[serde(default)]
     pub animations: BTreeMap<String, AnimationDef>,
@@ -111,6 +126,14 @@ impl SkinManifest {
     /// Seules les durées de frames sont concernées : elles sont rabotées plutôt que
     /// de faire échouer tout un pack de skin pour une coquille.
     pub fn normalize(&mut self) {
+        let normalized_style = self.accessory_style.trim().to_ascii_lowercase();
+        self.accessory_style =
+            if matches!(normalized_style.as_str(), "default" | "baby" | "evolved") {
+                normalized_style
+            } else {
+                String::from("default")
+            };
+
         for (anim_name, def) in &mut self.animations {
             let (clamped, adjusted) = clamp_frame_duration_ms(def.frame_duration_ms);
             if adjusted {
@@ -147,7 +170,49 @@ impl SkinManifest {
             }
         }
 
+        for (mood, offsets) in &self.anchor_offsets_per_mood {
+            for (name, offset) in offsets {
+                if offset.x.unsigned_abs() > MAX_ANCHOR_OFFSET.unsigned_abs()
+                    || offset.y.unsigned_abs() > MAX_ANCHOR_OFFSET.unsigned_abs()
+                {
+                    return Err(RenderError::invalid_field(
+                        format!("anchor_offsets_per_mood.{mood}.{name}"),
+                        format!(
+                            "({}, {}) dépasse la borne de ±{MAX_ANCHOR_OFFSET} px",
+                            offset.x, offset.y
+                        ),
+                    ));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Résout le point d'attache d'un calque pour l'humeur courante.
+    ///
+    /// L'ancre globale reste le repli compatible avec les anciens manifests. Les
+    /// groupes `head` et `body` évitent de répéter le même mouvement pour plusieurs
+    /// catégories, tandis qu'une correction propre au calque garde la priorité.
+    #[must_use]
+    pub fn anchor_for_mood(&self, anchor_name: &str, mood_key: &str) -> Option<AnchorPoint> {
+        let anchor = *self.anchors.get(anchor_name)?;
+        let offsets = self.anchor_offsets_per_mood.get(mood_key);
+        let semantic_name = match anchor_name {
+            "hat" | "glasses" => Some("head"),
+            "outfit" | "held" => Some("body"),
+            _ => None,
+        };
+        let offset = offsets
+            .and_then(|values| values.get(anchor_name))
+            .or_else(|| semantic_name.and_then(|name| offsets?.get(name)))
+            .copied()
+            .unwrap_or(AnchorPoint { x: 0, y: 0 });
+
+        Some(AnchorPoint {
+            x: anchor.x.saturating_add(offset.x),
+            y: anchor.y.saturating_add(offset.y),
+        })
     }
 
     /// Vérifie que les dimensions d'une image décodée correspondent à celles annoncées.
@@ -201,6 +266,10 @@ impl SkinManifest {
 
         controller
     }
+}
+
+fn default_accessory_style() -> String {
+    String::from("default")
 }
 
 /// Valide une dimension de frame issue d'un manifest non fiable.
@@ -281,6 +350,39 @@ mod tests {
         assert_eq!(controller.current_frame_key(), Some("idle_0"));
         controller.update(Duration::from_millis(250));
         assert_eq!(controller.current_frame_key(), Some("idle_1"));
+    }
+
+    #[test]
+    fn test_style_daccessoire_absent_vaut_default() {
+        // Un pack écrit avant la refonte des accessoires reste servi par le
+        // tracé classique, sans migration ni rejet.
+        let json = manifest_json(r#""anchors": { "hat": { "x": 16, "y": 4 } }"#);
+        let manifest = match SkinManifest::from_json(&json) {
+            Ok(m) => m,
+            Err(e) => panic!("manifest historique rejeté : {e}"),
+        };
+        assert_eq!(manifest.accessory_style, "default");
+    }
+
+    #[test]
+    fn test_style_daccessoire_est_normalise_ou_ramene_a_default() {
+        // Le style pilote le choix d'une variante : une valeur venue du disque
+        // ne doit jamais désigner autre chose que les trois familles connues.
+        for (raw, expected) in [
+            (" Baby ", "baby"),
+            ("EVOLVED", "evolved"),
+            ("default", "default"),
+            ("cyber", "default"),
+            ("", "default"),
+            ("../../etc", "default"),
+        ] {
+            let json = manifest_json(&format!(r#""accessory_style": "{raw}""#));
+            let manifest = match SkinManifest::from_json(&json) {
+                Ok(m) => m,
+                Err(e) => panic!("manifest rejeté pour le style {raw:?} : {e}"),
+            };
+            assert_eq!(manifest.accessory_style, expected, "style brut {raw:?}");
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -406,6 +508,55 @@ mod tests {
     #[test]
     fn test_ancrage_hors_bornes_est_rejete() {
         let json = manifest_json(r#""anchors": { "hat": { "x": 999999, "y": 0 } }"#);
+        assert!(matches!(
+            SkinManifest::from_json(&json),
+            Err(RenderError::InvalidManifestField { .. })
+        ));
+    }
+
+    #[test]
+    fn test_ancrage_de_pose_resout_groupes_et_correction_precise() {
+        let json = manifest_json(
+            r#""anchors": {
+                    "hat": { "x": 16, "y": 4 },
+                    "held": { "x": 32, "y": 28 }
+                },
+                "anchor_offsets_per_mood": {
+                    "sleep": {
+                        "head": { "x": 5, "y": 8 },
+                        "body": { "x": -2, "y": 4 },
+                        "held": { "x": 9, "y": 1 }
+                    }
+                }"#,
+        );
+        let manifest = match SkinManifest::from_json(&json) {
+            Ok(manifest) => manifest,
+            Err(error) => panic!("manifest de pose valide rejeté : {error}"),
+        };
+
+        assert_eq!(
+            manifest.anchor_for_mood("hat", "sleep"),
+            Some(AnchorPoint { x: 21, y: 12 })
+        );
+        assert_eq!(
+            manifest.anchor_for_mood("held", "sleep"),
+            Some(AnchorPoint { x: 41, y: 29 }),
+            "la correction précise doit primer sur le groupe body"
+        );
+        assert_eq!(
+            manifest.anchor_for_mood("hat", "idle"),
+            Some(AnchorPoint { x: 16, y: 4 })
+        );
+    }
+
+    #[test]
+    fn test_decalage_de_pose_hors_bornes_est_rejete() {
+        let json = manifest_json(
+            r#""anchors": { "hat": { "x": 16, "y": 4 } },
+                "anchor_offsets_per_mood": {
+                    "sleep": { "head": { "x": 999999, "y": 0 } }
+                }"#,
+        );
         assert!(matches!(
             SkinManifest::from_json(&json),
             Err(RenderError::InvalidManifestField { .. })

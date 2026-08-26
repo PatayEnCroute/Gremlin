@@ -6,13 +6,46 @@
 //! produirait une fenêtre de dimension nulle, et un intervalle de sauvegarde
 //! nul déclencherait une écriture disque à chaque réveil de la boucle.
 
+use crate::desktop_motion::{MotionConfig, PlacementIntent};
 use crate::ui::UiPreferences;
 use gremlin_render::WardrobeEquipment;
+use gremlin_system::desktop_layout::DisplayFingerprint;
 use gremlin_watcher::WatcherConfig;
 use serde::{Deserialize, Serialize};
 
+/// Intention de placement du familier sur le bureau, persistée entre sessions.
+///
+/// Une **intention**, pas une coordonnée : un écran débranché, une définition
+/// changée ou un facteur d'échelle différent rendraient une position absolue
+/// absurde — voire hors écran — alors qu'une ancre se reprojette toujours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DesktopPlacementConfig {
+    /// Empreinte du dernier écran occupé, si elle a pu être relevée.
+    pub display_hint: Option<DisplayFingerprint>,
+    /// Ancre et position le long du bord.
+    pub intent: PlacementIntent,
+}
+
+impl DesktopPlacementConfig {
+    /// Longueur maximale d'un nom d'écran persisté, en caractères.
+    pub const MAX_DISPLAY_NAME_CHARS: usize =
+        gremlin_system::desktop_layout::MAX_DISPLAY_NAME_CHARS;
+
+    /// Borne l'empreinte et l'intention lues depuis le disque. Idempotente.
+    pub fn normalize(&mut self) {
+        self.intent.normalize();
+        if let Some(hint) = &mut self.display_hint {
+            // L'empreinte passe par le constructeur du domaine : nom tronqué sur
+            // une frontière de caractère et dimensions bornées, exactement comme
+            // une empreinte fraîchement relevée.
+            *hint = DisplayFingerprint::new(Some(&hint.name), hint.width, hint.height);
+        }
+    }
+}
+
 /// Configuration générale et persistante de l'application.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     /// Identifiant du skin actif.
@@ -39,6 +72,20 @@ pub struct AppConfig {
     pub scale_factor: u32,
     /// Préférences d'affichage et d'accessibilité du panneau de paramètres.
     pub ui: UiPreferences,
+
+    /// Active le minuteur de concentration.
+    ///
+    /// Désactivé par défaut, et l'activer laisse le minuteur à l'arrêt : aucun
+    /// temps mesuré ni rappel affiché avant un démarrage explicite.
+    pub pomodoro_enabled: bool,
+    /// Active la chute douce au relâchement du familier.
+    pub desktop_motion_enabled: bool,
+    /// Active l'ancrage au plancher et aux coins de la zone de travail.
+    pub desktop_magnetism_enabled: bool,
+    /// Paramètres physiques de la chute.
+    pub motion: MotionConfig,
+    /// Dernier placement voulu du familier.
+    pub placement: DesktopPlacementConfig,
 }
 
 impl Default for AppConfig {
@@ -56,6 +103,11 @@ impl Default for AppConfig {
             break_reminders_enabled: true,
             scale_factor: 2,
             ui: UiPreferences::default(),
+            pomodoro_enabled: false,
+            desktop_motion_enabled: true,
+            desktop_magnetism_enabled: true,
+            motion: MotionConfig::default(),
+            placement: DesktopPlacementConfig::default(),
         }
     }
 }
@@ -98,6 +150,8 @@ impl AppConfig {
         // conteneur ne connaît pas leurs bornes.
         let ui_adjusted = self.ui.normalize();
         let watcher_adjusted = self.watcher.normalize();
+        self.motion.normalize();
+        self.placement.normalize();
 
         // Un identifiant de skin ne doit ni être vide, ni contenir de
         // séparateur de chemin : il est concaténé à un répertoire de base.

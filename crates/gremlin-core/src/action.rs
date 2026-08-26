@@ -30,6 +30,8 @@ pub enum ActionKind {
     TestRun,
     /// Assimiler un résultat de build.
     Build,
+    /// Utiliser un consommable de l'inventaire.
+    UseConsumable,
 }
 
 impl ActionKind {
@@ -47,6 +49,7 @@ impl ActionKind {
             Self::Commit => "assimiler un commit",
             Self::TestRun => "assimiler un rapport de tests",
             Self::Build => "assimiler un build",
+            Self::UseConsumable => "utiliser un objet",
         }
     }
 }
@@ -74,6 +77,7 @@ mod tests {
             ActionKind::Commit,
             ActionKind::TestRun,
             ActionKind::Build,
+            ActionKind::UseConsumable,
         ];
 
         let mut labels: Vec<&str> = actions.iter().map(|a| a.label()).collect();

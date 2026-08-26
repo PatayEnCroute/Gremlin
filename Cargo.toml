@@ -42,6 +42,25 @@ directories = "6.0"
 notify = "8.0"
 walkdir = "2.5"
 
+# Dates et fuseaux locaux, confinés à `gremlin-system::calendar`.
+#
+# Les séries de productivité comptent des **jours civils locaux** : il faut donc
+# le décalage UTC en vigueur à l'instant présent, heure d'été comprise. Cette
+# règle vit dans la base IANA (registre Windows côté Microsoft) et change
+# plusieurs fois par an par décision politique. L'approximer décalerait les
+# séries d'une journée entière à chaque changement d'heure.
+#
+# `default-features = false` puis réactivation explicite : seules la lecture du
+# fuseau système et sa base de données sont nécessaires. La sérialisation, le
+# support `no_std` et les bindings JavaScript restent hors du graphe.
+jiff = { version = "0.2", default-features = false, features = [
+    "std",
+    "alloc",
+    "tz-system",
+    "tzdb-bundle-platform",
+    "tzdb-zoneinfo",
+] }
+
 # Graphics & Windowing & Systray
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 winit = "0.30"
@@ -63,6 +82,15 @@ softbuffer = { version = "0.4", default-features = false, features = [
     "wayland",
     "wayland-dlopen",
 ] }
+
+# Sélecteur de dossier natif du système. Une boîte de dialogue de fichiers est
+# une capacité de l'environnement de bureau — dessinée, positionnée et pilotée
+# par lui, avec ses favoris, son historique et son accessibilité : elle ne se
+# fabrique pas dans un tampon de pixels. La dépendance est confinée derrière la
+# feature `folder_dialog` de `gremlin-app` et n'est appelée que depuis
+# `desktop.rs`. Les fonctionnalités par défaut retiennent le portail XDG sous
+# Linux plutôt que les liaisons GTK3.
+rfd = "0.17"
 
 # Accessibilité système : arbre sémantique exposé aux lecteurs d'écran
 # (UI Automation sous Windows, NSAccessibility sous macOS, AT-SPI sous Linux).

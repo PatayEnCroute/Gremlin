@@ -35,6 +35,17 @@ pub enum DialogueId {
     Died,
     Revived,
     Dragged,
+    // --- Phase 8 : productivité et bien-être ---
+    StreakKept,
+    StreakReward,
+    Coffee,
+    DebugPotion,
+    Snack,
+    FocusStarted,
+    FocusDone,
+    BreakDone,
+    Stretch,
+    Hydrate,
 }
 
 impl DialogueId {
@@ -62,6 +73,16 @@ impl DialogueId {
             Self::Died => "Oh non...",
             Self::Revived => "De retour",
             Self::Dragged => "Waaaah !",
+            Self::StreakKept => "Série tenue",
+            Self::StreakReward => "Débloqué !",
+            Self::Coffee => "Café !",
+            Self::DebugPotion => "Ça pique",
+            Self::Snack => "Miam",
+            Self::FocusStarted => "Au travail",
+            Self::FocusDone => "Bloc fini",
+            Self::BreakDone => "On repart",
+            Self::Stretch => "Étire-toi",
+            Self::Hydrate => "Bois un peu",
         }
     }
 
@@ -70,8 +91,11 @@ impl DialogueId {
             Self::Evolution => 100,
             Self::LevelUp => 90,
             Self::Died | Self::Revived => 80,
+            // Une récompense de série se remarque, sans jamais masquer une
+            // évolution ni un décès.
+            Self::StreakReward => 75,
             Self::Healed => 70,
-            Self::Fed | Self::Petted => 60,
+            Self::Fed | Self::Petted | Self::Coffee | Self::DebugPotion | Self::Snack => 60,
             Self::Commit
             | Self::TestsPassed
             | Self::TestsFixed
@@ -80,7 +104,17 @@ impl DialogueId {
             | Self::BuildFailed => 50,
             Self::Sick | Self::Hungry | Self::Tired | Self::Angry => 40,
             Self::Sleeping | Self::WokeUp | Self::Returned => 30,
-            Self::Dragged | Self::FocusMilestone | Self::BreakReminder => 20,
+            // Le minuteur et les rappels de bien-être restent au plus bas : une
+            // jauge critique doit toujours passer devant un rappel d'eau.
+            Self::Dragged
+            | Self::FocusMilestone
+            | Self::BreakReminder
+            | Self::StreakKept
+            | Self::FocusStarted
+            | Self::FocusDone
+            | Self::BreakDone
+            | Self::Stretch
+            | Self::Hydrate => 20,
         }
     }
 }

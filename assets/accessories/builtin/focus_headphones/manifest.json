@@ -1,0 +1,24 @@
+{
+  "id": "focus_headphones",
+  "name": "Casque de concentration",
+  "author": "Gremlin Studio",
+  "version": "1.0.0",
+  "category": "Glasses",
+  "description": "Récompense de sept jours de commits consécutifs.",
+  "frame_width": 64,
+  "frame_height": 64,
+  "frames": [
+    "focus_headphones_0"
+  ],
+  "frame_duration_ms": 200,
+  "offsets_per_mood": {},
+  "anchor": {
+    "x": 16,
+    "y": 20
+  },
+  "variants": {
+    "baby": {},
+    "evolved": {}
+  },
+  "clip_to_body": false
+}

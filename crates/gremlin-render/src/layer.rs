@@ -4,28 +4,27 @@
 //!
 //! **Tous les sprites de calque sont dessinés sur un canevas pleine taille**
 //! ([`crate::limits::CANVAS_SIZE`], ou la taille de frame déclarée par le skin) et
-//! sont **déjà positionnés** à leur emplacement nominal sur le corps du familier : un
-//! chapeau est peint en haut de son canevas, un objet tenu à hauteur de main, etc.
+//! sont dessinés à un emplacement de référence sur le Gremlin classique : un chapeau
+//! en haut de son canevas, un objet à hauteur de main, etc.
 //!
-//! Il en découle deux règles, valables aussi bien pour les accessoires procéduraux que
+//! Il en découle trois règles, valables aussi bien pour les accessoires procéduraux que
 //! pour les packs de skins chargés depuis le disque :
 //!
-//! 1. Composer un calque revient à un simple `blit` en `(0, 0)`, auquel s'ajoute
-//!    uniquement le décalage dynamique du calque ([`ActiveLayer::offset_x`] /
-//!    [`ActiveLayer::offset_y`], alimenté par les décalages d'humeur et d'animation).
-//! 2. Le champ `anchors` du [`SkinManifest`] est une **métadonnée descriptive** — le
-//!    point d'attache de référence documenté par l'auteur du skin, exploité par
-//!    l'outillage ou les effets visuels. Il n'est **jamais** ajouté comme translation, sans quoi
-//!    tout skin déclarant un ancrage non nul décalerait deux fois les accessoires
-//!    déjà positionnés.
+//! 1. Les calques génériques de [`LayerCompositor::compose`] restent des blits directs,
+//!    car [`ActiveLayer`] porte déjà leur décalage final.
+//! 2. La composition habillée aligne l'ancre source de chaque accessoire sur l'ancre
+//!    du skin actif, puis ajoute les corrections de pose du skin et les éventuels
+//!    ajustements propres à l'accessoire.
+//! 3. Les tenues sont découpées par l'alpha du corps courant. Elles épousent ainsi la
+//!    silhouette de chaque skin au lieu de former un rectangle flottant.
 //!
 //! Le manifest reste utile à la composition : il sert à valider que les sprites de
 //! l'atlas ont bien la taille de frame annoncée, et à tracer les divergences.
 
 use crate::accessory::{AccessoryCatalog, WardrobeEquipment};
 use crate::buffer::PixelBuffer;
-use crate::manifest::SkinManifest;
-use crate::sprite::SpriteAtlas;
+use crate::manifest::{AnchorPoint, SkinManifest};
+use crate::sprite::{SpriteAtlas, SpriteFrame};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::warn;
@@ -129,10 +128,9 @@ pub struct LayerCompositor;
 impl LayerCompositor {
     /// Compose les calques actifs sur le tampon de pixels.
     ///
-    /// Chaque calque est dessiné à son décalage dynamique
-    /// ([`ActiveLayer::offset_x`] / [`ActiveLayer::offset_y`]) : les sprites étant
-    /// dessinés sur un canevas pleine taille et déjà positionnés, aucun ancrage de
-    /// manifest n'est ajouté (voir la convention en tête de module).
+    /// Chaque calque générique est dessiné à son décalage dynamique
+    /// ([`ActiveLayer::offset_x`] / [`ActiveLayer::offset_y`]). La résolution des
+    /// ancres du catalogue est réservée aux méthodes `compose_layered_pet*`.
     ///
     /// Lorsqu'un `manifest` est fourni, il sert de contrôle de cohérence : tout sprite
     /// dont les dimensions diffèrent de la frame déclarée est tracé en avertissement.
@@ -243,6 +241,8 @@ impl LayerCompositor {
         mood_key: &str,
         elapsed: Duration,
     ) {
+        let base_sprite = atlas.get(base_frame_key);
+        let accessory_style = manifest.map_or("default", |skin| skin.accessory_style.as_str());
         for layer_type in LayerType::ALL {
             if layer_type == LayerType::Base {
                 Self::compose_sprite(
@@ -276,7 +276,10 @@ impl LayerCompositor {
                 );
                 continue;
             };
-            let Some(frame) = item.manifest.frame_key_at(elapsed) else {
+            let Some(frame) = item
+                .manifest
+                .frame_key_at_for_style(accessory_style, elapsed)
+            else {
                 warn!(
                     accessory_id,
                     category = ?category,
@@ -284,11 +287,153 @@ impl LayerCompositor {
                 );
                 continue;
             };
-            let (offset_x, offset_y) = item.manifest.mood_offset(mood_key);
-            Self::compose_sprite(
-                buffer, atlas, manifest, frame, layer_type, offset_x, offset_y,
-            );
+            let (offset_x, offset_y) =
+                Self::accessory_offset(item, manifest, mood_key, accessory_style);
+            if layer_type == LayerType::Outfit && item.manifest.clip_to_body {
+                Self::compose_outfit(
+                    buffer,
+                    atlas,
+                    manifest,
+                    frame,
+                    offset_x,
+                    offset_y,
+                    base_sprite,
+                    manifest.and_then(|skin| skin.anchor_for_mood("head", mood_key)),
+                );
+            } else {
+                Self::compose_sprite(
+                    buffer, atlas, manifest, frame, layer_type, offset_x, offset_y,
+                );
+            }
         }
+    }
+
+    /// Calcule le déplacement final d'un accessoire sans allocation.
+    fn accessory_offset(
+        item: &crate::AccessoryItem,
+        manifest: Option<&SkinManifest>,
+        mood_key: &str,
+        accessory_style: &str,
+    ) -> (i32, i32) {
+        let source = item.manifest.reference_anchor_for_style(accessory_style);
+        let target = manifest
+            .and_then(|skin| skin.anchor_for_mood(item.category().default_anchor_name(), mood_key))
+            .unwrap_or(source);
+        let (mood_x, mood_y) = item.manifest.mood_offset(mood_key);
+
+        (
+            target.x.saturating_sub(source.x).saturating_add(mood_x),
+            target.y.saturating_sub(source.y).saturating_add(mood_y),
+        )
+    }
+
+    /// Compose une tenue en la découpant sur la silhouette alpha du corps courant.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_outfit(
+        buffer: &mut PixelBuffer,
+        atlas: &SpriteAtlas,
+        manifest: Option<&SkinManifest>,
+        sprite_key: &str,
+        offset_x: i32,
+        offset_y: i32,
+        base_sprite: Option<&SpriteFrame>,
+        head_anchor: Option<AnchorPoint>,
+    ) {
+        let Some(sprite) = atlas.get(sprite_key) else {
+            warn!(
+                sprite_key,
+                layer = ?LayerType::Outfit,
+                "Sprite absent de l'atlas : calque ignoré"
+            );
+            return;
+        };
+
+        if let Some(m) = manifest {
+            if let Err(err) = m.validate_frame_size(sprite.width, sprite.height) {
+                warn!(
+                    sprite_key,
+                    layer = ?LayerType::Outfit,
+                    error = %err,
+                    "Dimensions de sprite incohérentes avec le manifest du skin"
+                );
+            }
+        }
+
+        let Some(mask) = base_sprite else {
+            buffer.blit(
+                &sprite.rgba,
+                sprite.width,
+                sprite.height,
+                offset_x,
+                offset_y,
+            );
+            return;
+        };
+
+        for source_y in 0..sprite.height {
+            let target_y = offset_y.saturating_add(source_y as i32);
+            if target_y < 0 || target_y >= buffer.height() as i32 {
+                continue;
+            }
+            for source_x in 0..sprite.width {
+                let target_x = offset_x.saturating_add(source_x as i32);
+                if target_x < 0 || target_x >= buffer.width() as i32 {
+                    continue;
+                }
+
+                let source_index =
+                    ((source_y as usize) * (sprite.width as usize) + source_x as usize) * 4;
+                let mask_index =
+                    ((target_y as usize) * (mask.width as usize) + target_x as usize) * 4;
+                let Some(source_pixel) = sprite.rgba.get(source_index..source_index + 4) else {
+                    continue;
+                };
+                let Some(mask_alpha) = mask.rgba.get(mask_index + 3) else {
+                    continue;
+                };
+                if *mask_alpha == 0 {
+                    continue;
+                }
+                if head_anchor
+                    .is_some_and(|head| Self::inside_head_exclusion(target_x, target_y, head))
+                {
+                    continue;
+                }
+
+                buffer.blend_pixel(
+                    target_x as u32,
+                    target_y as u32,
+                    [
+                        source_pixel[0],
+                        source_pixel[1],
+                        source_pixel[2],
+                        source_pixel[3],
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Approxime la zone de tête protégée des tenues par une ellipse.
+    ///
+    /// L'ancre `head` vise le haut du visage pour les bulles et couvre-chefs ; le
+    /// centre de l'ellipse est donc légèrement abaissé pour préserver yeux et bouche.
+    fn inside_head_exclusion(x: i32, y: i32, head: AnchorPoint) -> bool {
+        const RADIUS_X: i64 = 15;
+        const RADIUS_Y: i64 = 14;
+        const CENTER_Y_OFFSET: i32 = 6;
+
+        let dx = i64::from(x.saturating_sub(head.x));
+        let dy = i64::from(y.saturating_sub(head.y.saturating_add(CENTER_Y_OFFSET)));
+        dx.saturating_mul(dx)
+            .saturating_mul(RADIUS_Y.saturating_mul(RADIUS_Y))
+            .saturating_add(
+                dy.saturating_mul(dy)
+                    .saturating_mul(RADIUS_X.saturating_mul(RADIUS_X)),
+            )
+            <= RADIUS_X
+                .saturating_mul(RADIUS_X)
+                .saturating_mul(RADIUS_Y.saturating_mul(RADIUS_Y))
     }
 }
 
@@ -298,7 +443,7 @@ mod tests {
     use crate::accessory::AccessoryCategory;
     use crate::limits::CANVAS_SIZE;
     use crate::manifest::AnchorPoint;
-    use crate::procedural_accessories::register_default_procedural_accessories;
+    use crate::register_default_accessories;
     use crate::sprite::SpriteFrame;
     use std::collections::BTreeMap;
 
@@ -319,9 +464,11 @@ mod tests {
             name: "Test".into(),
             author: "Test".into(),
             version: "1.0.0".into(),
+            accessory_style: String::from("default"),
             frame_width: CANVAS_SIZE,
             frame_height: CANVAS_SIZE,
             anchors,
+            anchor_offsets_per_mood: BTreeMap::new(),
             animations: BTreeMap::new(),
         }
     }
@@ -349,7 +496,7 @@ mod tests {
         atlas.load_default_procedural_sprites();
 
         let mut catalog = AccessoryCatalog::new();
-        register_default_procedural_accessories(&mut atlas, &mut catalog);
+        register_default_accessories(&mut atlas, &mut catalog);
 
         let mut wardrobe = WardrobeEquipment::new();
         wardrobe.equip(AccessoryCategory::Hat, "wizard_hat");
@@ -371,10 +518,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ancrages_non_nuls_ne_deplacent_pas_les_calques() {
-        // Régression : les ancrages du manifest étaient additionnés au décalage de
-        // chaque calque, ce qui décalait les accessoires déjà positionnés dès qu'un
-        // skin réel déclarait un ancrage non nul.
+    fn test_compose_generique_ne_resout_pas_les_ancrages_du_catalogue() {
+        // `ActiveLayer` porte déjà son décalage final. La primitive générique ne
+        // connaît ni le catalogue ni l'ancre source qui permettraient un alignement.
         let atlas = solid_atlas("base", [10, 20, 30, 255]);
         let layers = [ActiveLayer::new(LayerType::Base, "base")];
 
@@ -388,42 +534,38 @@ mod tests {
         assert_eq!(
             sans_manifest.as_bytes(),
             avec_ancrages.as_bytes(),
-            "les ancrages du manifest sont descriptifs et ne doivent rien translater"
+            "la primitive générique ne doit pas inventer une ancre source"
         );
         assert_eq!(&sans_manifest.as_bytes()[0..4], &[10, 20, 30, 255]);
     }
 
     #[test]
-    fn test_pet_complet_identique_avec_et_sans_ancrages() {
+    fn test_accessoire_suit_ancre_du_skin_et_de_la_pose() {
         let mut atlas = SpriteAtlas::new();
         atlas.load_default_procedural_sprites();
         let mut catalog = AccessoryCatalog::new();
-        register_default_procedural_accessories(&mut atlas, &mut catalog);
+        register_default_accessories(&mut atlas, &mut catalog);
+        let Some(hat) = catalog.get("wizard_hat") else {
+            panic!("chapeau procédural manquant");
+        };
 
-        let mut wardrobe = WardrobeEquipment::new();
-        wardrobe.equip(AccessoryCategory::Hat, "wizard_hat");
-        wardrobe.equip(AccessoryCategory::Held, "coffee_mug");
-        wardrobe.equip(AccessoryCategory::Aura, "fire_aura");
-
-        let manifest = manifest_with_anchors(12);
-
-        let mut sans = PixelBuffer::new(CANVAS_SIZE, CANVAS_SIZE);
-        LayerCompositor::compose_layered_pet(
-            &mut sans, &wardrobe, &atlas, None, &catalog, "idle_0", "idle",
+        let mut manifest = manifest_with_anchors(0);
+        manifest
+            .anchors
+            .insert("hat".into(), AnchorPoint { x: 20, y: 9 });
+        manifest.anchor_offsets_per_mood.insert(
+            "happy".into(),
+            BTreeMap::from([("head".into(), AnchorPoint { x: 2, y: 3 })]),
         );
 
-        let mut avec = PixelBuffer::new(CANVAS_SIZE, CANVAS_SIZE);
-        LayerCompositor::compose_layered_pet(
-            &mut avec,
-            &wardrobe,
-            &atlas,
-            Some(&manifest),
-            &catalog,
-            "idle_0",
-            "idle",
+        assert_eq!(
+            LayerCompositor::accessory_offset(hat, Some(&manifest), "idle", "default"),
+            (4, 5)
         );
-
-        assert_eq!(sans.as_bytes(), avec.as_bytes());
+        assert_eq!(
+            LayerCompositor::accessory_offset(hat, Some(&manifest), "happy", "default"),
+            (6, 8)
+        );
     }
 
     #[test]
@@ -443,6 +585,15 @@ mod tests {
             &buffer.as_bytes()[idx_decale..idx_decale + 4],
             &[255, 0, 0, 255]
         );
+    }
+
+    #[test]
+    fn test_zone_de_tete_protege_le_visage_des_tenues() {
+        let head = AnchorPoint { x: 32, y: 17 };
+        assert!(LayerCompositor::inside_head_exclusion(32, 23, head));
+        assert!(LayerCompositor::inside_head_exclusion(20, 23, head));
+        assert!(!LayerCompositor::inside_head_exclusion(5, 23, head));
+        assert!(!LayerCompositor::inside_head_exclusion(32, 50, head));
     }
 
     #[test]
@@ -478,7 +629,7 @@ mod tests {
         }
 
         let mut catalog = AccessoryCatalog::new();
-        catalog.register(crate::accessory::AccessoryItem::procedural(
+        catalog.register(crate::accessory::AccessoryItem::built_in(
             crate::accessory::AccessoryManifest {
                 id: "anim_hat".into(),
                 name: "Chapeau animé".into(),
@@ -491,6 +642,9 @@ mod tests {
                 frames: vec!["anim_0".into(), "anim_1".into()],
                 frame_duration_ms: 100,
                 offsets_per_mood: BTreeMap::new(),
+                anchor: None,
+                variants: BTreeMap::new(),
+                clip_to_body: false,
             },
         ));
 
