@@ -2,7 +2,7 @@
 //!
 //! Deux conversions sont indispensables et faciles à manquer :
 //!
-//! * **origine** — AppKit place l'origine en bas à gauche de l'écran principal et
+//! * **origine** — `AppKit` place l'origine en bas à gauche de l'écran principal et
 //!   fait croître `y` vers le haut ; le reste de Gremlin raisonne en haut à
 //!   gauche avec `y` croissant vers le bas. Le retournement se fait autour du
 //!   bord haut de l'écran **principal**, pas de l'écran courant, sans quoi un
@@ -16,7 +16,7 @@ use crate::error::SystemError;
 use objc2_app_kit::NSScreen;
 use objc2_foundation::MainThreadMarker;
 
-/// Écart maximal toléré, en pixels, entre les limites `winit` et un cadre AppKit.
+/// Écart maximal toléré, en pixels, entre les limites `winit` et un cadre `AppKit`.
 ///
 /// Les deux piles arrondissent différemment le produit points × échelle ; exiger
 /// l'égalité stricte ferait échouer l'appariement sur un écran à 1,5×.
@@ -31,7 +31,7 @@ pub(super) fn source() -> Result<Box<dyn WorkAreaSource + Send + Sync>, SystemEr
     Ok(Box::new(MacWorkArea))
 }
 
-/// Source adossée à AppKit.
+/// Source adossée à `AppKit`.
 struct MacWorkArea;
 
 impl WorkAreaSource for MacWorkArea {
@@ -50,7 +50,7 @@ impl WorkAreaSource for MacWorkArea {
                 "aucun écran rapporté par AppKit",
             )));
         };
-        // Le premier écran de la liste porte l'origine du repère AppKit.
+        // Le premier écran de la liste porte l'origine du repère `AppKit`.
         let flip_origin = primary.frame().origin.y + primary.frame().size.height;
 
         for screen in &screens {
@@ -91,9 +91,9 @@ impl WorkAreaSource for MacWorkArea {
     }
 }
 
-/// Convertit un cadre AppKit en rectangle physique à origine haut-gauche.
+/// Convertit un cadre `AppKit` en rectangle physique à origine haut-gauche.
 ///
-/// Extraite pour être testable sans AppKit : c'est ici que se joue le
+/// Extraite pour être testable sans `AppKit` : c'est ici que se joue le
 /// retournement vertical et la mise à l'échelle.
 fn to_physical(
     x: f64,
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn test_dock_reduces_the_visible_frame_from_the_bottom() {
         // Dock de 70 points en bas : `visibleFrame` commence à y = 70 en repère
-        // AppKit, ce qui se traduit par une hauteur réduite en repère écran.
+        // `AppKit`, ce qui se traduit par une hauteur réduite en repère écran.
         let rect = to_physical(0.0, 70.0, 1440.0, 830.0, 900.0, 2.0);
         assert_eq!(rect, Some(PhysicalRect::new(0, 0, 2880, 1660)));
     }
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_screen_above_the_primary_gets_a_negative_top() {
-        // Un écran placé au-dessus a un `y` AppKit supérieur au bord haut du
+        // Un écran placé au-dessus a un `y` `AppKit` supérieur au bord haut du
         // principal : après retournement, son `y` écran doit être négatif.
         let rect = to_physical(0.0, 900.0, 1440.0, 900.0, 900.0, 1.0);
         assert_eq!(rect, Some(PhysicalRect::new(0, -900, 1440, 900)));

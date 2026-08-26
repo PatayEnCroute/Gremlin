@@ -145,7 +145,8 @@ impl X11WorkArea {
             )
         };
 
-        let outcome = self.extract_first_rect(status, actual_type, actual_format, item_count, data);
+        let outcome =
+            Self::extract_first_rect(status, actual_type, actual_format, item_count, data);
 
         if !data.is_null() {
             // SAFETY: `data` a été alloué par `XGetWindowProperty` et n'est libéré
@@ -160,7 +161,6 @@ impl X11WorkArea {
 
     /// Convertit les quatre premières valeurs lues en rectangle validé.
     fn extract_first_rect(
-        &self,
         status: i32,
         actual_type: xlib::Atom,
         actual_format: i32,
@@ -180,10 +180,10 @@ impl X11WorkArea {
             )));
         }
 
-        // SAFETY: `data` est non nul, le format 32 garantit un tableau de `c_long`,
-        // et `item_count` vient d'être vérifié comme couvrant au moins quatre
-        // valeurs — les seules lues ici.
-        #[allow(unsafe_code)]
+        // SAFETY: `data` est non nul, alloué par `XGetWindowProperty` avec un format 32
+        // qui garantit un alignement compatible `c_long`, et `item_count` couvre au
+        // moins quatre valeurs — les seules lues ici.
+        #[allow(unsafe_code, clippy::cast_ptr_alignment)]
         let values = unsafe { std::slice::from_raw_parts(data.cast::<c_long>(), WORKAREA_FIELDS) };
 
         let (Ok(x), Ok(y), Ok(width), Ok(height)) = (
